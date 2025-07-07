@@ -1,5 +1,5 @@
 use crate::packets::{Data, KeyLocator, Name};
-use crate::tlv::TlvError;
+use crate::tlv::{TlvError, TlvElement, encode_tlv_sequence, decode_tlv_sequence};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1::EncodeRsaPublicKey};
 use rsa::pkcs1v15::{SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, Verifier, SignatureEncoding};
@@ -7,6 +7,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// TLV type constants for signature encoding
+pub mod tlv_types {
+    /// SignatureInfo TLV type
+    pub const SIGNATURE_INFO: u8 = 0x16;
+    /// SignatureValue TLV type
+    pub const SIGNATURE_VALUE: u8 = 0x17;
+    /// SignatureType TLV type
+    pub const SIGNATURE_TYPE: u8 = 0x1B;
+    /// KeyLocator TLV type
+    pub const KEY_LOCATOR: u8 = 0x1C;
+    /// KeyDigest TLV type
+    pub const KEY_DIGEST: u8 = 0x1D;
+    /// SigningTime TLV type (custom extension)
+    pub const SIGNING_TIME: u8 = 0x28;
+    /// Certificate chain TLV type (custom extension)
+    pub const CERTIFICATE_CHAIN: u8 = 0x29;
+    /// Signature attributes TLV type (custom extension)
+    pub const SIGNATURE_ATTRIBUTES: u8 = 0x2A;
+    /// Digest TLV type (custom extension)
+    pub const DIGEST: u8 = 0x2B;
+}
 
 /// Signature types supported by the NDN protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +214,312 @@ impl Signature {
         }
         
         Ok(())
+    }
+    
+    /// Encode signature to TLV format
+    pub fn encode_tlv(&self) -> Result<Vec<u8>, SignatureError> {
+        let mut elements = Vec::new();
+        
+        // Encode signature type
+        elements.push(TlvElement::new(
+            tlv_types::SIGNATURE_TYPE,
+            vec![self.signature_type as u8]
+        ));
+        
+        // Encode key locator if present
+        if let Some(ref key_locator) = self.key_locator {
+            let key_locator_tlv = self.encode_key_locator_tlv(key_locator)?;
+            elements.push(key_locator_tlv);
+        }
+        
+        // Encode signing time
+        elements.push(TlvElement::new(
+            tlv_types::SIGNING_TIME,
+            self.signing_time.to_be_bytes().to_vec()
+        ));
+        
+        // Encode signature value
+        if !self.signature_value.is_empty() {
+            elements.push(TlvElement::new(
+                tlv_types::SIGNATURE_VALUE,
+                self.signature_value.clone()
+            ));
+        }
+        
+        // Encode digest
+        if !self.digest.is_empty() {
+            elements.push(TlvElement::new(
+                tlv_types::DIGEST,
+                self.digest.clone()
+            ));
+        }
+        
+        // Encode certificate chain if present
+        if !self.certificate_chain.is_empty() {
+            let cert_chain_tlv = self.encode_certificate_chain_tlv()?;
+            elements.push(cert_chain_tlv);
+        }
+        
+        // Encode attributes if present
+        if !self.attributes.is_empty() {
+            let attributes_tlv = self.encode_attributes_tlv()?;
+            elements.push(attributes_tlv);
+        }
+        
+        encode_tlv_sequence(&elements).map_err(SignatureError::TlvError)
+    }
+    
+    /// Decode signature from TLV format
+    pub fn decode_tlv(data: &[u8]) -> Result<Self, SignatureError> {
+        if data.is_empty() {
+            return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+        }
+        
+        let elements = decode_tlv_sequence(data).map_err(SignatureError::TlvError)?;
+        
+        let mut signature = Signature::default();
+        
+        for element in elements {
+            match element.type_ {
+                tlv_types::SIGNATURE_TYPE => {
+                    if element.value.len() != 1 {
+                        return Err(SignatureError::TlvError(TlvError::ValueLengthMismatch {
+                            expected: 1,
+                            actual: element.value.len(),
+                        }));
+                    }
+                    signature.signature_type = SignatureType::from(element.value[0]);
+                }
+                tlv_types::KEY_LOCATOR => {
+                    signature.key_locator = Some(Self::decode_key_locator_tlv_static(&element)?);
+                }
+                tlv_types::SIGNING_TIME => {
+                    if element.value.len() != 8 {
+                        return Err(SignatureError::TlvError(TlvError::ValueLengthMismatch {
+                            expected: 8,
+                            actual: element.value.len(),
+                        }));
+                    }
+                    let bytes: [u8; 8] = element.value.try_into()
+                        .map_err(|_| SignatureError::TlvError(TlvError::InvalidLength))?;
+                    signature.signing_time = u64::from_be_bytes(bytes);
+                }
+                tlv_types::SIGNATURE_VALUE => {
+                    signature.signature_value = element.value;
+                }
+                tlv_types::DIGEST => {
+                    signature.digest = element.value;
+                }
+                tlv_types::CERTIFICATE_CHAIN => {
+                    signature.certificate_chain = Self::decode_certificate_chain_tlv_static(&element)?;
+                }
+                tlv_types::SIGNATURE_ATTRIBUTES => {
+                    signature.attributes = Self::decode_attributes_tlv_static(&element)?;
+                }
+                _ => {
+                    // Unknown TLV type - ignore for forward compatibility
+                }
+            }
+        }
+        
+        Ok(signature)
+    }
+    
+    /// Encode key locator to TLV format
+    fn encode_key_locator_tlv(&self, key_locator: &KeyLocator) -> Result<TlvElement, SignatureError> {
+        let value = match key_locator {
+            KeyLocator::Name(name) => {
+                name.encode().map_err(SignatureError::TlvError)?
+            }
+            KeyLocator::KeyDigest(digest) => {
+                let mut value = Vec::new();
+                value.push(tlv_types::KEY_DIGEST);
+                value.push(digest.len() as u8);
+                value.extend_from_slice(digest);
+                value
+            }
+        };
+        
+        Ok(TlvElement::new(tlv_types::KEY_LOCATOR, value))
+    }
+    
+    /// Decode key locator from TLV element
+    fn decode_key_locator_tlv_static(element: &TlvElement) -> Result<KeyLocator, SignatureError> {
+        if element.value.is_empty() {
+            return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+        }
+        
+        if element.value[0] == tlv_types::KEY_DIGEST {
+            if element.value.len() < 2 {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let digest_len = element.value[1] as usize;
+            if element.value.len() < 2 + digest_len {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let digest = element.value[2..2 + digest_len].to_vec();
+            Ok(KeyLocator::KeyDigest(digest))
+        } else {
+            // Assume it's a name
+            let (name, _) = Name::decode(&element.value).map_err(SignatureError::TlvError)?;
+            Ok(KeyLocator::Name(name))
+        }
+    }
+    
+    /// Encode certificate chain to TLV format
+    fn encode_certificate_chain_tlv(&self) -> Result<TlvElement, SignatureError> {
+        let mut chain_data = Vec::new();
+        
+        for cert in &self.certificate_chain {
+            // Encode certificate name
+            let name_encoded = cert.name.encode().map_err(SignatureError::TlvError)?;
+            chain_data.extend_from_slice(&name_encoded);
+            
+            // Encode certificate data length and data
+            let data_len = cert.certificate_data.len() as u32;
+            chain_data.extend_from_slice(&data_len.to_be_bytes());
+            chain_data.extend_from_slice(&cert.certificate_data);
+            
+            // Encode validity period
+            chain_data.extend_from_slice(&cert.valid_from.to_be_bytes());
+            chain_data.extend_from_slice(&cert.valid_to.to_be_bytes());
+            
+            // Encode fingerprint length and fingerprint
+            let fp_len = cert.fingerprint.len() as u8;
+            chain_data.push(fp_len);
+            chain_data.extend_from_slice(&cert.fingerprint);
+        }
+        
+        Ok(TlvElement::new(tlv_types::CERTIFICATE_CHAIN, chain_data))
+    }
+    
+    /// Decode certificate chain from TLV element
+    fn decode_certificate_chain_tlv_static(element: &TlvElement) -> Result<Vec<CertificateInfo>, SignatureError> {
+        let mut certificates = Vec::new();
+        let mut offset = 0;
+        let data = &element.value;
+        
+        while offset < data.len() {
+            // Decode certificate name
+            let (name, name_len) = Name::decode(&data[offset..])
+                .map_err(SignatureError::TlvError)?;
+            offset += name_len;
+            
+            // Decode certificate data
+            if offset + 4 > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let data_len = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
+            ]) as usize;
+            offset += 4;
+            
+            if offset + data_len > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let certificate_data = data[offset..offset + data_len].to_vec();
+            offset += data_len;
+            
+            // Decode validity period
+            if offset + 16 > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let valid_from = u64::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
+            ]);
+            offset += 8;
+            let valid_to = u64::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]
+            ]);
+            offset += 8;
+            
+            // Decode fingerprint
+            if offset >= data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let fp_len = data[offset] as usize;
+            offset += 1;
+            
+            if offset + fp_len > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let fingerprint = data[offset..offset + fp_len].to_vec();
+            offset += fp_len;
+            
+            certificates.push(CertificateInfo {
+                name,
+                certificate_data,
+                valid_from,
+                valid_to,
+                fingerprint,
+            });
+        }
+        
+        Ok(certificates)
+    }
+    
+    /// Encode attributes to TLV format
+    fn encode_attributes_tlv(&self) -> Result<TlvElement, SignatureError> {
+        let mut attributes_data = Vec::new();
+        
+        for (key, value) in &self.attributes {
+            // Encode key length and key
+            let key_bytes = key.as_bytes();
+            let key_len = key_bytes.len() as u8;
+            attributes_data.push(key_len);
+            attributes_data.extend_from_slice(key_bytes);
+            
+            // Encode value length and value
+            let value_len = value.len() as u32;
+            attributes_data.extend_from_slice(&value_len.to_be_bytes());
+            attributes_data.extend_from_slice(value);
+        }
+        
+        Ok(TlvElement::new(tlv_types::SIGNATURE_ATTRIBUTES, attributes_data))
+    }
+    
+    /// Decode attributes from TLV element
+    fn decode_attributes_tlv_static(element: &TlvElement) -> Result<HashMap<String, Vec<u8>>, SignatureError> {
+        let mut attributes = HashMap::new();
+        let mut offset = 0;
+        let data = &element.value;
+        
+        while offset < data.len() {
+            // Decode key
+            if offset >= data.len() {
+                break;
+            }
+            let key_len = data[offset] as usize;
+            offset += 1;
+            
+            if offset + key_len > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let key = String::from_utf8(data[offset..offset + key_len].to_vec())
+                .map_err(|_| SignatureError::TlvError(TlvError::InvalidType(0)))?;
+            offset += key_len;
+            
+            // Decode value
+            if offset + 4 > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let value_len = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
+            ]) as usize;
+            offset += 4;
+            
+            if offset + value_len > data.len() {
+                return Err(SignatureError::TlvError(TlvError::BufferTooShort));
+            }
+            let value = data[offset..offset + value_len].to_vec();
+            offset += value_len;
+            
+            attributes.insert(key, value);
+        }
+        
+        Ok(attributes)
     }
 }
 
@@ -608,6 +936,132 @@ mod tests {
         let key_locator_name = KeyGenerator::generate_key_locator_name(&public_key).unwrap();
         assert!(key_locator_name.to_string().starts_with("/keys/"));
         assert!(key_locator_name.len() > 1);
+    }
+
+    #[test]
+    fn test_signature_tlv_encoding_decoding() {
+        let mut signature = Signature::new(SignatureType::Sha256WithRsa)
+            .with_key_locator(KeyLocator::Name(Name::from_str("/test/key")))
+            .with_signature_value(vec![1, 2, 3, 4, 5])
+            .with_digest(vec![0; 32]);
+        
+        // Add some attributes
+        signature = signature.with_attribute("test".to_string(), vec![6, 7, 8]);
+        
+        // Encode to TLV
+        let encoded = signature.encode_tlv().unwrap();
+        assert!(!encoded.is_empty());
+        
+        // Decode from TLV
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        // Verify fields match
+        assert_eq!(decoded.signature_type, signature.signature_type);
+        assert_eq!(decoded.signature_value, signature.signature_value);
+        assert_eq!(decoded.digest, signature.digest);
+        assert_eq!(decoded.attributes, signature.attributes);
+        
+        // Note: signing_time will be different due to time elapsed, but structure should be correct
+        assert!(decoded.key_locator.is_some());
+    }
+
+    #[test]
+    fn test_signature_tlv_with_certificate_chain() {
+        let cert_data = vec![1, 2, 3, 4, 5];
+        let cert = CertificateInfo::new(Name::from_str("/test/cert"), cert_data.clone());
+        
+        let signature = Signature::new(SignatureType::Sha256WithRsa)
+            .with_certificate(cert)
+            .with_signature_value(vec![10, 11, 12])
+            .with_digest(vec![0; 32]);
+        
+        // Test round-trip encoding/decoding
+        let encoded = signature.encode_tlv().unwrap();
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        assert_eq!(decoded.signature_type, signature.signature_type);
+        assert_eq!(decoded.certificate_chain.len(), 1);
+        assert_eq!(decoded.certificate_chain[0].certificate_data, cert_data);
+        assert_eq!(decoded.signature_value, signature.signature_value);
+    }
+
+    #[test]
+    fn test_signature_tlv_empty_signature() {
+        let signature = Signature::new(SignatureType::DigestSha256)
+            .with_digest(vec![0; 32]);
+        
+        let encoded = signature.encode_tlv().unwrap();
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        assert_eq!(decoded.signature_type, SignatureType::DigestSha256);
+        assert_eq!(decoded.digest, vec![0; 32]);
+        assert!(decoded.signature_value.is_empty());
+        assert!(decoded.key_locator.is_none());
+    }
+
+    #[test]
+    fn test_signature_tlv_key_digest_locator() {
+        let key_digest = vec![0xAB, 0xCD, 0xEF, 0x12, 0x34];
+        let signature = Signature::new(SignatureType::Sha256WithRsa)
+            .with_key_locator(KeyLocator::KeyDigest(key_digest.clone()))
+            .with_signature_value(vec![9, 8, 7])
+            .with_digest(vec![1; 32]);
+        
+        let encoded = signature.encode_tlv().unwrap();
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        match decoded.key_locator {
+            Some(KeyLocator::KeyDigest(digest)) => {
+                assert_eq!(digest, key_digest);
+            }
+            _ => panic!("Expected KeyDigest locator"),
+        }
+    }
+
+    #[test]
+    fn test_signature_tlv_multiple_attributes() {
+        let mut signature = Signature::new(SignatureType::Sha256WithRsa)
+            .with_signature_value(vec![1])
+            .with_digest(vec![2; 32]);
+        
+        signature = signature.with_attribute("attr1".to_string(), vec![10, 20])
+                            .with_attribute("attr2".to_string(), vec![30, 40, 50])
+                            .with_attribute("attr3".to_string(), vec![]);
+        
+        let encoded = signature.encode_tlv().unwrap();
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        assert_eq!(decoded.attributes.len(), 3);
+        assert_eq!(decoded.attributes.get("attr1"), Some(&vec![10, 20]));
+        assert_eq!(decoded.attributes.get("attr2"), Some(&vec![30, 40, 50]));
+        assert_eq!(decoded.attributes.get("attr3"), Some(&vec![]));
+    }
+
+    #[test]
+    fn test_signature_tlv_invalid_data() {
+        // Test with truncated data
+        let invalid_data = vec![0x1B, 0x01]; // Signature type TLV but no value
+        assert!(Signature::decode_tlv(&invalid_data).is_err());
+        
+        // Test with empty data
+        assert!(Signature::decode_tlv(&[]).is_err());
+    }
+
+    #[test]
+    fn test_signature_tlv_forward_compatibility() {
+        // Create TLV with unknown type (should be ignored)
+        let elements = vec![
+            TlvElement::new(tlv_types::SIGNATURE_TYPE, vec![1]),
+            TlvElement::new(tlv_types::DIGEST, vec![0; 32]),
+            TlvElement::new(0xFF, vec![1, 2, 3]), // Unknown type
+        ];
+        
+        let encoded = encode_tlv_sequence(&elements).unwrap();
+        let decoded = Signature::decode_tlv(&encoded).unwrap();
+        
+        // Should successfully decode known fields and ignore unknown ones
+        assert_eq!(decoded.signature_type, SignatureType::Sha256WithRsa);
+        assert_eq!(decoded.digest, vec![0; 32]);
     }
 
 }
