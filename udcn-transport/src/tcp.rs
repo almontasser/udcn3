@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 
 use crate::Transport;

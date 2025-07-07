@@ -1,7 +1,7 @@
 use std::process;
 
 use clap::{Arg, ArgMatches, Command};
-use log::{debug, error, info, warn};
+use log::error;
 
 mod commands;
 mod utils;

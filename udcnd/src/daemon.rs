@@ -1,20 +1,21 @@
 use std::sync::Arc;
 
-use log::{debug, error, info, warn};
+use log::info;
 use tokio::sync::RwLock;
 
-use crate::{config::Config, service::Service};
+use crate::config::Config;
 
 pub struct Daemon {
     config: Config,
-    services: Arc<RwLock<Vec<Box<dyn Service>>>>,
+    // For now, we'll manage services differently until we need them
+    _services: Arc<RwLock<Vec<String>>>,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            services: Arc::new(RwLock::new(Vec::new())),
+            _services: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -34,13 +35,7 @@ impl Daemon {
     pub async fn stop(&mut self) {
         info!("Stopping UDCN Daemon services");
 
-        let services = self.services.read().await;
-        for service in services.iter() {
-            if let Err(e) = service.stop().await {
-                error!("Failed to stop service: {}", e);
-            }
-        }
-
+        // TODO: Implement actual service stopping when services are added
         info!("All services stopped");
     }
 

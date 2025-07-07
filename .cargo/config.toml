@@ -23,7 +23,7 @@ clippy-all = "clippy --workspace --all-targets --all-features -- -D warnings"
 fmt-all = "fmt --all"
 bench-all = "bench --workspace"
 build-release = "build --workspace --release"
-build-ebpf = "build --package udcn-ebpf --target bpfel-unknown-none"
+build-ebpf = "build --package udcn-ebpf --target bpfel-unknown-none -Zbuild-std=core"
 
 
 [target.x86_64-unknown-linux-gnu]

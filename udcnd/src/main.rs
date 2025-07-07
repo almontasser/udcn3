@@ -1,7 +1,7 @@
 use std::process;
 
 use clap::{Arg, Command};
-use log::{debug, error, info, warn};
+use log::{error, info};
 use tokio::signal;
 
 mod config;

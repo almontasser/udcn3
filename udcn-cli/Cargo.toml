@@ -5,7 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [[bin]]
-name = "udcn"
+name = "udcn-cli"
 path = "src/main.rs"
 
 [dependencies]

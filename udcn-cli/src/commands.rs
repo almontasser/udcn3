@@ -1,5 +1,5 @@
 use clap::ArgMatches;
-use log::{debug, error, info, warn};
+use log::info;
 
 pub async fn handle_node_command(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     match matches.subcommand() {
