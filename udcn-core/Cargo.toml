@@ -13,5 +13,8 @@ tokio = { workspace = true, features = ["full"] }
 libc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+sha2 = "0.10"
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"
 
 udcn-common = { path = "../udcn-common" }
