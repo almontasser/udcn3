@@ -34,7 +34,9 @@ pub async fn handle_node_command(matches: &ArgMatches) -> Result<(), Box<dyn std
     }
 }
 
-pub async fn handle_network_command(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_network_command(
+    matches: &ArgMatches,
+) -> Result<(), Box<dyn std::error::Error>> {
     match matches.subcommand() {
         Some(("status", _)) => {
             info!("Showing network status");

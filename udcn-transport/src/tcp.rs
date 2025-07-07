@@ -1,5 +1,8 @@
-use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+};
+
 use crate::Transport;
 
 pub struct TcpTransport {

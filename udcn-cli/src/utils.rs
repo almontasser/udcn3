@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 pub fn read_config_file<P: AsRef<Path>>(path: P) -> Result<String, Box<dyn std::error::Error>> {
     let contents = fs::read_to_string(path)?;

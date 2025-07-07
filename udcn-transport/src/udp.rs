@@ -1,4 +1,5 @@
 use std::net::UdpSocket;
+
 use crate::Transport;
 
 pub struct UdpTransport {
@@ -8,7 +9,7 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub fn new() -> Self {
-        Self { 
+        Self {
             socket: None,
             peer_addr: None,
         }

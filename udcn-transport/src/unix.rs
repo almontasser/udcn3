@@ -1,5 +1,8 @@
-use std::os::unix::net::UnixStream;
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+};
+
 use crate::Transport;
 
 pub struct UnixTransport {

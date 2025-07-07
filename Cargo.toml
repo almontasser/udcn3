@@ -14,6 +14,16 @@ default-members = ["udcn", "udcn-common"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.90"
+authors = ["UDCN Project"]
+repository = "https://github.com/udcn/udcn"
+keywords = ["networking", "ebpf", "sdn", "rust"]
+categories = ["network-programming", "development-tools"]
+
+[workspace.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [workspace.dependencies]
 aya = { version = "0.13.1", default-features = false }
@@ -32,17 +42,58 @@ libc = { version = "0.2.159", default-features = false }
 log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-[profile.release.package.udcn-ebpf]
-debug = 2
-codegen-units = 1
 
+# Build profiles for different use cases
 [profile.dev]
 debug = true
 opt-level = 0
+overflow-checks = true
+panic = "unwind"
+incremental = true
 
 [profile.release]
 debug = false
 opt-level = 3
 lto = true
 codegen-units = 1
+panic = "abort"
+overflow-checks = false
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+lto = "thin"
+
+[profile.test]
+opt-level = 1
+debug = true
+overflow-checks = true
+
+# Special profile for eBPF components - needs debug info even in release
+[profile.release.package.udcn-ebpf]
+debug = 2
+codegen-units = 1
+opt-level = 3
+
+# Development profile for faster eBPF compilation
+[profile.dev.package.udcn-ebpf]
+debug = 2
+opt-level = 1
+
+# Optimize benchmarking dependencies
+[profile.bench.package.criterion]
+debug = false
+opt-level = 3
+
+# Build configuration
+[workspace.metadata.build]
+rustc-env = [
+    "CARGO_PKG_VERSION",
+    "CARGO_PKG_AUTHORS",
+    "CARGO_PKG_NAME",
+    "CARGO_PKG_DESCRIPTION",
+]
+

@@ -1,0 +1,57 @@
+[build]
+# Default target for the workspace
+target = "x86_64-unknown-linux-gnu"
+
+# Use all available CPU cores for parallel compilation
+# jobs = 0  # 0 means use all available cores, but this is now automatic
+
+# Incremental compilation for faster builds
+incremental = true
+
+# Rustc wrapper for better caching (uncomment if using sccache)
+# rustc-wrapper = "sccache"
+
+[term]
+# Use color in terminal output
+color = "auto"
+
+[alias]
+# Useful aliases for common tasks
+check-all = "check --workspace --all-targets --all-features"
+test-all = "test --workspace --all-targets --all-features"
+clippy-all = "clippy --workspace --all-targets --all-features -- -D warnings"
+fmt-all = "fmt --all"
+bench-all = "bench --workspace"
+build-release = "build --workspace --release"
+build-ebpf = "build --package udcn-ebpf --target bpfel-unknown-none"
+
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.bpfel-unknown-none]
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "no-redzone",
+    "-C", "overflow-checks=off",
+    "-C", "opt-level=2",
+    "-C", "embed-bitcode=yes",
+]
+
+[env]
+# Environment variables for build
+RUST_LOG = "info"
+CARGO_INCREMENTAL = "1"
+
+# eBPF specific environment
+BPF_CLANG = "clang"
+BPF_CFLAGS = "-O2 -g -Wall -Werror"
+
+[registry]
+# Use sparse registry for faster index updates
+default = "sparse+https://index.crates.io/"

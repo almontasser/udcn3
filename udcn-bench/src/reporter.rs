@@ -1,6 +1,7 @@
-use std::collections::HashMap;
-use std::fs;
+use std::{collections::HashMap, fs};
+
 use serde::{Deserialize, Serialize};
+
 use crate::benchmarks::BenchmarkResult;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,7 +44,7 @@ impl Reporter {
 
         let json = serde_json::to_string_pretty(&report)?;
         fs::write(filename, json)?;
-        
+
         println!("Benchmark results saved to {}", filename);
         Ok(())
     }
@@ -55,7 +56,10 @@ impl Reporter {
         }
 
         println!("\n=== Benchmark Summary ===");
-        println!("{:<20} {:<15} {:<15} {:<15} {:<15}", "Test", "Operations", "Throughput", "Avg Latency", "Success Rate");
+        println!(
+            "{:<20} {:<15} {:<15} {:<15} {:<15}",
+            "Test", "Operations", "Throughput", "Avg Latency", "Success Rate"
+        );
         println!("{}", "-".repeat(80));
 
         for (name, result) in &self.results {
@@ -72,7 +76,10 @@ impl Reporter {
         let summary = self.calculate_summary();
         println!("\n=== Overall Summary ===");
         println!("Total Operations: {}", summary.total_operations);
-        println!("Average Throughput: {:.2} ops/sec", summary.average_throughput);
+        println!(
+            "Average Throughput: {:.2} ops/sec",
+            summary.average_throughput
+        );
         println!("Average Latency: {:.2} ms", summary.average_latency);
         println!("Total Duration: {:.2} seconds", summary.total_duration);
     }
@@ -88,11 +95,17 @@ impl Reporter {
         }
 
         let total_operations: u64 = self.results.values().map(|r| r.operations).sum();
-        let average_throughput: f64 = self.results.values().map(|r| r.throughput).sum::<f64>() / self.results.len() as f64;
-        let average_latency: f64 = self.results.values()
+        let average_throughput: f64 =
+            self.results.values().map(|r| r.throughput).sum::<f64>() / self.results.len() as f64;
+        let average_latency: f64 = self
+            .results
+            .values()
             .map(|r| r.latency_avg.as_secs_f64() * 1000.0)
-            .sum::<f64>() / self.results.len() as f64;
-        let total_duration: f64 = self.results.values()
+            .sum::<f64>()
+            / self.results.len() as f64;
+        let total_duration: f64 = self
+            .results
+            .values()
             .map(|r| r.duration.as_secs_f64())
             .sum::<f64>();
 

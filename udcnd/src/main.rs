@@ -1,14 +1,15 @@
+use std::process;
+
 use clap::{Arg, Command};
 use log::{debug, error, info, warn};
-use std::process;
 use tokio::signal;
 
-mod daemon;
 mod config;
+mod daemon;
 mod service;
 
-use daemon::Daemon;
 use config::Config;
+use daemon::Daemon;
 
 #[tokio::main]
 async fn main() {
@@ -23,14 +24,14 @@ async fn main() {
                 .long("config")
                 .value_name("FILE")
                 .help("Configuration file path")
-                .default_value("/etc/udcn/udcnd.conf")
+                .default_value("/etc/udcn/udcnd.conf"),
         )
         .arg(
             Arg::new("daemon")
                 .short('d')
                 .long("daemon")
                 .help("Run as daemon")
-                .action(clap::ArgAction::SetTrue)
+                .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -50,7 +51,7 @@ async fn main() {
     };
 
     let mut daemon = Daemon::new(config);
-    
+
     if let Err(e) = daemon.start().await {
         error!("Failed to start daemon: {}", e);
         process::exit(1);
@@ -59,7 +60,7 @@ async fn main() {
     info!("UDCN Daemon started successfully");
 
     signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-    
+
     info!("Shutting down UDCN Daemon");
     daemon.stop().await;
 }

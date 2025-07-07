@@ -1,6 +1,7 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use udcn_core::{NetworkManager, NetworkNode};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn benchmark_network_manager(c: &mut Criterion) {
     c.bench_function("network_manager_add_node", |b| {
@@ -23,7 +24,7 @@ fn benchmark_network_manager(c: &mut Criterion) {
             capabilities: vec!["test".to_string()],
         };
         manager.add_node(node);
-        
+
         b.iter(|| {
             let _ = manager.get_node(black_box("test_node"));
         })

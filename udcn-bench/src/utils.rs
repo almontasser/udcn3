@@ -4,7 +4,7 @@ pub fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
     let millis = duration.subsec_millis();
     let micros = duration.subsec_micros() % 1000;
-    
+
     if secs > 0 {
         format!("{}.{:03}s", secs, millis)
     } else if millis > 0 {
@@ -28,7 +28,7 @@ pub fn percentile(values: &mut [Duration], percentile: f64) -> Duration {
     if values.is_empty() {
         return Duration::from_secs(0);
     }
-    
+
     values.sort();
     let index = (values.len() as f64 * percentile / 100.0) as usize;
     let index = index.min(values.len() - 1);
@@ -62,7 +62,7 @@ mod tests {
             Duration::from_millis(4),
             Duration::from_millis(5),
         ];
-        
+
         assert_eq!(percentile(&mut values, 50.0), Duration::from_millis(3));
         assert_eq!(percentile(&mut values, 90.0), Duration::from_millis(5));
     }
