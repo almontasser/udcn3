@@ -43,6 +43,8 @@ log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+thiserror = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 
 
 # Build profiles for different use cases

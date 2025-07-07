@@ -3,10 +3,14 @@ use log::{debug, error, info, warn};
 pub mod network;
 pub mod protocol;
 pub mod security;
+pub mod tlv;
+pub mod packets;
 
 pub use network::*;
 pub use protocol::*;
 pub use security::*;
+pub use tlv::*;
+pub use packets::*;
 
 pub fn init() {
     info!("UDCN Core initialized");

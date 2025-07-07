@@ -1116,6 +1116,8 @@ dependencies = [
  "aya-log",
  "libc",
  "log",
+ "serde",
+ "thiserror 1.0.69",
  "tokio",
  "udcn-common",
 ]

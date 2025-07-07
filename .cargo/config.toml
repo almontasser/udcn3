@@ -1,6 +1,6 @@
 [build]
 # Default target for the workspace
-target = "x86_64-unknown-linux-gnu"
+# target = "x86_64-unknown-linux-gnu"  # Commented out to use native target
 
 # Use all available CPU cores for parallel compilation
 # jobs = 0  # 0 means use all available cores, but this is now automatic
@@ -28,11 +28,9 @@ build-ebpf = "build --package udcn-ebpf --target bpfel-unknown-none"
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.bpfel-unknown-none]
 rustflags = [
