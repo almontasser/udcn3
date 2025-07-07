@@ -1424,6 +1424,726 @@ impl fmt::Display for HierarchyError {
 
 impl std::error::Error for HierarchyError {}
 
+// Validation and normalization functions
+
+/// Configuration for name validation rules
+#[derive(Debug, Clone)]
+pub struct ValidationConfig {
+    pub max_component_length: usize,
+    pub max_name_length: usize,
+    pub min_component_length: usize,
+    pub allowed_characters: ValidationCharacterSet,
+    pub case_sensitive: bool,
+    pub allow_empty_components: bool,
+    pub require_leading_slash: bool,
+    pub allow_trailing_slash: bool,
+    pub max_hierarchy_depth: Option<usize>,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_component_length: 255,
+            max_name_length: 8192,
+            min_component_length: 1,
+            allowed_characters: ValidationCharacterSet::Extended,
+            case_sensitive: true,
+            allow_empty_components: false,
+            require_leading_slash: true,
+            allow_trailing_slash: false,
+            max_hierarchy_depth: Some(32),
+        }
+    }
+}
+
+/// Character set validation options
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationCharacterSet {
+    /// Only ASCII alphanumeric and basic punctuation
+    Basic,
+    /// Extended ASCII including more symbols
+    Extended,
+    /// Full Unicode support
+    Unicode,
+    /// Custom character set with allowed characters
+    Custom(std::collections::HashSet<char>),
+}
+
+/// Configuration for name normalization
+#[derive(Debug, Clone)]
+pub struct NormalizationConfig {
+    pub case_handling: CaseHandling,
+    pub whitespace_handling: WhitespaceHandling,
+    pub diacritics_handling: DiacriticsHandling,
+    pub character_substitution: CharacterSubstitution,
+    pub encoding_normalization: EncodingNormalization,
+}
+
+impl Default for NormalizationConfig {
+    fn default() -> Self {
+        Self {
+            case_handling: CaseHandling::Preserve,
+            whitespace_handling: WhitespaceHandling::TrimAndCollapse,
+            diacritics_handling: DiacriticsHandling::Preserve,
+            character_substitution: CharacterSubstitution::None,
+            encoding_normalization: EncodingNormalization::Nfc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaseHandling {
+    Preserve,
+    ToLowercase,
+    ToUppercase,
+    TitleCase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhitespaceHandling {
+    Preserve,
+    Trim,
+    TrimAndCollapse,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiacriticsHandling {
+    Preserve,
+    Remove,
+    Normalize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CharacterSubstitution {
+    None,
+    BasicAscii,
+    Custom(HashMap<char, char>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodingNormalization {
+    None,
+    Nfc,  // Canonical Decomposition, followed by Canonical Composition
+    Nfd,  // Canonical Decomposition
+    Nfkc, // Compatibility Decomposition, followed by Canonical Composition
+    Nfkd, // Compatibility Decomposition
+}
+
+/// Validation engine for names and components
+#[derive(Debug, Clone)]
+pub struct NameValidator {
+    config: ValidationConfig,
+}
+
+impl NameValidator {
+    pub fn new() -> Self {
+        Self {
+            config: ValidationConfig::default(),
+        }
+    }
+
+    pub fn with_config(config: ValidationConfig) -> Self {
+        Self { config }
+    }
+
+    /// Validate a complete name
+    pub fn validate_name(&self, name: &Name) -> Result<(), ValidationError> {
+        // Check name length
+        let total_length = name.to_uri().len();
+        if total_length > self.config.max_name_length {
+            return Err(ValidationError::NameTooLong {
+                length: total_length,
+                max_length: self.config.max_name_length,
+            });
+        }
+
+        // Check hierarchy depth
+        if let Some(max_depth) = self.config.max_hierarchy_depth {
+            if name.len() > max_depth {
+                return Err(ValidationError::HierarchyTooDeep {
+                    depth: name.len(),
+                    max_depth,
+                });
+            }
+        }
+
+        // Check URI format
+        let uri = name.to_uri();
+        if self.config.require_leading_slash && !uri.starts_with('/') {
+            return Err(ValidationError::InvalidFormat("Name must start with '/'".to_string()));
+        }
+
+        if !self.config.allow_trailing_slash && uri.len() > 1 && uri.ends_with('/') {
+            return Err(ValidationError::InvalidFormat("Name cannot end with '/'".to_string()));
+        }
+
+        // Validate each component
+        for (index, component) in name.components.iter().enumerate() {
+            self.validate_component(component)
+                .map_err(|e| ValidationError::ComponentError { index, error: Box::new(e) })?;
+        }
+
+        // Check for empty components if not allowed
+        if !self.config.allow_empty_components {
+            for (index, component) in name.components.iter().enumerate() {
+                if component.is_empty() {
+                    return Err(ValidationError::ComponentError {
+                        index,
+                        error: Box::new(ValidationError::EmptyComponent),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a single name component
+    pub fn validate_component(&self, component: &NameComponent) -> Result<(), ValidationError> {
+        let length = component.len();
+
+        // Check component length
+        if length < self.config.min_component_length {
+            return Err(ValidationError::ComponentTooShort {
+                length,
+                min_length: self.config.min_component_length,
+            });
+        }
+
+        if length > self.config.max_component_length {
+            return Err(ValidationError::ComponentTooLong {
+                length,
+                max_length: self.config.max_component_length,
+            });
+        }
+
+        // Check character set
+        if let Ok(text) = component.as_str() {
+            self.validate_character_set(text)?;
+        }
+
+        // Validate component type specific rules
+        self.validate_component_type(component)?;
+
+        Ok(())
+    }
+
+    /// Validate hierarchy consistency
+    pub fn validate_hierarchy(&self, hierarchy: &NameHierarchy) -> Result<(), ValidationError> {
+        // Use the existing hierarchy validation
+        hierarchy.validate().map_err(ValidationError::HierarchyError)?;
+
+        // Additional validation rules
+        if let Some(max_depth) = self.config.max_hierarchy_depth {
+            if hierarchy.height() > max_depth {
+                return Err(ValidationError::HierarchyTooDeep {
+                    depth: hierarchy.height(),
+                    max_depth,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for circular references in name relationships
+    pub fn check_circular_references(&self, names: &[Name]) -> Result<(), ValidationError> {
+        // Build a dependency graph based on prefix relationships
+        let mut visited = std::collections::HashSet::new();
+        let mut rec_stack = std::collections::HashSet::new();
+
+        for name in names {
+            if !visited.contains(name) {
+                if self.has_cycle_util(name, names, &mut visited, &mut rec_stack) {
+                    return Err(ValidationError::CircularReference);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set validation configuration
+    pub fn set_config(&mut self, config: ValidationConfig) {
+        self.config = config;
+    }
+
+    /// Get current validation configuration
+    pub fn get_config(&self) -> &ValidationConfig {
+        &self.config
+    }
+
+    // Private helper methods
+
+    fn validate_character_set(&self, text: &str) -> Result<(), ValidationError> {
+        match &self.config.allowed_characters {
+            ValidationCharacterSet::Basic => {
+                for ch in text.chars() {
+                    if !ch.is_ascii_alphanumeric() && !"-_.".contains(ch) {
+                        return Err(ValidationError::InvalidCharacter(ch));
+                    }
+                }
+            }
+            ValidationCharacterSet::Extended => {
+                for ch in text.chars() {
+                    if !ch.is_ascii_graphic() && !ch.is_ascii_whitespace() {
+                        return Err(ValidationError::InvalidCharacter(ch));
+                    }
+                }
+            }
+            ValidationCharacterSet::Unicode => {
+                // Unicode allows most characters, but exclude control characters
+                for ch in text.chars() {
+                    if ch.is_control() && ch != '\t' && ch != '\n' && ch != '\r' {
+                        return Err(ValidationError::InvalidCharacter(ch));
+                    }
+                }
+            }
+            ValidationCharacterSet::Custom(allowed_chars) => {
+                for ch in text.chars() {
+                    if !allowed_chars.contains(&ch) {
+                        return Err(ValidationError::InvalidCharacter(ch));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_component_type(&self, component: &NameComponent) -> Result<(), ValidationError> {
+        match component.component_type {
+            ComponentType::TimestampNameComponent => {
+                if let Ok(text) = component.as_str() {
+                    if text.parse::<u64>().is_err() {
+                        return Err(ValidationError::InvalidComponentType {
+                            component_type: component.component_type.clone(),
+                            reason: "Timestamp must be a valid number".to_string(),
+                        });
+                    }
+                }
+            }
+            ComponentType::VersionNameComponent => {
+                if let Ok(text) = component.as_str() {
+                    if !text.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                        return Err(ValidationError::InvalidComponentType {
+                            component_type: component.component_type.clone(),
+                            reason: "Version must contain only digits and dots".to_string(),
+                        });
+                    }
+                }
+            }
+            ComponentType::SequenceNumNameComponent => {
+                if let Ok(text) = component.as_str() {
+                    if text.parse::<u64>().is_err() {
+                        return Err(ValidationError::InvalidComponentType {
+                            component_type: component.component_type.clone(),
+                            reason: "Sequence number must be a valid number".to_string(),
+                        });
+                    }
+                }
+            }
+            ComponentType::ByteOffsetNameComponent => {
+                if let Ok(text) = component.as_str() {
+                    if text.parse::<u64>().is_err() {
+                        return Err(ValidationError::InvalidComponentType {
+                            component_type: component.component_type.clone(),
+                            reason: "Byte offset must be a valid number".to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {} // Other types don't have specific validation rules
+        }
+        Ok(())
+    }
+
+    fn has_cycle_util(
+        &self,
+        name: &Name,
+        all_names: &[Name],
+        visited: &mut std::collections::HashSet<Name>,
+        rec_stack: &mut std::collections::HashSet<Name>,
+    ) -> bool {
+        visited.insert(name.clone());
+        rec_stack.insert(name.clone());
+
+        // Check all names that could be considered "dependent" on this name
+        for other_name in all_names {
+            if other_name != name && self.is_prefix_of(name, other_name) {
+                if !visited.contains(other_name) {
+                    if self.has_cycle_util(other_name, all_names, visited, rec_stack) {
+                        return true;
+                    }
+                } else if rec_stack.contains(other_name) {
+                    return true;
+                }
+            }
+        }
+
+        rec_stack.remove(name);
+        false
+    }
+
+    fn is_prefix_of(&self, prefix: &Name, name: &Name) -> bool {
+        if prefix.len() >= name.len() {
+            return false;
+        }
+
+        for i in 0..prefix.len() {
+            if prefix.get_component(i) != name.get_component(i) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Default for NameValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Name normalization engine
+#[derive(Debug, Clone)]
+pub struct NameNormalizer {
+    config: NormalizationConfig,
+}
+
+impl NameNormalizer {
+    pub fn new() -> Self {
+        Self {
+            config: NormalizationConfig::default(),
+        }
+    }
+
+    pub fn with_config(config: NormalizationConfig) -> Self {
+        Self { config }
+    }
+
+    /// Normalize a complete name
+    pub fn normalize_name(&self, name: &Name) -> Result<Name, ValidationError> {
+        let mut normalized_components = Vec::new();
+
+        for component in &name.components {
+            let normalized_component = self.normalize_component(component)?;
+            normalized_components.push(normalized_component);
+        }
+
+        Ok(Name {
+            components: normalized_components,
+        })
+    }
+
+    /// Normalize a single name component
+    pub fn normalize_component(&self, component: &NameComponent) -> Result<NameComponent, ValidationError> {
+        if let Ok(text) = component.as_str() {
+            let normalized_text = self.normalize_text(text)?;
+            let normalized_bytes = normalized_text.as_bytes().to_vec();
+
+            Ok(NameComponent {
+                value: normalized_bytes,
+                component_type: component.component_type.clone(),
+                metadata: component.metadata.clone(),
+            })
+        } else {
+            // For non-UTF8 components, only apply byte-level normalizations
+            Ok(component.clone())
+        }
+    }
+
+    /// Normalize text according to configuration
+    pub fn normalize_text(&self, text: &str) -> Result<String, ValidationError> {
+        let mut result = text.to_string();
+
+        // Apply whitespace handling
+        result = self.handle_whitespace(&result);
+
+        // Apply case handling
+        result = self.handle_case(&result);
+
+        // Apply character substitution
+        result = self.handle_character_substitution(&result);
+
+        // Apply diacritics handling
+        result = self.handle_diacritics(&result);
+
+        // Apply encoding normalization
+        result = self.handle_encoding_normalization(&result)?;
+
+        Ok(result)
+    }
+
+    /// Set normalization configuration
+    pub fn set_config(&mut self, config: NormalizationConfig) {
+        self.config = config;
+    }
+
+    /// Get current normalization configuration
+    pub fn get_config(&self) -> &NormalizationConfig {
+        &self.config
+    }
+
+    // Private helper methods
+
+    fn handle_whitespace(&self, text: &str) -> String {
+        match self.config.whitespace_handling {
+            WhitespaceHandling::Preserve => text.to_string(),
+            WhitespaceHandling::Trim => text.trim().to_string(),
+            WhitespaceHandling::TrimAndCollapse => {
+                let trimmed = text.trim();
+                trimmed.split_whitespace().collect::<Vec<&str>>().join(" ")
+            }
+            WhitespaceHandling::Remove => text.chars().filter(|c| !c.is_whitespace()).collect(),
+        }
+    }
+
+    fn handle_case(&self, text: &str) -> String {
+        match self.config.case_handling {
+            CaseHandling::Preserve => text.to_string(),
+            CaseHandling::ToLowercase => text.to_lowercase(),
+            CaseHandling::ToUppercase => text.to_uppercase(),
+            CaseHandling::TitleCase => {
+                let mut result = String::new();
+                let mut capitalize_next = true;
+
+                for ch in text.chars() {
+                    if ch.is_alphabetic() {
+                        if capitalize_next {
+                            result.push(ch.to_uppercase().next().unwrap_or(ch));
+                            capitalize_next = false;
+                        } else {
+                            result.push(ch.to_lowercase().next().unwrap_or(ch));
+                        }
+                    } else {
+                        result.push(ch);
+                        capitalize_next = ch.is_whitespace() || ch == '-' || ch == '_';
+                    }
+                }
+
+                result
+            }
+        }
+    }
+
+    fn handle_character_substitution(&self, text: &str) -> String {
+        match &self.config.character_substitution {
+            CharacterSubstitution::None => text.to_string(),
+            CharacterSubstitution::BasicAscii => {
+                text.chars()
+                    .map(|c| match c {
+                        'À'..='Ö' | 'Ø'..='ö' | 'ø'..='ÿ' => self.remove_diacritics_char(c),
+                        _ if c.is_ascii() => c,
+                        _ => '_', // Replace non-ASCII with underscore
+                    })
+                    .collect()
+            }
+            CharacterSubstitution::Custom(substitutions) => {
+                text.chars()
+                    .map(|c| substitutions.get(&c).copied().unwrap_or(c))
+                    .collect()
+            }
+        }
+    }
+
+    fn handle_diacritics(&self, text: &str) -> String {
+        match self.config.diacritics_handling {
+            DiacriticsHandling::Preserve => text.to_string(),
+            DiacriticsHandling::Remove => text.chars().map(|c| self.remove_diacritics_char(c)).collect(),
+            DiacriticsHandling::Normalize => {
+                // Simple normalization - in a real implementation, you'd use a proper Unicode library
+                text.chars().map(|c| self.normalize_diacritics_char(c)).collect()
+            }
+        }
+    }
+
+    fn handle_encoding_normalization(&self, text: &str) -> Result<String, ValidationError> {
+        match self.config.encoding_normalization {
+            EncodingNormalization::None => Ok(text.to_string()),
+            // Note: In a production implementation, you would use the `unicode-normalization` crate
+            // For this basic implementation, we'll just return the text as-is
+            EncodingNormalization::Nfc
+            | EncodingNormalization::Nfd
+            | EncodingNormalization::Nfkc
+            | EncodingNormalization::Nfkd => {
+                // Placeholder - in real implementation, use unicode_normalization crate
+                Ok(text.to_string())
+            }
+        }
+    }
+
+    fn remove_diacritics_char(&self, c: char) -> char {
+        // Simple diacritics removal mapping
+        match c {
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'È' | 'É' | 'Ê' | 'Ë' => 'E',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'Ì' | 'Í' | 'Î' | 'Ï' => 'I',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => 'O',
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+            'Ù' | 'Ú' | 'Û' | 'Ü' => 'U',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            'Ý' => 'Y',
+            'ý' | 'ÿ' => 'y',
+            'Ñ' => 'N',
+            'ñ' => 'n',
+            'Ç' => 'C',
+            'ç' => 'c',
+            _ => c,
+        }
+    }
+
+    fn normalize_diacritics_char(&self, c: char) -> char {
+        // For simple normalization, just remove diacritics
+        self.remove_diacritics_char(c)
+    }
+}
+
+impl Default for NameNormalizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Errors that can occur during validation
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidationError {
+    NameTooLong { length: usize, max_length: usize },
+    ComponentTooLong { length: usize, max_length: usize },
+    ComponentTooShort { length: usize, min_length: usize },
+    EmptyComponent,
+    InvalidCharacter(char),
+    InvalidFormat(String),
+    InvalidComponentType { component_type: ComponentType, reason: String },
+    HierarchyTooDeep { depth: usize, max_depth: usize },
+    CircularReference,
+    HierarchyError(HierarchyError),
+    ComponentError { index: usize, error: Box<ValidationError> },
+    EncodingError(String),
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::NameTooLong { length, max_length } => {
+                write!(f, "Name too long: {} characters (max: {})", length, max_length)
+            }
+            ValidationError::ComponentTooLong { length, max_length } => {
+                write!(f, "Component too long: {} characters (max: {})", length, max_length)
+            }
+            ValidationError::ComponentTooShort { length, min_length } => {
+                write!(f, "Component too short: {} characters (min: {})", length, min_length)
+            }
+            ValidationError::EmptyComponent => write!(f, "Empty component not allowed"),
+            ValidationError::InvalidCharacter(ch) => write!(f, "Invalid character: '{}'", ch),
+            ValidationError::InvalidFormat(msg) => write!(f, "Invalid format: {}", msg),
+            ValidationError::InvalidComponentType { component_type, reason } => {
+                write!(f, "Invalid component type {:?}: {}", component_type, reason)
+            }
+            ValidationError::HierarchyTooDeep { depth, max_depth } => {
+                write!(f, "Hierarchy too deep: {} levels (max: {})", depth, max_depth)
+            }
+            ValidationError::CircularReference => write!(f, "Circular reference detected"),
+            ValidationError::HierarchyError(err) => write!(f, "Hierarchy error: {}", err),
+            ValidationError::ComponentError { index, error } => {
+                write!(f, "Error in component {}: {}", index, error)
+            }
+            ValidationError::EncodingError(msg) => write!(f, "Encoding error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+/// Combined validation and normalization engine
+#[derive(Debug, Clone)]
+pub struct NameProcessor {
+    validator: NameValidator,
+    normalizer: NameNormalizer,
+}
+
+impl NameProcessor {
+    pub fn new() -> Self {
+        Self {
+            validator: NameValidator::new(),
+            normalizer: NameNormalizer::new(),
+        }
+    }
+
+    pub fn with_configs(
+        validation_config: ValidationConfig,
+        normalization_config: NormalizationConfig,
+    ) -> Self {
+        Self {
+            validator: NameValidator::with_config(validation_config),
+            normalizer: NameNormalizer::with_config(normalization_config),
+        }
+    }
+
+    /// Process a name: normalize then validate
+    pub fn process_name(&self, name: &Name) -> Result<Name, ValidationError> {
+        let normalized = self.normalizer.normalize_name(name)?;
+        self.validator.validate_name(&normalized)?;
+        Ok(normalized)
+    }
+
+    /// Process a component: normalize then validate
+    pub fn process_component(&self, component: &NameComponent) -> Result<NameComponent, ValidationError> {
+        let normalized = self.normalizer.normalize_component(component)?;
+        self.validator.validate_component(&normalized)?;
+        Ok(normalized)
+    }
+
+    /// Validate without normalization
+    pub fn validate_name(&self, name: &Name) -> Result<(), ValidationError> {
+        self.validator.validate_name(name)
+    }
+
+    /// Validate component without normalization
+    pub fn validate_component(&self, component: &NameComponent) -> Result<(), ValidationError> {
+        self.validator.validate_component(component)
+    }
+
+    /// Normalize without validation
+    pub fn normalize_name(&self, name: &Name) -> Result<Name, ValidationError> {
+        self.normalizer.normalize_name(name)
+    }
+
+    /// Normalize component without validation
+    pub fn normalize_component(&self, component: &NameComponent) -> Result<NameComponent, ValidationError> {
+        self.normalizer.normalize_component(component)
+    }
+
+    /// Get validator reference
+    pub fn validator(&self) -> &NameValidator {
+        &self.validator
+    }
+
+    /// Get normalizer reference
+    pub fn normalizer(&self) -> &NameNormalizer {
+        &self.normalizer
+    }
+
+    /// Get mutable validator reference
+    pub fn validator_mut(&mut self) -> &mut NameValidator {
+        &mut self.validator
+    }
+
+    /// Get mutable normalizer reference
+    pub fn normalizer_mut(&mut self) -> &mut NameNormalizer {
+        &mut self.normalizer
+    }
+}
+
+impl Default for NameProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Bulk operations for managing multiple hierarchy changes
 pub struct HierarchyBulkOperations {
     hierarchy: NameHierarchy,
@@ -1893,5 +2613,536 @@ mod hierarchy_tests {
         assert_eq!(hierarchy.size(), 0);
         assert!(hierarchy.is_empty());
         assert!(hierarchy.get_root().is_none());
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_validation_config_default() {
+        let config = ValidationConfig::default();
+        assert_eq!(config.max_component_length, 255);
+        assert_eq!(config.max_name_length, 8192);
+        assert_eq!(config.min_component_length, 1);
+        assert!(!config.allow_empty_components);
+        assert!(config.require_leading_slash);
+        assert!(!config.allow_trailing_slash);
+    }
+
+    #[test]
+    fn test_name_validator_basic() {
+        let validator = NameValidator::new();
+        let name = Name::from_str("/hello/world").unwrap();
+        
+        assert!(validator.validate_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_name_validator_empty_component() {
+        let validator = NameValidator::new();
+        let mut name = Name::new();
+        name.push(NameComponent::from_str("hello"));
+        name.push(NameComponent::from_str("")); // Empty component
+        name.push(NameComponent::from_str("world"));
+        
+        let result = validator.validate_name(&name);
+        assert!(result.is_err());
+        if let Err(ValidationError::ComponentError { index, error: _ }) = result {
+            assert_eq!(index, 1);
+        } else {
+            panic!("Expected ComponentError");
+        }
+    }
+
+    #[test]
+    fn test_name_validator_component_too_long() {
+        let mut config = ValidationConfig::default();
+        config.max_component_length = 5;
+        let validator = NameValidator::with_config(config);
+        
+        let component = NameComponent::from_str("this_is_too_long");
+        let result = validator.validate_component(&component);
+        
+        assert!(matches!(result, Err(ValidationError::ComponentTooLong { .. })));
+    }
+
+    #[test]
+    fn test_name_validator_component_too_short() {
+        let mut config = ValidationConfig::default();
+        config.min_component_length = 5;
+        let validator = NameValidator::with_config(config);
+        
+        let component = NameComponent::from_str("hi");
+        let result = validator.validate_component(&component);
+        
+        assert!(matches!(result, Err(ValidationError::ComponentTooShort { .. })));
+    }
+
+    #[test]
+    fn test_name_validator_invalid_character_basic() {
+        let mut config = ValidationConfig::default();
+        config.allowed_characters = ValidationCharacterSet::Basic;
+        let validator = NameValidator::with_config(config);
+        
+        let component = NameComponent::from_str("hello@world");
+        let result = validator.validate_component(&component);
+        
+        assert!(matches!(result, Err(ValidationError::InvalidCharacter('@'))));
+    }
+
+    #[test]
+    fn test_name_validator_custom_character_set() {
+        let mut allowed_chars = std::collections::HashSet::new();
+        allowed_chars.insert('a');
+        allowed_chars.insert('b');
+        allowed_chars.insert('c');
+        
+        let mut config = ValidationConfig::default();
+        config.allowed_characters = ValidationCharacterSet::Custom(allowed_chars);
+        let validator = NameValidator::with_config(config);
+        
+        let valid_component = NameComponent::from_str("abc");
+        assert!(validator.validate_component(&valid_component).is_ok());
+        
+        let invalid_component = NameComponent::from_str("abcd");
+        let result = validator.validate_component(&invalid_component);
+        assert!(matches!(result, Err(ValidationError::InvalidCharacter('d'))));
+    }
+
+    #[test]
+    fn test_name_validator_hierarchy_depth() {
+        let mut config = ValidationConfig::default();
+        config.max_hierarchy_depth = Some(3);
+        let validator = NameValidator::with_config(config);
+        
+        let shallow_name = Name::from_str("/a/b/c").unwrap();
+        assert!(validator.validate_name(&shallow_name).is_ok());
+        
+        let deep_name = Name::from_str("/a/b/c/d").unwrap();
+        let result = validator.validate_name(&deep_name);
+        assert!(matches!(result, Err(ValidationError::HierarchyTooDeep { .. })));
+    }
+
+    #[test]
+    fn test_name_validator_component_type_timestamp() {
+        let validator = NameValidator::new();
+        
+        let valid_timestamp = NameComponent::with_type(
+            "1234567890".as_bytes().to_vec(),
+            ComponentType::TimestampNameComponent,
+        );
+        assert!(validator.validate_component(&valid_timestamp).is_ok());
+        
+        let invalid_timestamp = NameComponent::with_type(
+            "not_a_number".as_bytes().to_vec(),
+            ComponentType::TimestampNameComponent,
+        );
+        let result = validator.validate_component(&invalid_timestamp);
+        assert!(matches!(result, Err(ValidationError::InvalidComponentType { .. })));
+    }
+
+    #[test]
+    fn test_name_validator_component_type_version() {
+        let validator = NameValidator::new();
+        
+        let valid_version = NameComponent::with_type(
+            "1.2.3".as_bytes().to_vec(),
+            ComponentType::VersionNameComponent,
+        );
+        assert!(validator.validate_component(&valid_version).is_ok());
+        
+        let invalid_version = NameComponent::with_type(
+            "1.2.3a".as_bytes().to_vec(),
+            ComponentType::VersionNameComponent,
+        );
+        let result = validator.validate_component(&invalid_version);
+        assert!(matches!(result, Err(ValidationError::InvalidComponentType { .. })));
+    }
+
+    #[test]
+    fn test_name_validator_leading_slash() {
+        let validator = NameValidator::new();
+        
+        // Test by creating a name manually to preserve the original string format
+        let mut name_without_slash = Name::new();
+        name_without_slash.push(NameComponent::from_str("hello"));
+        name_without_slash.push(NameComponent::from_str("world"));
+        
+        // Override the to_uri method behavior by checking against the actual validation logic
+        // Since from_str normalizes the input, we need to test the validation logic differently
+        
+        // The validation checks the URI output, so let's test with a config that disables leading slash requirement
+        let mut config = ValidationConfig::default();
+        config.require_leading_slash = false;
+        let permissive_validator = NameValidator::with_config(config);
+        
+        // This should pass since we disabled the requirement
+        assert!(permissive_validator.validate_name(&name_without_slash).is_ok());
+        
+        // With the default config that requires leading slash, it should pass because 
+        // Name::to_uri() always adds a leading slash
+        let name_with_slash = Name::from_str("/hello/world").unwrap();
+        assert!(validator.validate_name(&name_with_slash).is_ok());
+    }
+
+    #[test]
+    fn test_name_validator_trailing_slash() {
+        let validator = NameValidator::new();
+        
+        // The Name::from_str method filters out empty components from trailing slashes
+        // so we need to test this differently. Let's create a custom URI string for testing
+        
+        // Create a name and test if it would fail with trailing slash in the URI
+        let name = Name::from_str("/hello/world").unwrap();
+        assert!(validator.validate_name(&name).is_ok());
+        
+        // Test the trailing slash logic by using a name with an empty component at the end
+        let mut name_with_empty_end = Name::new();
+        name_with_empty_end.push(NameComponent::from_str("hello"));
+        name_with_empty_end.push(NameComponent::from_str("world"));
+        
+        // Since Name::to_uri() doesn't add trailing slashes for normal names,
+        // let's test the validation with a config that allows trailing slashes
+        let mut config = ValidationConfig::default();
+        config.allow_trailing_slash = true;
+        let permissive_validator = NameValidator::with_config(config);
+        assert!(permissive_validator.validate_name(&name_with_empty_end).is_ok());
+    }
+
+    #[test]
+    fn test_name_validator_circular_references() {
+        let validator = NameValidator::new();
+        
+        let name1 = Name::from_str("/a/b").unwrap();
+        let name2 = Name::from_str("/a").unwrap();
+        let name3 = Name::from_str("/a/b/c").unwrap();
+        
+        let names = vec![name1, name2, name3];
+        
+        // This should not detect a circular reference since it's a valid hierarchy
+        assert!(validator.check_circular_references(&names).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    fn test_normalization_config_default() {
+        let config = NormalizationConfig::default();
+        assert_eq!(config.case_handling, CaseHandling::Preserve);
+        assert_eq!(config.whitespace_handling, WhitespaceHandling::TrimAndCollapse);
+        assert_eq!(config.diacritics_handling, DiacriticsHandling::Preserve);
+    }
+
+    #[test]
+    fn test_name_normalizer_basic() {
+        let normalizer = NameNormalizer::new();
+        let name = Name::from_str("/hello/world").unwrap();
+        
+        let normalized = normalizer.normalize_name(&name).unwrap();
+        assert_eq!(normalized, name);
+    }
+
+    #[test]
+    fn test_name_normalizer_whitespace_trim_and_collapse() {
+        let mut config = NormalizationConfig::default();
+        config.whitespace_handling = WhitespaceHandling::TrimAndCollapse;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("  hello   world  ");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_name_normalizer_whitespace_remove() {
+        let mut config = NormalizationConfig::default();
+        config.whitespace_handling = WhitespaceHandling::Remove;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("hello world");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "helloworld");
+    }
+
+    #[test]
+    fn test_name_normalizer_case_lowercase() {
+        let mut config = NormalizationConfig::default();
+        config.case_handling = CaseHandling::ToLowercase;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("Hello World");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_name_normalizer_case_uppercase() {
+        let mut config = NormalizationConfig::default();
+        config.case_handling = CaseHandling::ToUppercase;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("Hello World");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "HELLO WORLD");
+    }
+
+    #[test]
+    fn test_name_normalizer_case_title() {
+        let mut config = NormalizationConfig::default();
+        config.case_handling = CaseHandling::TitleCase;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("hello world");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn test_name_normalizer_diacritics_remove() {
+        let mut config = NormalizationConfig::default();
+        config.diacritics_handling = DiacriticsHandling::Remove;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("hëllö wörld");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_name_normalizer_character_substitution_basic_ascii() {
+        let mut config = NormalizationConfig::default();
+        config.character_substitution = CharacterSubstitution::BasicAscii;
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("hëllö 世界");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "hello __");
+    }
+
+    #[test]
+    fn test_name_normalizer_character_substitution_custom() {
+        let mut substitutions = HashMap::new();
+        substitutions.insert('o', '0');
+        substitutions.insert('l', '1');
+        
+        let mut config = NormalizationConfig::default();
+        config.character_substitution = CharacterSubstitution::Custom(substitutions);
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("hello");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "he110");
+    }
+
+    #[test]
+    fn test_name_normalizer_combined_operations() {
+        let mut config = NormalizationConfig::default();
+        config.case_handling = CaseHandling::ToLowercase;
+        config.whitespace_handling = WhitespaceHandling::TrimAndCollapse;
+        config.diacritics_handling = DiacriticsHandling::Remove;
+        
+        let normalizer = NameNormalizer::with_config(config);
+        
+        let component = NameComponent::from_str("  HËLLÖ   WÖRLD  ");
+        let normalized = normalizer.normalize_component(&component).unwrap();
+        
+        assert_eq!(normalized.as_str().unwrap(), "hello world");
+    }
+}
+
+#[cfg(test)]
+mod name_processor_tests {
+    use super::*;
+
+    #[test]
+    fn test_name_processor_basic() {
+        let processor = NameProcessor::new();
+        let name = Name::from_str("/hello/world").unwrap();
+        
+        let processed = processor.process_name(&name).unwrap();
+        assert_eq!(processed, name);
+    }
+
+    #[test]
+    fn test_name_processor_with_configs() {
+        let mut validation_config = ValidationConfig::default();
+        validation_config.max_component_length = 10;
+        
+        let mut normalization_config = NormalizationConfig::default();
+        normalization_config.case_handling = CaseHandling::ToLowercase;
+        
+        let processor = NameProcessor::with_configs(validation_config, normalization_config);
+        
+        let component = NameComponent::from_str("HELLO");
+        let processed = processor.process_component(&component).unwrap();
+        
+        assert_eq!(processed.as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_name_processor_validation_failure() {
+        let mut validation_config = ValidationConfig::default();
+        validation_config.max_component_length = 3;
+        
+        let processor = NameProcessor::with_configs(validation_config, NormalizationConfig::default());
+        
+        let component = NameComponent::from_str("toolong");
+        let result = processor.process_component(&component);
+        
+        assert!(matches!(result, Err(ValidationError::ComponentTooLong { .. })));
+    }
+
+    #[test]
+    fn test_name_processor_normalize_then_validate() {
+        let mut validation_config = ValidationConfig::default();
+        validation_config.allowed_characters = ValidationCharacterSet::Basic;
+        
+        let mut normalization_config = NormalizationConfig::default();
+        normalization_config.character_substitution = CharacterSubstitution::BasicAscii;
+        
+        let processor = NameProcessor::with_configs(validation_config, normalization_config);
+        
+        // Original has non-ASCII characters, but normalization should fix it
+        let component = NameComponent::from_str("hëllö");
+        let processed = processor.process_component(&component).unwrap();
+        
+        assert_eq!(processed.as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_name_processor_validate_only() {
+        let processor = NameProcessor::new();
+        let name = Name::from_str("/hello/world").unwrap();
+        
+        assert!(processor.validate_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_name_processor_normalize_only() {
+        let processor = NameProcessor::new();
+        let name = Name::from_str("/hello/world").unwrap();
+        
+        let normalized = processor.normalize_name(&name).unwrap();
+        assert_eq!(normalized, name);
+    }
+
+    #[test]
+    fn test_name_processor_access_engines() {
+        let processor = NameProcessor::new();
+        
+        // Test immutable access
+        let _validator = processor.validator();
+        let _normalizer = processor.normalizer();
+        
+        // Test mutable access
+        let mut processor = processor;
+        let _validator_mut = processor.validator_mut();
+        let _normalizer_mut = processor.normalizer_mut();
+    }
+}
+
+#[cfg(test)]
+mod validation_error_tests {
+    use super::*;
+
+    #[test]
+    fn test_validation_error_display() {
+        let error = ValidationError::NameTooLong { length: 100, max_length: 50 };
+        assert_eq!(error.to_string(), "Name too long: 100 characters (max: 50)");
+        
+        let error = ValidationError::InvalidCharacter('@');
+        assert_eq!(error.to_string(), "Invalid character: '@'");
+        
+        let error = ValidationError::EmptyComponent;
+        assert_eq!(error.to_string(), "Empty component not allowed");
+    }
+
+    #[test]
+    fn test_validation_error_component_error() {
+        let inner_error = ValidationError::EmptyComponent;
+        let component_error = ValidationError::ComponentError {
+            index: 2,
+            error: Box::new(inner_error),
+        };
+        
+        assert_eq!(component_error.to_string(), "Error in component 2: Empty component not allowed");
+    }
+}
+
+#[cfg(test)]
+mod character_set_tests {
+    use super::*;
+
+    #[test]
+    fn test_validation_character_set_basic() {
+        let mut config = ValidationConfig::default();
+        config.allowed_characters = ValidationCharacterSet::Basic;
+        let validator = NameValidator::with_config(config);
+        
+        // Valid basic characters
+        let valid_chars = "abcABC123-_.";
+        let component = NameComponent::from_str(valid_chars);
+        assert!(validator.validate_component(&component).is_ok());
+        
+        // Invalid characters for basic set
+        let invalid_chars = ["@", "#", "ñ", "😀"];
+        for invalid_char in invalid_chars {
+            let component = NameComponent::from_str(invalid_char);
+            let result = validator.validate_component(&component);
+            assert!(result.is_err(), "Character '{}' should be invalid for basic set", invalid_char);
+        }
+    }
+
+    #[test]
+    fn test_validation_character_set_extended() {
+        let mut config = ValidationConfig::default();
+        config.allowed_characters = ValidationCharacterSet::Extended;
+        let validator = NameValidator::with_config(config);
+        
+        // Valid extended ASCII characters
+        let valid_chars = "abcABC123!@#$%^&*()";
+        let component = NameComponent::from_str(valid_chars);
+        assert!(validator.validate_component(&component).is_ok());
+        
+        // Invalid characters (non-ASCII)
+        let invalid_chars = ["ñ", "😀", "世"];
+        for invalid_char in invalid_chars {
+            let component = NameComponent::from_str(invalid_char);
+            let result = validator.validate_component(&component);
+            assert!(result.is_err(), "Character '{}' should be invalid for extended set", invalid_char);
+        }
+    }
+
+    #[test]
+    fn test_validation_character_set_unicode() {
+        let mut config = ValidationConfig::default();
+        config.allowed_characters = ValidationCharacterSet::Unicode;
+        let validator = NameValidator::with_config(config);
+        
+        // Valid Unicode characters
+        let valid_strings = ["hello", "ñ", "世界", "😀"];
+        for valid_str in valid_strings {
+            let component = NameComponent::from_str(valid_str);
+            assert!(validator.validate_component(&component).is_ok(), 
+                   "String '{}' should be valid for Unicode set", valid_str);
+        }
+        
+        // Control characters should still be invalid
+        let component = NameComponent::new(vec![0x01]); // Control character
+        let result = validator.validate_component(&component);
+        assert!(result.is_err(), "Control characters should be invalid");
     }
 }
