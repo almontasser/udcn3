@@ -15,7 +15,8 @@ pub use packets::{Interest, Data, Packet, MetaInfo, SignatureInfo, KeyLocator, S
 pub use name::{
     Name as ComponentName, NameComponent, NameComponents, ComponentType, NameParseError,
     TrieNode, NameTrie, MatchingConfig, MatchResult, MatchType, PrefixMatcher,
-    levenshtein_distance, jaro_winkler_similarity, jaro_similarity, common_prefix_length
+    levenshtein_distance, jaro_winkler_similarity, jaro_similarity, common_prefix_length,
+    HierarchyNode, NameHierarchy, HierarchyError, HierarchyBulkOperations, BulkOperation
 };
 
 pub fn init() {

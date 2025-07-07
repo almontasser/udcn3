@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,6 +69,20 @@ impl NameComponent {
     }
 }
 
+impl Hash for NameComponent {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        self.component_type.hash(state);
+        // Sort metadata keys for consistent hashing
+        let mut metadata_vec: Vec<_> = self.metadata.iter().collect();
+        metadata_vec.sort_by_key(|&(k, _)| k);
+        for (key, value) in metadata_vec {
+            key.hash(state);
+            value.hash(state);
+        }
+    }
+}
+
 impl fmt::Display for NameComponent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.as_str() {
@@ -77,7 +92,7 @@ impl fmt::Display for NameComponent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Name {
     pub components: Vec<NameComponent>,
 }
@@ -944,5 +959,939 @@ mod prefix_matching_tests {
         let matcher = PrefixMatcher::with_config(config.clone());
         assert_eq!(matcher.get_config().fuzzy_threshold, 0.9);
         assert_eq!(matcher.get_config().max_edit_distance, 1);
+    }
+}
+
+// Hierarchy operations for managing name relationships
+
+/// Node in the name hierarchy tree
+#[derive(Debug, Clone)]
+pub struct HierarchyNode {
+    pub name: Name,
+    pub parent_id: Option<String>,
+    pub children_ids: Vec<String>,
+    pub metadata: HashMap<String, String>,
+    pub node_id: String,
+}
+
+impl HierarchyNode {
+    pub fn new(name: Name) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos().hash(&mut hasher);
+        let node_id = format!("node_{:x}", hasher.finish());
+        
+        Self {
+            name,
+            parent_id: None,
+            children_ids: Vec::new(),
+            metadata: HashMap::new(),
+            node_id,
+        }
+    }
+
+    pub fn with_id(name: Name, node_id: String) -> Self {
+        Self {
+            name,
+            parent_id: None,
+            children_ids: Vec::new(),
+            metadata: HashMap::new(),
+            node_id,
+        }
+    }
+
+    /// Check if this node is a root node (has no parent)
+    pub fn is_root(&self) -> bool {
+        self.parent_id.is_none()
+    }
+
+    /// Check if this node is a leaf node (has no children)
+    pub fn is_leaf(&self) -> bool {
+        self.children_ids.is_empty()
+    }
+
+    /// Get the number of children
+    pub fn child_count(&self) -> usize {
+        self.children_ids.len()
+    }
+
+    /// Add a child node ID
+    pub fn add_child_id(&mut self, child_id: String) {
+        if !self.children_ids.contains(&child_id) {
+            self.children_ids.push(child_id);
+        }
+    }
+
+    /// Remove a child by node ID
+    pub fn remove_child_id(&mut self, node_id: &str) -> bool {
+        if let Some(index) = self.children_ids.iter().position(|id| id == node_id) {
+            self.children_ids.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set metadata for this node
+    pub fn set_metadata(&mut self, key: String, value: String) {
+        self.metadata.insert(key, value);
+    }
+
+    /// Get metadata for this node
+    pub fn get_metadata(&self, key: &str) -> Option<&String> {
+        self.metadata.get(key)
+    }
+}
+
+impl Hash for HierarchyNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.node_id.hash(state);
+    }
+}
+
+/// Hierarchy manager for organizing names in a tree structure
+#[derive(Debug, Clone)]
+pub struct NameHierarchy {
+    root_id: Option<String>,
+    nodes: HashMap<String, HierarchyNode>,
+    name_to_id: HashMap<Name, String>, // Map names to node IDs
+}
+
+impl NameHierarchy {
+    pub fn new() -> Self {
+        Self {
+            root_id: None,
+            nodes: HashMap::new(),
+            name_to_id: HashMap::new(),
+        }
+    }
+
+    /// Set the root node of the hierarchy
+    pub fn set_root(&mut self, name: Name) -> String {
+        let node = HierarchyNode::new(name.clone());
+        let node_id = node.node_id.clone();
+        
+        self.name_to_id.insert(name, node_id.clone());
+        self.nodes.insert(node_id.clone(), node);
+        self.root_id = Some(node_id.clone());
+        
+        node_id
+    }
+
+    /// Insert a node under a parent
+    pub fn insert_node(&mut self, parent_id: &str, name: Name) -> Result<String, HierarchyError> {
+        if self.name_to_id.contains_key(&name) {
+            return Err(HierarchyError::DuplicateName);
+        }
+
+        if !self.nodes.contains_key(parent_id) {
+            return Err(HierarchyError::NodeNotFound);
+        }
+
+        let mut child = HierarchyNode::new(name.clone());
+        child.parent_id = Some(parent_id.to_string());
+        let child_id = child.node_id.clone();
+        
+        // Add child to parent's children list
+        if let Some(parent) = self.nodes.get_mut(parent_id) {
+            parent.add_child_id(child_id.clone());
+        }
+        
+        self.nodes.insert(child_id.clone(), child);
+        self.name_to_id.insert(name, child_id.clone());
+        
+        Ok(child_id)
+    }
+
+    /// Remove a node and all its descendants
+    pub fn remove_node(&mut self, node_id: &str) -> Result<HierarchyNode, HierarchyError> {
+        let node = self.nodes.get(node_id)
+            .ok_or(HierarchyError::NodeNotFound)?
+            .clone();
+
+        // Remove from parent's children
+        if let Some(parent_id) = &node.parent_id {
+            if let Some(parent) = self.nodes.get_mut(parent_id) {
+                parent.remove_child_id(node_id);
+            }
+        }
+
+        // Remove all descendants
+        let descendants = self.get_descendants(node_id)?;
+        for descendant in descendants {
+            self.name_to_id.remove(&descendant.name);
+            self.nodes.remove(&descendant.node_id);
+        }
+        
+        // Remove the node itself
+        self.name_to_id.remove(&node.name);
+        self.nodes.remove(node_id);
+        
+        // Update root if necessary
+        if self.root_id.as_ref() == Some(&node_id.to_string()) {
+            self.root_id = None;
+        }
+        
+        Ok(node)
+    }
+
+    /// Move a node to a new parent
+    pub fn move_node(&mut self, node_id: &str, new_parent_id: &str) -> Result<(), HierarchyError> {
+        if node_id == new_parent_id {
+            return Err(HierarchyError::InvalidOperation);
+        }
+
+        if !self.nodes.contains_key(node_id) || !self.nodes.contains_key(new_parent_id) {
+            return Err(HierarchyError::NodeNotFound);
+        }
+
+        // Check if new parent would create a cycle
+        if self.would_create_cycle(node_id, new_parent_id)? {
+            return Err(HierarchyError::CycleDetected);
+        }
+
+        let node = self.nodes.get(node_id).unwrap().clone();
+
+        // Remove from old parent
+        if let Some(old_parent_id) = &node.parent_id {
+            if let Some(old_parent) = self.nodes.get_mut(old_parent_id) {
+                old_parent.remove_child_id(node_id);
+            }
+        }
+
+        // Update node's parent
+        if let Some(node_mut) = self.nodes.get_mut(node_id) {
+            node_mut.parent_id = Some(new_parent_id.to_string());
+        }
+
+        // Add to new parent
+        if let Some(new_parent) = self.nodes.get_mut(new_parent_id) {
+            new_parent.add_child_id(node_id.to_string());
+        }
+        
+        Ok(())
+    }
+
+    /// Get all ancestors of a node
+    pub fn get_ancestors(&self, node_id: &str) -> Result<Vec<HierarchyNode>, HierarchyError> {
+        let mut ancestors = Vec::new();
+        let mut current_id = node_id;
+
+        while let Some(node) = self.nodes.get(current_id) {
+            if let Some(parent_id) = &node.parent_id {
+                if let Some(parent) = self.nodes.get(parent_id) {
+                    ancestors.push(parent.clone());
+                    current_id = parent_id;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(ancestors)
+    }
+
+    /// Get all descendants of a node
+    pub fn get_descendants(&self, node_id: &str) -> Result<Vec<HierarchyNode>, HierarchyError> {
+        let node = self.nodes.get(node_id)
+            .ok_or(HierarchyError::NodeNotFound)?;
+
+        let mut descendants = Vec::new();
+        self.collect_descendants(node, &mut descendants);
+        
+        Ok(descendants)
+    }
+
+    /// Get siblings of a node (nodes with the same parent)
+    pub fn get_siblings(&self, node_id: &str) -> Result<Vec<HierarchyNode>, HierarchyError> {
+        let node = self.nodes.get(node_id)
+            .ok_or(HierarchyError::NodeNotFound)?;
+
+        if let Some(parent_id) = &node.parent_id {
+            if let Some(parent) = self.nodes.get(parent_id) {
+                let siblings = parent.children_ids.iter()
+                    .filter(|&child_id| child_id != node_id)
+                    .filter_map(|child_id| self.nodes.get(child_id))
+                    .cloned()
+                    .collect();
+                Ok(siblings)
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new()) // Root node has no siblings
+        }
+    }
+
+    /// Get direct children of a node
+    pub fn get_children(&self, node_id: &str) -> Result<Vec<HierarchyNode>, HierarchyError> {
+        let node = self.nodes.get(node_id)
+            .ok_or(HierarchyError::NodeNotFound)?;
+
+        let children = node.children_ids.iter()
+            .filter_map(|child_id| self.nodes.get(child_id))
+            .cloned()
+            .collect();
+
+        Ok(children)
+    }
+
+    /// Find a node by name
+    pub fn find_by_name(&self, name: &Name) -> Option<&HierarchyNode> {
+        if let Some(node_id) = self.name_to_id.get(name) {
+            self.nodes.get(node_id)
+        } else {
+            None
+        }
+    }
+
+    /// Get a node by ID
+    pub fn get_node(&self, node_id: &str) -> Option<&HierarchyNode> {
+        self.nodes.get(node_id)
+    }
+
+    /// Get the root node
+    pub fn get_root(&self) -> Option<&HierarchyNode> {
+        if let Some(root_id) = &self.root_id {
+            self.nodes.get(root_id)
+        } else {
+            None
+        }
+    }
+
+    /// Get the depth of a node in the hierarchy (root = 0)
+    pub fn get_depth(&self, node_id: &str) -> Result<usize, HierarchyError> {
+        let ancestors = self.get_ancestors(node_id)?;
+        Ok(ancestors.len())
+    }
+
+    /// Validate the entire hierarchy for consistency
+    pub fn validate(&self) -> Result<(), HierarchyError> {
+        // Check for cycles
+        if let Some(root_id) = &self.root_id {
+            let mut visited = std::collections::HashSet::new();
+            self.check_cycles(root_id, &mut visited)?;
+        }
+
+        // Check that all nodes in the index exist
+        for (name, node_id) in &self.name_to_id {
+            if let Some(node) = self.nodes.get(node_id) {
+                if &node.name != name {
+                    return Err(HierarchyError::IndexInconsistency);
+                }
+            } else {
+                return Err(HierarchyError::IndexInconsistency);
+            }
+        }
+
+        // Check parent-child relationships
+        for node in self.nodes.values() {
+            if let Some(parent_id) = &node.parent_id {
+                if let Some(parent) = self.nodes.get(parent_id) {
+                    if !parent.children_ids.contains(&node.node_id) {
+                        return Err(HierarchyError::RelationshipInconsistency);
+                    }
+                } else {
+                    return Err(HierarchyError::RelationshipInconsistency);
+                }
+            }
+
+            // Check children exist
+            for child_id in &node.children_ids {
+                if !self.nodes.contains_key(child_id) {
+                    return Err(HierarchyError::RelationshipInconsistency);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the total number of nodes in the hierarchy
+    pub fn size(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Check if the hierarchy is empty
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Clear the entire hierarchy
+    pub fn clear(&mut self) {
+        self.root_id = None;
+        self.nodes.clear();
+        self.name_to_id.clear();
+    }
+
+    /// Get all leaf nodes in the hierarchy
+    pub fn get_leaves(&self) -> Vec<&HierarchyNode> {
+        self.nodes.values().filter(|node| node.is_leaf()).collect()
+    }
+
+    /// Get the height of the hierarchy (longest path from root to leaf)
+    pub fn height(&self) -> usize {
+        if let Some(root_id) = &self.root_id {
+            self.calculate_height(root_id)
+        } else {
+            0
+        }
+    }
+
+    // Private helper methods
+
+    fn would_create_cycle(&self, node_id: &str, potential_parent_id: &str) -> Result<bool, HierarchyError> {
+        let descendants = self.get_descendants(node_id)?;
+        Ok(descendants.iter().any(|desc| desc.node_id == potential_parent_id))
+    }
+
+    fn check_cycles(&self, node_id: &str, visited: &mut std::collections::HashSet<String>) -> Result<(), HierarchyError> {
+        if visited.contains(node_id) {
+            return Err(HierarchyError::CycleDetected);
+        }
+
+        visited.insert(node_id.to_string());
+
+        if let Some(node) = self.nodes.get(node_id) {
+            for child_id in &node.children_ids {
+                self.check_cycles(child_id, visited)?;
+            }
+        }
+
+        visited.remove(node_id);
+        Ok(())
+    }
+
+    fn collect_descendants(&self, node: &HierarchyNode, descendants: &mut Vec<HierarchyNode>) {
+        for child_id in &node.children_ids {
+            if let Some(child) = self.nodes.get(child_id) {
+                descendants.push(child.clone());
+                self.collect_descendants(child, descendants);
+            }
+        }
+    }
+
+    fn calculate_height(&self, node_id: &str) -> usize {
+        if let Some(node) = self.nodes.get(node_id) {
+            if node.children_ids.is_empty() {
+                0
+            } else {
+                node.children_ids.iter()
+                    .map(|child_id| self.calculate_height(child_id))
+                    .max()
+                    .unwrap_or(0) + 1
+            }
+        } else {
+            0
+        }
+    }
+}
+
+impl Default for NameHierarchy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Errors that can occur during hierarchy operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HierarchyError {
+    NodeNotFound,
+    DuplicateName,
+    CycleDetected,
+    InvalidOperation,
+    IndexInconsistency,
+    RelationshipInconsistency,
+}
+
+impl fmt::Display for HierarchyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HierarchyError::NodeNotFound => write!(f, "Node not found in hierarchy"),
+            HierarchyError::DuplicateName => write!(f, "Duplicate name in hierarchy"),
+            HierarchyError::CycleDetected => write!(f, "Cycle detected in hierarchy"),
+            HierarchyError::InvalidOperation => write!(f, "Invalid hierarchy operation"),
+            HierarchyError::IndexInconsistency => write!(f, "Hierarchy index inconsistency"),
+            HierarchyError::RelationshipInconsistency => write!(f, "Parent-child relationship inconsistency"),
+        }
+    }
+}
+
+impl std::error::Error for HierarchyError {}
+
+/// Bulk operations for managing multiple hierarchy changes
+pub struct HierarchyBulkOperations {
+    hierarchy: NameHierarchy,
+    operations: Vec<BulkOperation>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BulkOperation {
+    Insert { parent_id: String, name: Name },
+    Remove { node_id: String },
+    Move { node_id: String, new_parent_id: String },
+    SetMetadata { node_id: String, key: String, value: String },
+}
+
+impl HierarchyBulkOperations {
+    pub fn new(hierarchy: NameHierarchy) -> Self {
+        Self {
+            hierarchy,
+            operations: Vec::new(),
+        }
+    }
+
+    /// Add an insert operation to the batch
+    pub fn add_insert(&mut self, parent_id: String, name: Name) {
+        self.operations.push(BulkOperation::Insert { parent_id, name });
+    }
+
+    /// Add a remove operation to the batch
+    pub fn add_remove(&mut self, node_id: String) {
+        self.operations.push(BulkOperation::Remove { node_id });
+    }
+
+    /// Add a move operation to the batch
+    pub fn add_move(&mut self, node_id: String, new_parent_id: String) {
+        self.operations.push(BulkOperation::Move { node_id, new_parent_id });
+    }
+
+    /// Add a metadata operation to the batch
+    pub fn add_set_metadata(&mut self, node_id: String, key: String, value: String) {
+        self.operations.push(BulkOperation::SetMetadata { node_id, key, value });
+    }
+
+    /// Execute all batched operations
+    pub fn execute(mut self) -> Result<NameHierarchy, HierarchyError> {
+        for operation in self.operations {
+            match operation {
+                BulkOperation::Insert { parent_id, name } => {
+                    self.hierarchy.insert_node(&parent_id, name)?;
+                }
+                BulkOperation::Remove { node_id } => {
+                    self.hierarchy.remove_node(&node_id)?;
+                }
+                BulkOperation::Move { node_id, new_parent_id } => {
+                    self.hierarchy.move_node(&node_id, &new_parent_id)?;
+                }
+                BulkOperation::SetMetadata { node_id, key, value } => {
+                    if let Some(node) = self.hierarchy.nodes.get_mut(&node_id) {
+                        node.set_metadata(key, value);
+                    } else {
+                        return Err(HierarchyError::NodeNotFound);
+                    }
+                }
+            }
+        }
+
+        // Validate the hierarchy after all operations
+        self.hierarchy.validate()?;
+        
+        Ok(self.hierarchy)
+    }
+
+    /// Get the number of pending operations
+    pub fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Clear all pending operations
+    pub fn clear_operations(&mut self) {
+        self.operations.clear();
+    }
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::*;
+
+    fn create_test_hierarchy() -> NameHierarchy {
+        let mut hierarchy = NameHierarchy::new();
+        let root_name = Name::from_str("/root").unwrap();
+        hierarchy.set_root(root_name);
+        hierarchy
+    }
+
+    #[test]
+    fn test_hierarchy_node_creation() {
+        let name = Name::from_str("/test/node").unwrap();
+        let node = HierarchyNode::new(name.clone());
+        
+        assert_eq!(node.name, name);
+        assert!(node.is_root());
+        assert!(node.is_leaf());
+        assert_eq!(node.child_count(), 0);
+        assert!(!node.node_id.is_empty());
+    }
+
+    #[test]
+    fn test_hierarchy_set_root() {
+        let mut hierarchy = NameHierarchy::new();
+        let root_name = Name::from_str("/root").unwrap();
+        
+        let root_id = hierarchy.set_root(root_name.clone());
+        
+        assert!(!root_id.is_empty());
+        assert_eq!(hierarchy.size(), 1);
+        assert!(hierarchy.get_root().is_some());
+        assert_eq!(hierarchy.get_root().unwrap().name, root_name);
+    }
+
+    #[test]
+    fn test_hierarchy_insert_node() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name.clone()).unwrap();
+        
+        assert_eq!(hierarchy.size(), 2);
+        
+        let child_node = hierarchy.get_node(&child_id).unwrap();
+        assert_eq!(child_node.name, child_name);
+        assert_eq!(child_node.parent_id, Some(root_id.clone()));
+        
+        let root_children = hierarchy.get_children(&root_id).unwrap();
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0].node_id, child_id);
+    }
+
+    #[test]
+    fn test_hierarchy_duplicate_name_error() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let name = Name::from_str("/duplicate").unwrap();
+        hierarchy.insert_node(&root_id, name.clone()).unwrap();
+        
+        let result = hierarchy.insert_node(&root_id, name);
+        assert!(matches!(result, Err(HierarchyError::DuplicateName)));
+    }
+
+    #[test]
+    fn test_hierarchy_node_not_found_error() {
+        let mut hierarchy = create_test_hierarchy();
+        let name = Name::from_str("/orphan").unwrap();
+        
+        let result = hierarchy.insert_node("non_existent_id", name);
+        assert!(matches!(result, Err(HierarchyError::NodeNotFound)));
+    }
+
+    #[test]
+    fn test_hierarchy_remove_node() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name.clone()).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child_id, grandchild_name).unwrap();
+        
+        assert_eq!(hierarchy.size(), 3);
+        
+        let removed_node = hierarchy.remove_node(&child_id).unwrap();
+        assert_eq!(removed_node.name, child_name);
+        assert_eq!(hierarchy.size(), 1); // Only root remains
+        
+        assert!(hierarchy.get_node(&child_id).is_none());
+        assert!(hierarchy.get_node(&grandchild_id).is_none());
+    }
+
+    #[test]
+    fn test_hierarchy_move_node() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let parent1_name = Name::from_str("/parent1").unwrap();
+        let parent1_id = hierarchy.insert_node(&root_id, parent1_name).unwrap();
+        
+        let parent2_name = Name::from_str("/parent2").unwrap();
+        let parent2_id = hierarchy.insert_node(&root_id, parent2_name).unwrap();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&parent1_id, child_name).unwrap();
+        
+        // Move child from parent1 to parent2
+        hierarchy.move_node(&child_id, &parent2_id).unwrap();
+        
+        let child_node = hierarchy.get_node(&child_id).unwrap();
+        assert_eq!(child_node.parent_id, Some(parent2_id.clone()));
+        
+        let parent1_children = hierarchy.get_children(&parent1_id).unwrap();
+        let parent2_children = hierarchy.get_children(&parent2_id).unwrap();
+        
+        assert_eq!(parent1_children.len(), 0);
+        assert_eq!(parent2_children.len(), 1);
+        assert_eq!(parent2_children[0].node_id, child_id);
+    }
+
+    #[test]
+    fn test_hierarchy_cycle_detection() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child_id, grandchild_name).unwrap();
+        
+        // Try to move root under grandchild (would create cycle)
+        let result = hierarchy.move_node(&root_id, &grandchild_id);
+        assert!(matches!(result, Err(HierarchyError::CycleDetected)));
+    }
+
+    #[test]
+    fn test_hierarchy_get_ancestors() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child_id, grandchild_name).unwrap();
+        
+        let ancestors = hierarchy.get_ancestors(&grandchild_id).unwrap();
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0].node_id, child_id);
+        assert_eq!(ancestors[1].node_id, root_id);
+    }
+
+    #[test]
+    fn test_hierarchy_get_descendants() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child1_name = Name::from_str("/child1").unwrap();
+        let child1_id = hierarchy.insert_node(&root_id, child1_name).unwrap();
+        
+        let child2_name = Name::from_str("/child2").unwrap();
+        let child2_id = hierarchy.insert_node(&root_id, child2_name).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child1_id, grandchild_name).unwrap();
+        
+        let descendants = hierarchy.get_descendants(&root_id).unwrap();
+        assert_eq!(descendants.len(), 3);
+        
+        let descendant_ids: Vec<&String> = descendants.iter().map(|d| &d.node_id).collect();
+        assert!(descendant_ids.contains(&&child1_id));
+        assert!(descendant_ids.contains(&&child2_id));
+        assert!(descendant_ids.contains(&&grandchild_id));
+    }
+
+    #[test]
+    fn test_hierarchy_get_siblings() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child1_name = Name::from_str("/child1").unwrap();
+        let child1_id = hierarchy.insert_node(&root_id, child1_name).unwrap();
+        
+        let child2_name = Name::from_str("/child2").unwrap();
+        let child2_id = hierarchy.insert_node(&root_id, child2_name).unwrap();
+        
+        let child3_name = Name::from_str("/child3").unwrap();
+        let child3_id = hierarchy.insert_node(&root_id, child3_name).unwrap();
+        
+        let siblings = hierarchy.get_siblings(&child1_id).unwrap();
+        assert_eq!(siblings.len(), 2);
+        
+        let sibling_ids: Vec<&String> = siblings.iter().map(|s| &s.node_id).collect();
+        assert!(sibling_ids.contains(&&child2_id));
+        assert!(sibling_ids.contains(&&child3_id));
+        assert!(!sibling_ids.contains(&&child1_id));
+    }
+
+    #[test]
+    fn test_hierarchy_get_children() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child1_name = Name::from_str("/child1").unwrap();
+        let child1_id = hierarchy.insert_node(&root_id, child1_name).unwrap();
+        
+        let child2_name = Name::from_str("/child2").unwrap();
+        let child2_id = hierarchy.insert_node(&root_id, child2_name).unwrap();
+        
+        let children = hierarchy.get_children(&root_id).unwrap();
+        assert_eq!(children.len(), 2);
+        
+        let child_ids: Vec<&String> = children.iter().map(|c| &c.node_id).collect();
+        assert!(child_ids.contains(&&child1_id));
+        assert!(child_ids.contains(&&child2_id));
+    }
+
+    #[test]
+    fn test_hierarchy_find_by_name() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/unique_child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name.clone()).unwrap();
+        
+        let found_node = hierarchy.find_by_name(&child_name).unwrap();
+        assert_eq!(found_node.node_id, child_id);
+        assert_eq!(found_node.name, child_name);
+    }
+
+    #[test]
+    fn test_hierarchy_get_depth() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child_id, grandchild_name).unwrap();
+        
+        assert_eq!(hierarchy.get_depth(&root_id).unwrap(), 0);
+        assert_eq!(hierarchy.get_depth(&child_id).unwrap(), 1);
+        assert_eq!(hierarchy.get_depth(&grandchild_id).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_hierarchy_height() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        assert_eq!(hierarchy.height(), 0); // Just root
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name).unwrap();
+        
+        assert_eq!(hierarchy.height(), 1);
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        hierarchy.insert_node(&child_id, grandchild_name).unwrap();
+        
+        assert_eq!(hierarchy.height(), 2);
+    }
+
+    #[test]
+    fn test_hierarchy_get_leaves() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child1_name = Name::from_str("/child1").unwrap();
+        let child1_id = hierarchy.insert_node(&root_id, child1_name).unwrap();
+        
+        let child2_name = Name::from_str("/child2").unwrap();
+        let child2_id = hierarchy.insert_node(&root_id, child2_name).unwrap();
+        
+        let grandchild_name = Name::from_str("/grandchild").unwrap();
+        let grandchild_id = hierarchy.insert_node(&child1_id, grandchild_name).unwrap();
+        
+        let leaves = hierarchy.get_leaves();
+        assert_eq!(leaves.len(), 2); // child2 and grandchild are leaves
+        
+        let leaf_ids: Vec<&String> = leaves.iter().map(|l| &l.node_id).collect();
+        assert!(leaf_ids.contains(&&child2_id));
+        assert!(leaf_ids.contains(&&grandchild_id));
+        assert!(!leaf_ids.contains(&&root_id)); // Root is not a leaf
+        assert!(!leaf_ids.contains(&&child1_id)); // child1 has children
+    }
+
+    #[test]
+    fn test_hierarchy_validation() {
+        let hierarchy = create_test_hierarchy();
+        assert!(hierarchy.validate().is_ok());
+        
+        // Test with a more complex hierarchy
+        let mut complex_hierarchy = create_test_hierarchy();
+        let root_id = complex_hierarchy.get_root().unwrap().node_id.clone();
+        
+        for i in 0..5 {
+            let child_name = Name::from_str(&format!("/child{}", i)).unwrap();
+            complex_hierarchy.insert_node(&root_id, child_name).unwrap();
+        }
+        
+        assert!(complex_hierarchy.validate().is_ok());
+    }
+
+    #[test]
+    fn test_hierarchy_metadata() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let child_name = Name::from_str("/child").unwrap();
+        let child_id = hierarchy.insert_node(&root_id, child_name).unwrap();
+        
+        // Set metadata
+        if let Some(child_node) = hierarchy.nodes.get_mut(&child_id) {
+            child_node.set_metadata("type".to_string(), "important".to_string());
+            child_node.set_metadata("priority".to_string(), "high".to_string());
+        }
+        
+        let child_node = hierarchy.get_node(&child_id).unwrap();
+        assert_eq!(child_node.get_metadata("type"), Some(&"important".to_string()));
+        assert_eq!(child_node.get_metadata("priority"), Some(&"high".to_string()));
+        assert_eq!(child_node.get_metadata("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_bulk_operations() {
+        let hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let mut bulk_ops = HierarchyBulkOperations::new(hierarchy);
+        
+        // Add multiple operations
+        bulk_ops.add_insert(root_id.clone(), Name::from_str("/bulk1").unwrap());
+        bulk_ops.add_insert(root_id.clone(), Name::from_str("/bulk2").unwrap());
+        bulk_ops.add_insert(root_id, Name::from_str("/bulk3").unwrap());
+        
+        assert_eq!(bulk_ops.operation_count(), 3);
+        
+        let updated_hierarchy = bulk_ops.execute().unwrap();
+        assert_eq!(updated_hierarchy.size(), 4); // root + 3 children
+        
+        assert!(updated_hierarchy.find_by_name(&Name::from_str("/bulk1").unwrap()).is_some());
+        assert!(updated_hierarchy.find_by_name(&Name::from_str("/bulk2").unwrap()).is_some());
+        assert!(updated_hierarchy.find_by_name(&Name::from_str("/bulk3").unwrap()).is_some());
+    }
+
+    #[test]
+    fn test_bulk_operations_with_metadata() {
+        let hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        let mut bulk_ops = HierarchyBulkOperations::new(hierarchy);
+        
+        bulk_ops.add_insert(root_id.clone(), Name::from_str("/tagged").unwrap());
+        
+        let updated_hierarchy = bulk_ops.execute().unwrap();
+        let tagged_node = updated_hierarchy.find_by_name(&Name::from_str("/tagged").unwrap()).unwrap();
+        let tagged_id = tagged_node.node_id.clone();
+        
+        // Create new bulk operations for metadata
+        let mut metadata_ops = HierarchyBulkOperations::new(updated_hierarchy);
+        metadata_ops.add_set_metadata(tagged_id.clone(), "category".to_string(), "test".to_string());
+        
+        let final_hierarchy = metadata_ops.execute().unwrap();
+        let final_node = final_hierarchy.get_node(&tagged_id).unwrap();
+        assert_eq!(final_node.get_metadata("category"), Some(&"test".to_string()));
+    }
+
+    #[test]
+    fn test_hierarchy_clear() {
+        let mut hierarchy = create_test_hierarchy();
+        let root_id = hierarchy.get_root().unwrap().node_id.clone();
+        
+        hierarchy.insert_node(&root_id, Name::from_str("/child").unwrap()).unwrap();
+        assert_eq!(hierarchy.size(), 2);
+        
+        hierarchy.clear();
+        assert_eq!(hierarchy.size(), 0);
+        assert!(hierarchy.is_empty());
+        assert!(hierarchy.get_root().is_none());
     }
 }
