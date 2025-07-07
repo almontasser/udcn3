@@ -1,0 +1,269 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": 1,
+        "title": "Setup Project Repository Structure",
+        "description": "Create the foundational Rust workspace structure with all required crates and configuration files",
+        "details": "Initialize Cargo workspace with udcn-core, udcn-transport, udcn-ebpf, udcn-common, udcnd, udcn-cli, and udcn-bench crates. Configure rust-toolchain.toml with pinned nightly version. Set up .gitignore for Rust projects. Create scripts directory with build.sh, test.sh, and docker-test.sh. Initialize docker directory for container definitions. Configure workspace dependencies in root Cargo.toml.",
+        "testStrategy": "Verify all crates compile with `cargo check --workspace`. Ensure scripts are executable and basic structure is correct.",
+        "priority": "high",
+        "dependencies": [],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 2,
+        "title": "Implement TLV Codec and Basic Packet Structures",
+        "description": "Build the core TLV encoding/decoding system and define Interest/Data packet structures",
+        "details": "Implement TLV (Type-Length-Value) encoding in udcn-core. Create Interest struct with name, can_be_prefix, must_be_fresh, lifetime, hop_limit, and nonce fields. Create Data struct with name, content, freshness_period, and signature fields. Implement Name struct with components vector. Add serialization/deserialization methods for all packet types. Include basic validation for packet structure integrity.",
+        "testStrategy": "Unit tests for TLV codec with various data types. Round-trip tests for Interest/Data serialization. Test malformed packet handling and edge cases.",
+        "priority": "high",
+        "dependencies": [
+          1
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 3,
+        "title": "Implement Name Structure and Matching",
+        "description": "Create NDN name handling system with component management and prefix matching",
+        "details": "Implement Name struct with component vector management. Add methods for name construction, component access, and prefix matching. Support for name comparison, longest prefix matching, and name hierarchy operations. Include name component encoding/decoding with proper type handling. Add name validation and normalization functions.",
+        "testStrategy": "Unit tests for name operations including prefix matching, component manipulation, and edge cases. Performance tests for name comparison operations.",
+        "priority": "high",
+        "dependencies": [
+          2
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 4,
+        "title": "Implement Basic Signature System",
+        "description": "Add cryptographic signature generation and verification for Data packets",
+        "details": "Implement Signature struct with signature type, key locator, and signature value. Add SHA256 digest computation for Data packets. Implement basic RSA signature generation and verification using ring crate. Support for signature validation and key management. Include signature info encoding in TLV format.",
+        "testStrategy": "Unit tests for signature generation and verification. Test with various key sizes and signature types. Verify signature validation against tampered data.",
+        "priority": "medium",
+        "dependencies": [
+          3
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 5,
+        "title": "Setup QUIC Transport Foundation",
+        "description": "Initialize QUIC transport layer using quinn crate with basic connection management",
+        "details": "Create udcn-transport crate with quinn dependency. Implement QuicTransport struct with connection establishment, client/server modes, and basic stream management. Configure TLS 1.3 with self-signed certificates for testing. Add connection pool management and error handling. Include transport configuration for NDN-specific requirements.",
+        "testStrategy": "Integration tests for QUIC connection establishment. Test client-server communication with basic data transfer. Verify TLS handshake and connection security.",
+        "priority": "high",
+        "dependencies": [
+          4
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 6,
+        "title": "Implement Interest/Data Exchange over QUIC",
+        "description": "Build the core NDN protocol flow over QUIC streams with proper packet handling",
+        "details": "Implement Interest transmission over QUIC streams. Add Data packet response handling with proper stream management. Create packet framing for QUIC streams with length prefixes. Add timeout handling for Interest satisfaction. Implement basic flow control and stream multiplexing. Include error handling for network failures and protocol violations.",
+        "testStrategy": "Integration tests for Interest/Data exchange. Test timeout scenarios and error conditions. Verify stream multiplexing works correctly with multiple concurrent requests.",
+        "priority": "high",
+        "dependencies": [
+          5
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 7,
+        "title": "Create Basic CLI Application Structure",
+        "description": "Build the foundation for udcn-cli with command parsing and basic file operations",
+        "details": "Create udcn-cli crate with clap for command-line parsing. Implement basic commands for send and receive operations. Add file chunking logic for breaking large files into NDN segments. Create progress tracking infrastructure. Include logging configuration with env_logger. Add basic error handling and user-friendly error messages.",
+        "testStrategy": "Unit tests for command parsing and file operations. Test file chunking with various file sizes. Verify CLI help text and error messages are user-friendly.",
+        "priority": "high",
+        "dependencies": [
+          6
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 8,
+        "title": "Implement File Transfer Send Functionality",
+        "description": "Build the file sending capability with chunking and Data packet publication",
+        "details": "Implement file reading and chunking into NDN segments. Create Data packet publication for each chunk with proper naming scheme. Add metadata handling for file information. Implement concurrent chunk serving with proper Interest handling. Include progress reporting and error recovery. Support for large file transfers with efficient memory usage.",
+        "testStrategy": "Integration tests for file sending with various file sizes. Test concurrent chunk requests. Verify memory usage remains constant for large files.",
+        "priority": "high",
+        "dependencies": [
+          7
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 9,
+        "title": "Implement File Transfer Receive Functionality",
+        "description": "Build the file receiving capability with Interest expression and reassembly",
+        "details": "Implement Interest generation for file chunks with proper naming. Add Data packet reception and reassembly logic. Create file reconstruction from received chunks. Implement pipeline fetching for parallel chunk retrieval. Add progress tracking and error recovery for failed chunks. Include file integrity verification after reassembly.",
+        "testStrategy": "Integration tests for file receiving with various file sizes. Test pipeline fetching efficiency. Verify file integrity after transfer and handle missing chunks.",
+        "priority": "high",
+        "dependencies": [
+          8
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 10,
+        "title": "Setup eBPF Development Environment",
+        "description": "Configure eBPF toolchain with aya framework and create basic XDP program structure",
+        "details": "Create udcn-ebpf crate with aya dependencies. Configure eBPF build system with proper LLVM requirements. Create basic XDP program skeleton with packet inspection. Set up udcn-common crate for shared structures between user and kernel space. Add eBPF program loading infrastructure. Include proper error handling for eBPF operations.",
+        "testStrategy": "Verify eBPF program compilation and loading. Test basic packet inspection without crashes. Validate shared structure synchronization between user and kernel space.",
+        "priority": "medium",
+        "dependencies": [
+          1
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 11,
+        "title": "Implement Basic XDP Packet Filtering",
+        "description": "Create XDP program for Interest packet identification and basic filtering",
+        "details": "Implement XDP program for packet parsing and Interest identification. Add basic packet filtering based on NDN packet headers. Create statistics collection for processed packets. Implement packet pass-through for non-NDN traffic. Add proper bounds checking and verifier compliance. Include debugging support for eBPF development.",
+        "testStrategy": "Test XDP program with synthetic packet traffic. Verify packet filtering accuracy and performance. Test verifier compliance and program loading stability.",
+        "priority": "medium",
+        "dependencies": [
+          10
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 12,
+        "title": "Implement PIT (Pending Interest Table) in eBPF",
+        "description": "Build kernel-space PIT for tracking pending Interests with proper lifecycle management",
+        "details": "Create PIT entry structure with name hash, incoming faces, and expiry. Implement PIT map operations in eBPF with proper locking. Add Interest aggregation logic for duplicate Interests. Implement PIT entry cleanup and expiration. Create face management for tracking Interest sources. Include PIT statistics and monitoring.",
+        "testStrategy": "Unit tests for PIT operations including insertion, lookup, and expiration. Test Interest aggregation with duplicate requests. Verify PIT cleanup and memory management.",
+        "priority": "medium",
+        "dependencies": [
+          11
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 13,
+        "title": "Implement Content Store with LRU Caching",
+        "description": "Build kernel-space content cache with LRU eviction policy and efficient lookup",
+        "details": "Create ContentStoreEntry structure with name hash, data pointer, size, and hit count. Implement LRU eviction algorithm in eBPF. Add content store lookup and insertion logic. Implement cache statistics collection. Create content store size management and memory limits. Include cache hit/miss tracking and reporting.",
+        "testStrategy": "Unit tests for LRU eviction policy and cache operations. Performance tests for cache lookup efficiency. Test cache behavior under memory pressure and various access patterns.",
+        "priority": "medium",
+        "dependencies": [
+          12
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 14,
+        "title": "Implement User-space Daemon (udcnd)",
+        "description": "Create management daemon for eBPF program loading and control plane operations",
+        "details": "Create udcnd crate with eBPF program loading capabilities. Implement face management API for network interfaces. Add routing table management and FIB operations. Create control plane for eBPF map management. Implement configuration management and runtime parameters. Include health monitoring and statistics collection.",
+        "testStrategy": "Integration tests for daemon startup and eBPF program loading. Test face management operations and routing table updates. Verify control plane communication with eBPF programs.",
+        "priority": "medium",
+        "dependencies": [
+          13
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 15,
+        "title": "Implement Basic Benchmarking Infrastructure",
+        "description": "Create performance measurement tools and traffic generation capabilities",
+        "details": "Create udcn-bench crate with traffic generation capabilities. Implement synthetic Interest/Data traffic patterns. Add latency and throughput measurement tools. Create cache hit rate monitoring. Implement topology simulation for testing. Include performance regression detection and automated testing.",
+        "testStrategy": "Verify traffic generation accuracy and measurement precision. Test benchmarking tools with known performance characteristics. Validate topology simulation correctness.",
+        "priority": "medium",
+        "dependencies": [
+          9
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 16,
+        "title": "Implement Transport Optimization Features",
+        "description": "Add fragmentation, reassembly, and pipeline fetching for improved performance",
+        "details": "Implement packet fragmentation and reassembly for large Data packets. Add pipeline fetching with configurable window size. Create multi-threaded operation support. Implement connection pooling for efficiency. Add congestion control awareness. Include adaptive pipeline sizing based on network conditions.",
+        "testStrategy": "Performance tests for fragmentation and pipeline fetching. Test multi-threaded operation under load. Verify connection pooling efficiency and resource management.",
+        "priority": "medium",
+        "dependencies": [
+          14
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 17,
+        "title": "Implement Enhanced File Transfer Features",
+        "description": "Add large file support, resume capability, and advanced progress tracking",
+        "details": "Add support for files larger than 1GB with efficient memory usage. Implement resume capability for interrupted transfers. Create detailed progress tracking with ETA calculation. Add parallel fetching optimization. Implement error recovery for failed chunks. Include file integrity verification and checksum validation.",
+        "testStrategy": "Integration tests with large files (multi-GB). Test resume functionality after interruption. Verify memory usage remains constant for large files and parallel operations.",
+        "priority": "medium",
+        "dependencies": [
+          16
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 18,
+        "title": "Implement Advanced Benchmarking Suite",
+        "description": "Create comprehensive performance testing with topology simulation and automated reporting",
+        "details": "Implement network topology simulation with configurable parameters. Add automated performance regression testing. Create detailed performance reports with graphs and analysis. Implement stress testing scenarios. Add comparative analysis with traditional networking. Include CI/CD integration for automated testing.",
+        "testStrategy": "Validate topology simulation accuracy. Test automated regression detection. Verify report generation and analysis correctness.",
+        "priority": "low",
+        "dependencies": [
+          15
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 19,
+        "title": "Implement Docker Packaging and Deployment",
+        "description": "Create containerized deployment with proper configuration and orchestration",
+        "details": "Create Docker containers for udcnd, udcn-cli, and udcn-bench. Implement proper container networking for NDN communication. Add Docker Compose configuration for multi-node testing. Create deployment scripts and documentation. Implement health checks and monitoring. Include configuration management for containerized deployment.",
+        "testStrategy": "Test container deployment and networking. Verify multi-node communication through containers. Test deployment scripts and configuration management.",
+        "priority": "medium",
+        "dependencies": [
+          17
+        ],
+        "status": "pending",
+        "subtasks": []
+      },
+      {
+        "id": 20,
+        "title": "Implement Production Monitoring and Metrics",
+        "description": "Add comprehensive monitoring, logging, and operational metrics collection",
+        "details": "Implement structured logging with configurable levels. Add Prometheus metrics collection. Create operational dashboards and alerting. Implement distributed tracing for request flow. Add performance profiling hooks. Include system resource monitoring and capacity planning metrics.",
+        "testStrategy": "Verify metrics collection accuracy and performance impact. Test monitoring dashboard functionality. Validate alerting and notification systems.",
+        "priority": "low",
+        "dependencies": [
+          18
+        ],
+        "status": "pending",
+        "subtasks": []
+      }
+    ],
+    "metadata": {
+      "created": "2025-07-07T14:00:07.094Z",
+      "updated": "2025-07-07T14:00:07.094Z",
+      "description": "Tasks for master context"
+    }
+  }
+}

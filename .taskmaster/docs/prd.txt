@@ -1,0 +1,458 @@
+# μDCN (micro Data-Centric Networking) Architecture - Product Requirements Document
+
+## Overview
+
+The μDCN project implements a high-performance Named Data Networking (NDN) stack in Rust, combining QUIC transport with kernel-space packet processing via eBPF. This architecture addresses the need for efficient content-centric networking by moving away from traditional host-centric models, enabling native content caching, multicast support, and improved network efficiency.
+
+**Problem Solved**: Traditional IP networking is inefficient for content distribution, requiring complex overlay solutions for caching and multicast. NDN provides native support for these features at the network layer.
+
+**Target Users**: 
+- Network researchers exploring NDN architectures
+- Organizations needing efficient content distribution
+- Developers building content-centric applications
+- DevOps teams managing high-traffic content delivery systems
+
+**Value Proposition**: 
+- Kernel-space processing for ultra-low latency
+- Native content caching without CDN complexity
+- Efficient multicast without IP multicast limitations
+- Modern Rust implementation ensuring memory safety and performance
+
+## Core Features
+
+### 1. NDN Protocol Implementation
+- **What it does**: Implements core NDN packet types (Interest/Data) with TLV encoding
+- **Why it's important**: Foundation for all NDN communication
+- **How it works**: 
+  - Interest packets request content by name
+  - Data packets carry content with cryptographic signatures
+  - TLV (Type-Length-Value) encoding for extensibility
+  - Name-based routing instead of address-based
+
+### 2. QUIC Transport Layer
+- **What it does**: Provides reliable, encrypted transport using quinn crate
+- **Why it's important**: Modern transport with built-in security and multiplexing
+- **How it works**:
+  - Connection establishment with TLS 1.3
+  - Stream multiplexing for parallel transfers
+  - Congestion control and loss recovery
+  - Integration with NDN packet flow
+
+### 3. eBPF Fast-Path Processing
+- **What it does**: Kernel-space packet filtering and caching via XDP
+- **Why it's important**: Bypasses kernel networking stack for ultra-low latency
+- **How it works**:
+  - XDP programs filter Interest packets at driver level
+  - In-kernel PIT (Pending Interest Table) tracking
+  - LRU content store for popular content
+  - Direct packet redirect without userspace transition
+
+### 4. File Transfer Application
+- **What it does**: CLI tool for sending/receiving files over NDN
+- **Why it's important**: Demonstrates practical usage and validates stack
+- **How it works**:
+  - Chunks files into NDN segments
+  - Parallel fetching with pipeline
+  - Progress tracking and error recovery
+  - Support for large file transfers
+
+### 5. Benchmarking Suite
+- **What it does**: Measures performance metrics and simulates topologies
+- **Why it's important**: Validates performance claims and identifies bottlenecks
+- **How it works**:
+  - Synthetic traffic generation
+  - Latency, throughput, and cache hit measurements
+  - Network topology simulation
+  - Automated performance regression testing
+
+## User Experience
+
+### User Personas
+
+1. **Network Researcher**
+   - Needs: Experiment with NDN protocols and measure performance
+   - Goals: Publish research on NDN architectures
+   - Pain points: Complex setup, lack of real implementations
+
+2. **DevOps Engineer**
+   - Needs: Deploy efficient content distribution
+   - Goals: Reduce bandwidth costs and improve latency
+   - Pain points: CDN complexity and costs
+
+3. **Application Developer**
+   - Needs: Build content-centric applications
+   - Goals: Simple API for content publishing/retrieval
+   - Pain points: Managing content addressing and caching
+
+### Key User Flows
+
+1. **File Transfer Flow**
+   ```
+   Sender → CLI → Chunk file → Publish as NDN Data packets
+   Receiver → CLI → Express Interests → Reassemble file
+   ```
+
+2. **Benchmarking Flow**
+   ```
+   Configure topology → Generate traffic → Collect metrics → Visualize results
+   ```
+
+3. **Deployment Flow**
+   ```
+   Build on Linux → Test locally → Deploy to Docker → Run containers
+   ```
+
+### UI/UX Considerations
+- CLI with intuitive commands and helpful error messages
+- Progress bars for file transfers
+- Real-time performance metrics display
+- Docker containers for easy deployment
+- Comprehensive logging with adjustable verbosity
+
+## Technical Architecture
+
+### System Components
+
+1. **Core NDN Library** (`udcn-core`)
+   - Packet definitions and TLV codec
+   - Name structures and matching
+   - Signature generation/verification
+   - Interest/Data flow control
+
+2. **Transport Layer** (`udcn-transport`)
+   - QUIC integration via quinn
+   - Connection management
+   - Stream multiplexing
+   - Fragmentation/reassembly
+
+3. **eBPF Programs** (`udcn-ebpf`)
+   - XDP packet filter
+   - PIT implementation
+   - Content store with LRU
+   - Statistics collection
+
+4. **User-space Daemon** (`udcnd`)
+   - eBPF program loading
+   - Routing table management
+   - Face management
+   - Control plane operations
+
+5. **CLI Application** (`udcn-cli`)
+   - File transfer commands
+   - Network management
+   - Performance monitoring
+   - Debug utilities
+
+6. **Benchmarking Tools** (`udcn-bench`)
+   - Traffic generators
+   - Topology simulators
+   - Metric collectors
+   - Report generators
+
+### Data Models
+
+```rust
+// Core structures
+struct Interest {
+    name: Name,
+    can_be_prefix: bool,
+    must_be_fresh: bool,
+    lifetime: Duration,
+    hop_limit: u8,
+    nonce: u32,
+}
+
+struct Data {
+    name: Name,
+    content: Vec<u8>,
+    freshness_period: Duration,
+    signature: Signature,
+}
+
+struct Name {
+    components: Vec<Component>,
+}
+
+// eBPF shared structures
+struct PitEntry {
+    name_hash: u64,
+    incoming_faces: [u32; MAX_FACES],
+    expiry: u64,
+}
+
+struct ContentStoreEntry {
+    name_hash: u64,
+    data_ptr: u64,
+    size: u32,
+    hits: u32,
+}
+```
+
+### APIs and Integrations
+
+1. **Rust API**
+   ```rust
+   // High-level API
+   async fn express_interest(name: &Name) -> Result<Data>;
+   async fn publish_data(name: &Name, content: &[u8]) -> Result<()>;
+   ```
+
+2. **eBPF Maps API**
+   - PIT map operations
+   - Content store management
+   - Statistics retrieval
+
+3. **Management API**
+   - Face creation/destruction
+   - Route management
+   - Performance metrics
+
+### Infrastructure Requirements
+
+- Linux kernel 5.10+ with eBPF support
+- Rust nightly (for cutting-edge eBPF features)
+- LLVM for eBPF compilation
+- Docker for containerization and testing
+- 2GB RAM minimum, 4GB recommended
+- Network interfaces supporting XDP
+
+## Development Roadmap
+
+### Phase 1: Foundation (MVP)
+**Scope**: Basic NDN functionality with file transfer
+
+1. **Core NDN Library**
+   - Interest/Data packet structures
+   - TLV encoding/decoding
+   - Basic name matching
+   - Simple signature verification
+
+2. **QUIC Transport**
+   - Connection establishment
+   - Basic Interest/Data exchange
+   - No fragmentation initially
+   - Single-threaded operation
+
+3. **Simple File Transfer**
+   - Send small files (<1MB)
+   - Sequential fetching
+   - Basic CLI interface
+   - No error recovery
+
+4. **Minimal eBPF**
+   - XDP packet counter
+   - Basic Interest filtering
+   - No caching yet
+
+**Deliverable**: Can transfer a file between two nodes using NDN over QUIC
+
+### Phase 2: Performance Enhancement
+**Scope**: Add caching and optimize transport
+
+1. **eBPF Caching**
+   - Implement PIT in kernel
+   - Add LRU content store
+   - Interest aggregation
+   - Fast-path for cached content
+
+2. **Transport Optimization**
+   - Fragmentation/reassembly
+   - Pipeline fetching
+   - Multi-threaded operation
+   - Connection pooling
+
+3. **Enhanced File Transfer**
+   - Large file support
+   - Parallel fetching
+   - Resume capability
+   - Progress tracking
+
+4. **Basic Benchmarking**
+   - Throughput measurement
+   - Latency tracking
+   - Cache hit rate monitoring
+   - Simple traffic generator
+
+### Phase 3: Production Features
+**Scope**: Full feature set with management tools
+
+1. **Advanced eBPF**
+   - Sophisticated caching policies
+   - Dynamic cache sizing
+   - Advanced statistics
+   - Multiple face support
+
+2. **Management Daemon**
+   - Face management
+   - Routing protocols
+   - Configuration API
+   - Monitoring endpoints
+
+3. **Benchmarking Suite**
+   - Topology simulation
+   - Automated testing
+   - Performance regression detection
+   - Detailed reporting
+
+4. **Production Tooling**
+   - Docker packaging
+   - Deployment scripts
+   - Health checks
+   - Operational metrics
+
+### Phase 4: Advanced Features
+**Scope**: Research and experimental features
+
+1. **Advanced NDN Features**
+   - Manifest support
+   - Network coding
+   - Pub/sub patterns
+   - Security policies
+
+2. **Performance Tuning**
+   - NUMA awareness
+   - CPU affinity
+   - Zero-copy optimizations
+   - Hardware offload exploration
+
+3. **Integration Features**
+   - REST API gateway
+   - Prometheus metrics
+   - Kubernetes operator
+   - CDN integration
+
+## Logical Dependency Chain
+
+### Development Order
+
+1. **Foundation Layer** (Week 1-2)
+   - TLV codec implementation
+   - Basic packet structures
+   - Name handling
+   - Must complete before any networking
+
+2. **Transport Layer** (Week 2-3)
+   - QUIC connection setup
+   - Basic Interest/Data flow
+   - Depends on: Foundation Layer
+   - Enables: First end-to-end test
+
+3. **Basic CLI** (Week 3-4)
+   - Simple send/receive commands
+   - File chunking logic
+   - Depends on: Transport Layer
+   - Enables: User testing
+
+4. **eBPF Foundation** (Week 4-5)
+   - XDP program skeleton
+   - Basic packet inspection
+   - Can develop in parallel with CLI
+   - Enables: Performance optimization
+
+5. **Caching Implementation** (Week 5-6)
+   - PIT in eBPF
+   - Content store
+   - Depends on: eBPF Foundation
+   - Enables: Performance gains
+
+6. **Benchmarking Tools** (Week 6-7)
+   - Traffic generation
+   - Metric collection
+   - Depends on: All core features
+   - Enables: Performance validation
+
+7. **Production Features** (Week 7-8)
+   - Docker packaging
+   - Deployment scripts
+   - Cross-compilation
+   - Depends on: Stable core
+
+### Critical Path
+TLV Codec → QUIC Integration → Basic File Transfer → eBPF Caching → Benchmarking
+
+## Risks and Mitigations
+
+### Technical Challenges
+
+1. **eBPF Complexity**
+   - Risk: Kernel verifier rejections, limited eBPF capabilities
+   - Mitigation: Start simple, incremental complexity, fallback to userspace
+
+2. **QUIC Integration**
+   - Risk: Protocol impedance mismatch with NDN
+   - Mitigation: Custom stream management, careful API design
+
+3. **Rust Nightly Dependencies**
+   - Risk: Unstable features, breaking changes
+   - Mitigation: Pin specific nightly version, regular testing
+
+4. **Performance Goals**
+   - Risk: Not achieving latency targets
+   - Mitigation: Profiling from day one, architecture flexibility
+
+### MVP Scoping
+
+1. **Feature Creep**
+   - Risk: Trying to implement full NDN spec
+   - Mitigation: Clear MVP definition, phased approach
+
+2. **Over-engineering**
+   - Risk: Complex abstractions slowing development
+   - Mitigation: YAGNI principle, refactor when needed
+
+### Resource Constraints
+
+1. **Development Time**
+   - Risk: Underestimating eBPF learning curve
+   - Mitigation: Leverage aya examples, community support
+
+2. **Testing Infrastructure**
+   - Risk: Complex eBPF testing requirements
+   - Mitigation: Docker-based test environment, automated test suite
+
+## Appendix
+
+### Research References
+- NDN Protocol Specification (v0.3)
+- QUIC RFC 9000
+- XDP Tutorial and Documentation
+- aya-rs eBPF Framework Documentation
+
+### Technical Specifications
+
+#### Performance Targets
+- Latency: <100μs for cached content (kernel fast-path)
+- Throughput: 10Gbps on modern hardware
+- Cache hit rate: >80% for popular content
+- Memory usage: <500MB for 100k cached objects
+
+#### Compatibility Requirements
+- Linux kernel: 5.10+ (LTS)
+- Rust: nightly (pinned version)
+- LLVM: 14+ (for eBPF)
+- Architecture: x86_64, aarch64
+
+#### Development Environment
+- Primary: Native Linux
+- Testing: Local + Docker containers
+- CI/CD: GitHub Actions
+- Container: Docker 20.10+
+
+### File Structure
+```
+udcn/
+├── udcn-core/          # Core NDN library
+├── udcn-transport/     # QUIC transport
+├── udcn-ebpf/          # eBPF programs
+├── udcn-common/        # Shared eBPF structs
+├── udcnd/              # User-space daemon
+├── udcn-cli/           # CLI application
+├── udcn-bench/         # Benchmarking suite
+├── scripts/
+│   ├── build.sh        # Build script
+│   ├── test.sh         # Integration tests
+│   └── docker-test.sh  # Docker-based tests
+├── docker/             # Container definitions
+├── rust-toolchain.toml # Pinned nightly version
+└── docs/               # Documentation
+
