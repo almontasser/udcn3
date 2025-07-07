@@ -1,0 +1,156 @@
+version: '3.8'
+
+services:
+  # Main UDCN daemon service
+  udcnd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: udcnd
+    privileged: true  # Required for eBPF operations
+    network_mode: host  # Required for network manipulation
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      - udcn_data:/var/lib/udcn
+      - udcn_logs:/var/log/udcn
+      - ./config:/opt/udcn/config:ro
+    environment:
+      - RUST_LOG=info
+      - UDCN_CONFIG_PATH=/opt/udcn/config
+      - UDCN_DATA_PATH=/var/lib/udcn
+      - UDCN_LOG_PATH=/var/log/udcn
+    restart: unless-stopped
+    depends_on:
+      - udcn-db
+    healthcheck:
+      test: ["CMD", "udcn-cli", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development environment with tools
+  udcn-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: udcn-dev
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/app:cached
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      - rust_cache:/usr/local/cargo/registry
+      - target_cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - CARGO_TARGET_DIR=/app/target
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
+    profiles:
+      - dev
+
+  # Database service (for persistent storage)
+  udcn-db:
+    image: postgres:15-alpine
+    container_name: udcn-db
+    environment:
+      - POSTGRES_DB=udcn
+      - POSTGRES_USER=udcn
+      - POSTGRES_PASSWORD=udcn_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U udcn"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Monitoring and metrics
+  udcn-metrics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: udcn-metrics
+    command: ["udcn-bench", "monitor"]
+    depends_on:
+      - udcnd
+    volumes:
+      - udcn_logs:/var/log/udcn:ro
+    environment:
+      - RUST_LOG=info
+      - METRICS_INTERVAL=60
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Testing environment
+  udcn-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: udcn-test
+    privileged: true
+    network_mode: host
+    volumes:
+      - .:/app:cached
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      - rust_cache:/usr/local/cargo/registry
+      - target_cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - CARGO_TARGET_DIR=/app/target
+    working_dir: /app
+    command: ["cargo", "test", "--workspace"]
+    profiles:
+      - test
+
+  # Load balancer/reverse proxy
+  udcn-proxy:
+    image: nginx:alpine
+    container_name: udcn-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - udcnd
+    restart: unless-stopped
+    profiles:
+      - proxy
+
+volumes:
+  udcn_data:
+    driver: local
+  udcn_logs:
+    driver: local
+  postgres_data:
+    driver: local
+  rust_cache:
+    driver: local
+  target_cache:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
