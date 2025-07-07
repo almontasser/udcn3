@@ -1,0 +1,17 @@
+[package]
+name = "udcn-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+udcn-common = { path = "../udcn-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "udcn"
+path = "src/main.rs"
