@@ -1,0 +1,33 @@
+[package]
+name = "udcn-bench"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "udcn-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+clap = { workspace = true }
+
+# Benchmarking dependencies
+criterion = { version = "0.5", features = ["html_reports"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+udcn-common = { path = "../udcn-common" }
+udcn-core = { path = "../udcn-core" }
+udcn-transport = { path = "../udcn-transport" }
+
+[[bench]]
+name = "network_bench"
+harness = false
+
+[[bench]]
+name = "transport_bench"
+harness = false

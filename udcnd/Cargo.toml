@@ -1,0 +1,22 @@
+[package]
+name = "udcnd"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "udcnd"
+path = "src/main.rs"
+
+[dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+clap = { workspace = true }
+
+udcn-common = { path = "../udcn-common" }
+udcn-core = { path = "../udcn-core" }
+udcn-transport = { path = "../udcn-transport" }

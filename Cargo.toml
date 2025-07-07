@@ -4,6 +4,11 @@ members = [
     "udcn",
     "udcn-common",
     "udcn-ebpf",
+    "udcn-core",
+    "udcn-transport",
+    "udcnd",
+    "udcn-cli",
+    "udcn-bench",
 ]
 default-members = ["udcn", "udcn-common"]
 
@@ -30,4 +35,14 @@ which = { version = "6.0.0", default-features = false }
 
 [profile.release.package.udcn-ebpf]
 debug = 2
+codegen-units = 1
+
+[profile.dev]
+debug = true
+opt-level = 0
+
+[profile.release]
+debug = false
+opt-level = 3
+lto = true
 codegen-units = 1
