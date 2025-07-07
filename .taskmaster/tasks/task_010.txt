@@ -1,0 +1,31 @@
+# Task ID: 10
+# Title: Setup eBPF Development Environment
+# Status: pending
+# Dependencies: 1
+# Priority: medium
+# Description: Configure eBPF toolchain with aya framework and create basic XDP program structure
+# Details:
+Create udcn-ebpf crate with aya dependencies. Configure eBPF build system with proper LLVM requirements. Create basic XDP program skeleton with packet inspection. Set up udcn-common crate for shared structures between user and kernel space. Add eBPF program loading infrastructure. Include proper error handling for eBPF operations.
+
+# Test Strategy:
+Verify eBPF program compilation and loading. Test basic packet inspection without crashes. Validate shared structure synchronization between user and kernel space.
+
+# Subtasks:
+## 1. Set up eBPF toolchain and build environment [pending]
+### Dependencies: None
+### Description: Configure the development environment with necessary eBPF tools, libraries, and compilation infrastructure
+### Details:
+Install and configure libbpf, clang/LLVM for eBPF compilation, bpftool for program management, and set up proper kernel headers. Create Makefile or build system for compiling eBPF programs with proper flags and target architecture.
+
+## 2. Create XDP program skeleton with basic structure [pending]
+### Dependencies: 10.1
+### Description: Implement the foundational XDP program structure with entry point, basic packet processing logic, and return codes
+### Details:
+Create XDP program with SEC() annotations, implement xdp_md context handling, set up basic packet parsing infrastructure, and define XDP action return codes (XDP_PASS, XDP_DROP, XDP_REDIRECT, etc.). Include proper license declaration and version info.
+
+## 3. Define shared data structures between kernel and userspace [pending]
+### Dependencies: 10.1
+### Description: Create common header files and data structures that will be shared between eBPF programs and userspace applications
+### Details:
+Define packet metadata structures, statistics counters, configuration parameters, and any shared enums or constants. Create header files that can be included by both kernel-space eBPF code and userspace C programs. Include proper alignment and padding considerations for cross-boundary data sharing.
+

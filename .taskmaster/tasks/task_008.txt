@@ -1,0 +1,37 @@
+# Task ID: 8
+# Title: Implement File Transfer Send Functionality
+# Status: pending
+# Dependencies: 7
+# Priority: high
+# Description: Build the file sending capability with chunking and Data packet publication
+# Details:
+Implement file reading and chunking into NDN segments. Create Data packet publication for each chunk with proper naming scheme. Add metadata handling for file information. Implement concurrent chunk serving with proper Interest handling. Include progress reporting and error recovery. Support for large file transfers with efficient memory usage.
+
+# Test Strategy:
+Integration tests for file sending with various file sizes. Test concurrent chunk requests. Verify memory usage remains constant for large files.
+
+# Subtasks:
+## 1. Implement file chunking logic [pending]
+### Dependencies: None
+### Description: Create efficient file chunking system that splits large files into manageable chunks for processing and transmission
+### Details:
+Design and implement file chunking algorithm that can handle various file sizes, determine optimal chunk sizes, and maintain chunk metadata for reassembly
+
+## 2. Build data packet publication system [pending]
+### Dependencies: 8.1
+### Description: Develop system to publish file chunks as data packets with proper formatting and metadata
+### Details:
+Create packet structure, implement serialization/deserialization, add packet headers with chunk information, and ensure data integrity
+
+## 3. Implement concurrent serving mechanism [pending]
+### Dependencies: 8.2
+### Description: Design and build concurrent serving system to handle multiple client requests simultaneously
+### Details:
+Implement thread pool or async handling for concurrent connections, manage resource sharing, handle client connections, and optimize throughput
+
+## 4. Add progress tracking functionality [pending]
+### Dependencies: 8.3
+### Description: Create comprehensive progress tracking system for file transfers and client connections
+### Details:
+Implement progress monitoring for individual transfers, add logging and metrics collection, create status reporting mechanism, and handle error states
+

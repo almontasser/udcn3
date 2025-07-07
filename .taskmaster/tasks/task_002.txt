@@ -1,0 +1,43 @@
+# Task ID: 2
+# Title: Implement TLV Codec and Basic Packet Structures
+# Status: pending
+# Dependencies: 1
+# Priority: high
+# Description: Build the core TLV encoding/decoding system and define Interest/Data packet structures
+# Details:
+Implement TLV (Type-Length-Value) encoding in udcn-core. Create Interest struct with name, can_be_prefix, must_be_fresh, lifetime, hop_limit, and nonce fields. Create Data struct with name, content, freshness_period, and signature fields. Implement Name struct with components vector. Add serialization/deserialization methods for all packet types. Include basic validation for packet structure integrity.
+
+# Test Strategy:
+Unit tests for TLV codec with various data types. Round-trip tests for Interest/Data serialization. Test malformed packet handling and edge cases.
+
+# Subtasks:
+## 1. Implement TLV codec with encoding/decoding functions [pending]
+### Dependencies: None
+### Description: Create Type-Length-Value codec for binary data serialization with proper error handling
+### Details:
+Implement TLV encoding and decoding functions that handle different data types, length calculations, and buffer management. Include proper error handling for malformed data.
+
+## 2. Define Interest and Data packet structures [pending]
+### Dependencies: None
+### Description: Create structured definitions for Interest and Data packets with required fields
+### Details:
+Define Interest packet structure with name, selectors, and nonce fields. Define Data packet structure with name, content, signature info, and MetaInfo fields.
+
+## 3. Implement Name structure and components [pending]
+### Dependencies: None
+### Description: Create Name structure to represent hierarchical names with component management
+### Details:
+Implement Name structure with component array, methods for appending/prepending components, comparison operations, and string representation conversion.
+
+## 4. Implement serialization methods for packets [pending]
+### Dependencies: 2.1, 2.2, 2.3
+### Description: Create serialization and deserialization methods for Interest and Data packets
+### Details:
+Implement wire format serialization using TLV codec for Interest and Data packets. Include methods to convert between packet structures and binary wire format.
+
+## 5. Add validation logic for packet integrity [pending]
+### Dependencies: 2.2, 2.3, 2.4
+### Description: Implement validation functions to ensure packet correctness and protocol compliance
+### Details:
+Create validation functions to check packet field requirements, name format correctness, TLV structure integrity, and protocol compliance rules.
+

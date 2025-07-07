@@ -1,0 +1,43 @@
+# Task ID: 12
+# Title: Implement PIT (Pending Interest Table) in eBPF
+# Status: pending
+# Dependencies: 11
+# Priority: medium
+# Description: Build kernel-space PIT for tracking pending Interests with proper lifecycle management
+# Details:
+Create PIT entry structure with name hash, incoming faces, and expiry. Implement PIT map operations in eBPF with proper locking. Add Interest aggregation logic for duplicate Interests. Implement PIT entry cleanup and expiration. Create face management for tracking Interest sources. Include PIT statistics and monitoring.
+
+# Test Strategy:
+Unit tests for PIT operations including insertion, lookup, and expiration. Test Interest aggregation with duplicate requests. Verify PIT cleanup and memory management.
+
+# Subtasks:
+## 1. Design PIT structure and data organization [pending]
+### Dependencies: None
+### Description: Design the core Pending Interest Table (PIT) data structure, including entry format, indexing strategy, and memory layout for efficient lookup and storage
+### Details:
+Define PIT entry structure with fields for interest name, incoming face, nonce, expiration time, and state flags. Design hash table or tree-based indexing for fast name-based lookups. Consider memory alignment and cache efficiency for kernel space operations.
+
+## 2. Implement map operations for PIT entries [pending]
+### Dependencies: 12.1
+### Description: Implement core map operations including insert, lookup, update, and delete for PIT entries with proper synchronization
+### Details:
+Implement thread-safe operations for PIT entry management including atomic insertions, exact and longest prefix match lookups, entry updates for additional faces, and safe deletion with proper memory cleanup. Include lock-free optimizations where possible.
+
+## 3. Develop Interest aggregation mechanism [pending]
+### Dependencies: 12.2
+### Description: Implement Interest packet aggregation logic to handle multiple Interests for the same content efficiently
+### Details:
+Design aggregation algorithm to merge multiple pending Interests with same name prefix, manage multiple incoming faces per PIT entry, implement nonce checking to prevent Interest loops, and handle Interest parameter matching for proper aggregation decisions.
+
+## 4. Implement expiration handling and cleanup [pending]
+### Dependencies: 12.2
+### Description: Develop automatic expiration mechanism for PIT entries with efficient cleanup and notification system
+### Details:
+Implement timer-based expiration system using kernel timers or time wheels, automatic cleanup of expired entries, NACK generation for expired Interests, and efficient traversal mechanisms for bulk cleanup operations. Handle race conditions between expiration and data arrival.
+
+## 5. Implement face management integration [pending]
+### Dependencies: 12.3, 12.4
+### Description: Integrate PIT operations with face management system for proper Interest forwarding and face state tracking
+### Details:
+Implement face-to-PIT binding for tracking which faces have pending Interests, handle face state changes and cleanup of associated PIT entries, integrate with forwarding engine for Interest dispatch, and implement proper error handling for face failures during PIT operations.
+

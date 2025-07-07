@@ -1,0 +1,43 @@
+# Task ID: 14
+# Title: Implement User-space Daemon (udcnd)
+# Status: pending
+# Dependencies: 13
+# Priority: medium
+# Description: Create management daemon for eBPF program loading and control plane operations
+# Details:
+Create udcnd crate with eBPF program loading capabilities. Implement face management API for network interfaces. Add routing table management and FIB operations. Create control plane for eBPF map management. Implement configuration management and runtime parameters. Include health monitoring and statistics collection.
+
+# Test Strategy:
+Integration tests for daemon startup and eBPF program loading. Test face management operations and routing table updates. Verify control plane communication with eBPF programs.
+
+# Subtasks:
+## 1. eBPF Program Loading [pending]
+### Dependencies: None
+### Description: Implement eBPF program compilation, loading, and attachment to network interfaces
+### Details:
+Create modules for eBPF bytecode compilation, kernel loading via bpf() syscall, and program attachment to XDP hooks or TC classifiers
+
+## 2. Face Management API [pending]
+### Dependencies: 14.1
+### Description: Design and implement network face management API for NDN communication
+### Details:
+Build API for creating, configuring, and managing network faces including Ethernet, UDP, and TCP faces with proper lifecycle management
+
+## 3. Routing Operations [pending]
+### Dependencies: 14.1, 14.2
+### Description: Implement NDN packet forwarding and routing decision logic
+### Details:
+Create forwarding information base (FIB) management, interest forwarding, data packet routing, and strategy choice implementation
+
+## 4. Control Plane [pending]
+### Dependencies: 14.2, 14.3
+### Description: Develop control plane for managing routing protocols and network state
+### Details:
+Implement routing protocol handlers, network topology discovery, face status monitoring, and control message processing
+
+## 5. Configuration Management [pending]
+### Dependencies: 14.4
+### Description: Build configuration system for runtime parameter management
+### Details:
+Create configuration file parser, runtime parameter updates, policy management, and administrative interface for system configuration
+
