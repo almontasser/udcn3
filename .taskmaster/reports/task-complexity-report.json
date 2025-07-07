@@ -1,0 +1,173 @@
+{
+	"meta": {
+		"generatedAt": "2025-07-07T14:10:20.049Z",
+		"tasksAnalyzed": 20,
+		"totalTasks": 20,
+		"analysisCount": 20,
+		"thresholdScore": 5,
+		"projectName": "Taskmaster",
+		"usedResearch": true
+	},
+	"complexityAnalysis": [
+		{
+			"taskId": 1,
+			"taskTitle": "Setup Project Repository Structure",
+			"complexityScore": 3,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break down the workspace initialization into distinct phases: workspace configuration, crate creation, build system setup, and Docker infrastructure",
+			"reasoning": "Simple file system operations and configuration setup with well-defined requirements"
+		},
+		{
+			"taskId": 2,
+			"taskTitle": "Implement TLV Codec and Basic Packet Structures",
+			"complexityScore": 7,
+			"recommendedSubtasks": 5,
+			"expansionPrompt": "Separate TLV codec implementation, Interest/Data struct definitions, Name structure, serialization methods, and validation logic",
+			"reasoning": "Complex protocol implementation requiring binary encoding, data structures, and validation with multiple interdependent components"
+		},
+		{
+			"taskId": 3,
+			"taskTitle": "Implement Name Structure and Matching",
+			"complexityScore": 6,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Split into name component management, prefix matching algorithms, hierarchy operations, and validation/normalization functions",
+			"reasoning": "Moderate complexity with algorithmic challenges in prefix matching and component management"
+		},
+		{
+			"taskId": 4,
+			"taskTitle": "Implement Basic Signature System",
+			"complexityScore": 5,
+			"recommendedSubtasks": 3,
+			"expansionPrompt": "Divide into signature structure implementation, cryptographic operations (SHA256/RSA), and TLV encoding integration",
+			"reasoning": "Moderate complexity involving cryptographic operations but using established libraries"
+		},
+		{
+			"taskId": 5,
+			"taskTitle": "Setup QUIC Transport Foundation",
+			"complexityScore": 6,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into QUIC connection management, TLS configuration, connection pooling, and NDN-specific transport configuration",
+			"reasoning": "Moderate-high complexity involving network protocols and async programming patterns"
+		},
+		{
+			"taskId": 6,
+			"taskTitle": "Implement Interest/Data Exchange over QUIC",
+			"complexityScore": 7,
+			"recommendedSubtasks": 5,
+			"expansionPrompt": "Separate Interest transmission, Data response handling, packet framing, timeout management, and stream multiplexing",
+			"reasoning": "High complexity combining protocol implementation with network programming and concurrent operations"
+		},
+		{
+			"taskId": 7,
+			"taskTitle": "Create Basic CLI Application Structure",
+			"complexityScore": 4,
+			"recommendedSubtasks": 3,
+			"expansionPrompt": "Split into command-line interface setup, file operation utilities, and logging/error handling infrastructure",
+			"reasoning": "Moderate complexity with well-defined CLI patterns and file operations"
+		},
+		{
+			"taskId": 8,
+			"taskTitle": "Implement File Transfer Send Functionality",
+			"complexityScore": 6,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into file chunking logic, Data packet publication, concurrent serving, and progress tracking",
+			"reasoning": "Moderate-high complexity involving file I/O, concurrency, and memory management"
+		},
+		{
+			"taskId": 9,
+			"taskTitle": "Implement File Transfer Receive Functionality",
+			"complexityScore": 7,
+			"recommendedSubtasks": 5,
+			"expansionPrompt": "Separate Interest generation, Data reception, file reassembly, pipeline fetching, and integrity verification",
+			"reasoning": "High complexity with concurrent operations, state management, and error recovery"
+		},
+		{
+			"taskId": 10,
+			"taskTitle": "Setup eBPF Development Environment",
+			"complexityScore": 5,
+			"recommendedSubtasks": 3,
+			"expansionPrompt": "Split into eBPF toolchain setup, XDP program skeleton, and shared structure definitions",
+			"reasoning": "Moderate complexity with specialized toolchain but following established patterns"
+		},
+		{
+			"taskId": 11,
+			"taskTitle": "Implement Basic XDP Packet Filtering",
+			"complexityScore": 8,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into packet parsing logic, Interest identification, filtering rules, and statistics collection",
+			"reasoning": "High complexity due to eBPF constraints, verifier requirements, and kernel-space programming"
+		},
+		{
+			"taskId": 12,
+			"taskTitle": "Implement PIT (Pending Interest Table) in eBPF",
+			"complexityScore": 9,
+			"recommendedSubtasks": 5,
+			"expansionPrompt": "Separate PIT structure design, map operations, Interest aggregation, expiration handling, and face management",
+			"reasoning": "Very high complexity with concurrent data structures in kernel space and complex state management"
+		},
+		{
+			"taskId": 13,
+			"taskTitle": "Implement Content Store with LRU Caching",
+			"complexityScore": 8,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Split into cache structure design, LRU eviction algorithm, lookup/insertion operations, and statistics tracking",
+			"reasoning": "High complexity with algorithmic challenges and memory management in constrained eBPF environment"
+		},
+		{
+			"taskId": 14,
+			"taskTitle": "Implement User-space Daemon (udcnd)",
+			"complexityScore": 7,
+			"recommendedSubtasks": 5,
+			"expansionPrompt": "Break into eBPF program loading, face management API, routing operations, control plane, and configuration management",
+			"reasoning": "High complexity with system integration, API design, and multiple subsystem coordination"
+		},
+		{
+			"taskId": 15,
+			"taskTitle": "Implement Basic Benchmarking Infrastructure",
+			"complexityScore": 5,
+			"recommendedSubtasks": 3,
+			"expansionPrompt": "Split into traffic generation, measurement tools, and topology simulation",
+			"reasoning": "Moderate complexity with performance measurement and synthetic traffic generation"
+		},
+		{
+			"taskId": 16,
+			"taskTitle": "Implement Transport Optimization Features",
+			"complexityScore": 7,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into fragmentation/reassembly, pipeline fetching, multi-threading, and connection pooling",
+			"reasoning": "High complexity with advanced networking features and concurrent programming"
+		},
+		{
+			"taskId": 17,
+			"taskTitle": "Implement Enhanced File Transfer Features",
+			"complexityScore": 6,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Split into large file handling, resume capability, progress tracking, and integrity verification",
+			"reasoning": "Moderate-high complexity with state persistence and advanced file operations"
+		},
+		{
+			"taskId": 18,
+			"taskTitle": "Implement Advanced Benchmarking Suite",
+			"complexityScore": 6,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into topology simulation, automated testing, report generation, and CI/CD integration",
+			"reasoning": "Moderate-high complexity with simulation and automation components"
+		},
+		{
+			"taskId": 19,
+			"taskTitle": "Implement Docker Packaging and Deployment",
+			"complexityScore": 4,
+			"recommendedSubtasks": 3,
+			"expansionPrompt": "Split into container creation, networking configuration, and deployment orchestration",
+			"reasoning": "Moderate complexity with containerization and deployment patterns"
+		},
+		{
+			"taskId": 20,
+			"taskTitle": "Implement Production Monitoring and Metrics",
+			"complexityScore": 5,
+			"recommendedSubtasks": 4,
+			"expansionPrompt": "Break into logging infrastructure, metrics collection, monitoring dashboards, and tracing systems",
+			"reasoning": "Moderate complexity with multiple monitoring technologies and integration points"
+		}
+	]
+}
