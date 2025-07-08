@@ -404,7 +404,7 @@ impl PacketFlowOptimizer {
             bytes_transferred: 0,
             last_activity: Instant::now(),
             avg_rtt: Duration::from_millis(100), // Default RTT
-        }).active_packets += 1;
+        });
         
         debug!("Assigned Interest {} to stream {}", interest.name.to_string(), stream_id);
         stream_id
@@ -438,9 +438,12 @@ impl PacketFlowOptimizer {
     
     /// Extract name prefix for stream assignment
     fn extract_name_prefix(&self, name: &Name) -> String {
-        // Use first 2 components as prefix for stream assignment
-        let prefix_len = std::cmp::min(2, name.len());
-        name.get_prefix(prefix_len).to_string()
+        // Use first component as prefix for stream assignment to group related interests
+        // For names with <= 2 components, use first component
+        // For names with > 2 components, use first 2 components
+        let prefix_len = if name.len() <= 2 { 1 } else { 2 };
+        let actual_len = std::cmp::min(prefix_len, name.len());
+        name.get_prefix(actual_len).to_string()
     }
     
     /// Find the least loaded stream
@@ -781,9 +784,10 @@ mod tests {
         
         // Add meta info with freshness period to make it cacheable
         data.meta_info = Some(udcn_core::packets::MetaInfo {
-            content_type: None,
+            content_type: udcn_core::ContentType::Blob,
             freshness_period: Some(Duration::from_secs(60)),
             final_block_id: None,
+            other_fields: std::collections::HashMap::new(),
         });
         
         // Store data

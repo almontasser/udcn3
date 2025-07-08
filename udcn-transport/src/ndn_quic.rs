@@ -1087,6 +1087,10 @@ mod tests {
             lifetime: std::time::Duration::from_secs(4),
             retransmissions: 0,
             sequence: 1,
+            last_retry: None,
+            retry_timeout: std::time::Duration::from_millis(100),
+            alternative_addrs: Vec::new(),
+            current_addr_index: 0,
         };
         
         pit.add_interest(entry.clone());
