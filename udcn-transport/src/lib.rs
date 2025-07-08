@@ -12,6 +12,10 @@ pub mod ndn_performance;
 pub mod data_response_handler;
 pub mod framing;
 pub mod stream_multiplexer;
+pub mod file_chunking;
+pub mod data_publisher;
+pub mod concurrent_server;
+pub mod progress_tracker;
 
 pub use tcp::*;
 pub use udp::*;
@@ -31,6 +35,15 @@ pub use framing::{FramingLayer, FramingError, LengthPrefixFramer, DatagramFramer
 
 // Stream multiplexing exports
 pub use stream_multiplexer::{StreamMultiplexer, StreamMultiplexerConfig, StreamId, StreamType, StreamPriority, StreamState, StreamEntry, StreamPool, StreamStats};
+
+// File chunking exports
+pub use file_chunking::{FileChunker, ChunkingConfig, FileMetadata, ChunkInfo, FileChunk, ChunkingError, FileChunkIterator};
+
+// Data publisher exports
+pub use data_publisher::{DataPacketPublisher, PublisherConfig, PublishStats, PublishedPacket, PublishingError};
+
+// Concurrent server exports
+pub use concurrent_server::{ConcurrentServer, ConcurrentServerConfig, ServerStats, RequestResponse, ConcurrentServerError};
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
