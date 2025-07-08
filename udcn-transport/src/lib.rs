@@ -9,6 +9,7 @@ pub mod ndn_quic;
 pub mod ndn_optimizations;
 pub mod ndn_forwarding;
 pub mod ndn_performance;
+pub mod data_response_handler;
 
 pub use tcp::*;
 pub use udp::*;
@@ -21,6 +22,7 @@ pub use ndn_quic::{NdnQuicTransport, NdnQuicConfig, NdnFrame, NdnFrameType, NdnF
 pub use ndn_optimizations::*;
 pub use ndn_forwarding::{NdnForwardingEngine, ForwardingInformationBase, PendingInterestTable as NdnPendingInterestTable, ForwardingConfig, ForwardingDecision, ForwardingStats};
 pub use ndn_performance::*;
+pub use data_response_handler::{DataResponseHandler, DataResponseConfig, DataVerificationStatus, ContentStore, ContentStoreEntry, DataResponseStats};
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;

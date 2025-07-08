@@ -842,7 +842,7 @@ pub mod utils {
         let available_memory = 1024 * 1024 * 1024; // 1GB assumption
         let cpu_cores = 4; // 4 cores assumption
         
-        let profile = if available_memory > 2 * 1024 * 1024 * 1024 {
+        let profile = if available_memory > 2_147_483_648u64 {
             // High-memory system
             WorkloadProfile::BulkDataTransfer
         } else if cpu_cores > 8 {
