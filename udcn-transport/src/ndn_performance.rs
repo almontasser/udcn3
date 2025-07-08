@@ -605,6 +605,12 @@ impl NdnPerformanceConfig {
             backoff_multiplier: 2.0,
             max_backoff: std::time::Duration::from_secs(10),
             adaptive_timeout: true,
+            cleanup_interval: std::time::Duration::from_millis(500),
+            rtt_timeout_weight: 0.3,
+            proactive_timeout_management: true,
+            min_timeout: std::time::Duration::from_millis(100),
+            enable_stream_multiplexing: true,
+            stream_multiplexer_config: crate::stream_multiplexer::StreamMultiplexerConfig::default(),
         }
     }
     

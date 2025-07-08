@@ -11,6 +11,7 @@ pub mod ndn_forwarding;
 pub mod ndn_performance;
 pub mod data_response_handler;
 pub mod framing;
+pub mod stream_multiplexer;
 
 pub use tcp::*;
 pub use udp::*;
@@ -27,6 +28,9 @@ pub use data_response_handler::{DataResponseHandler, DataResponseConfig, DataVer
 
 // Framing exports
 pub use framing::{FramingLayer, FramingError, LengthPrefixFramer, DatagramFramer, PacketBuffer, boundary_detection};
+
+// Stream multiplexing exports
+pub use stream_multiplexer::{StreamMultiplexer, StreamMultiplexerConfig, StreamId, StreamType, StreamPriority, StreamState, StreamEntry, StreamPool, StreamStats};
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;

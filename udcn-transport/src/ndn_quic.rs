@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use anyhow::Result;
 use log::{info, debug, warn, error};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Notify};
 use quinn::{Connection, SendStream, RecvStream};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, interval};
 
 use udcn_core::packets::{Packet, Interest, Data};
 use crate::quic::QuicTransport;
+use crate::stream_multiplexer::{StreamMultiplexer, StreamMultiplexerConfig, StreamPriority};
 
 /// NDN-over-QUIC frame types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +236,18 @@ pub struct NdnQuicConfig {
     pub max_backoff: std::time::Duration,
     /// Enable adaptive timeout based on RTT
     pub adaptive_timeout: bool,
+    /// Timeout cleanup interval
+    pub cleanup_interval: std::time::Duration,
+    /// RTT-based timeout calculation weight
+    pub rtt_timeout_weight: f64,
+    /// Enable proactive timeout management
+    pub proactive_timeout_management: bool,
+    /// Minimum timeout value to prevent too aggressive timeouts
+    pub min_timeout: std::time::Duration,
+    /// Enable stream multiplexing
+    pub enable_stream_multiplexing: bool,
+    /// Stream multiplexer configuration
+    pub stream_multiplexer_config: StreamMultiplexerConfig,
 }
 
 impl Default for NdnQuicConfig {
@@ -251,6 +264,12 @@ impl Default for NdnQuicConfig {
             backoff_multiplier: 2.0,
             max_backoff: std::time::Duration::from_secs(10),
             adaptive_timeout: true,
+            cleanup_interval: std::time::Duration::from_millis(500), // 500ms cleanup interval
+            rtt_timeout_weight: 0.3, // 30% weight for RTT-based adjustment
+            proactive_timeout_management: true,
+            min_timeout: std::time::Duration::from_millis(100), // Minimum 100ms timeout
+            enable_stream_multiplexing: true,
+            stream_multiplexer_config: StreamMultiplexerConfig::default(),
         }
     }
 }
@@ -266,6 +285,111 @@ pub struct NdnQuicTransport {
     next_sequence: Arc<RwLock<u64>>,
     /// Pending Interest table for tracking outgoing Interests
     pending_interests: Arc<RwLock<PendingInterestTable>>,
+    /// Timeout management task handle
+    timeout_task_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Stream multiplexer for managing concurrent streams
+    stream_multiplexer: Option<Arc<StreamMultiplexer>>,
+}
+
+/// Timeout event types
+#[derive(Debug, Clone)]
+pub enum TimeoutEvent {
+    /// Interest expired without satisfaction
+    InterestExpired {
+        name: String,
+        remote_addr: SocketAddr,
+        elapsed: std::time::Duration,
+        retransmissions: u32,
+    },
+    /// Interest retry attempt
+    InterestRetry {
+        name: String,
+        remote_addr: SocketAddr,
+        attempt: u32,
+        backoff_duration: std::time::Duration,
+    },
+    /// Connection timeout detected
+    ConnectionTimeout {
+        remote_addr: SocketAddr,
+        idle_duration: std::time::Duration,
+    },
+}
+
+/// Timeout event callback type
+pub type TimeoutEventCallback = Arc<dyn Fn(TimeoutEvent) + Send + Sync>;
+
+/// RTT measurement for adaptive timeouts
+#[derive(Debug, Clone)]
+pub struct RttMeasurement {
+    /// Most recent RTT measurement
+    pub rtt: std::time::Duration,
+    /// Smoothed RTT (SRTT)
+    pub srtt: std::time::Duration,
+    /// RTT variance
+    pub rttvar: std::time::Duration,
+    /// Last update timestamp
+    pub last_update: std::time::Instant,
+    /// Number of measurements
+    pub sample_count: u32,
+}
+
+impl Default for RttMeasurement {
+    fn default() -> Self {
+        Self {
+            rtt: std::time::Duration::from_millis(100),
+            srtt: std::time::Duration::from_millis(100),
+            rttvar: std::time::Duration::from_millis(50),
+            last_update: std::time::Instant::now(),
+            sample_count: 0,
+        }
+    }
+}
+
+impl RttMeasurement {
+    /// Update RTT measurement with new sample
+    pub fn update(&mut self, new_rtt: std::time::Duration) {
+        self.rtt = new_rtt;
+        self.last_update = std::time::Instant::now();
+        
+        if self.sample_count == 0 {
+            // First measurement
+            self.srtt = new_rtt;
+            self.rttvar = new_rtt / 2;
+        } else {
+            // RFC 6298 algorithm
+            let alpha = 1.0 / 8.0;
+            let beta = 1.0 / 4.0;
+            
+            let rtt_diff = if new_rtt > self.srtt {
+                new_rtt - self.srtt
+            } else {
+                self.srtt - new_rtt
+            };
+            
+            self.rttvar = std::time::Duration::from_nanos(
+                ((1.0 - beta) * self.rttvar.as_nanos() as f64 + beta * rtt_diff.as_nanos() as f64) as u64
+            );
+            
+            self.srtt = std::time::Duration::from_nanos(
+                ((1.0 - alpha) * self.srtt.as_nanos() as f64 + alpha * new_rtt.as_nanos() as f64) as u64
+            );
+        }
+        
+        self.sample_count += 1;
+    }
+    
+    /// Calculate adaptive timeout based on RTT measurements
+    pub fn calculate_timeout(&self, base_timeout: std::time::Duration, weight: f64) -> std::time::Duration {
+        // RTO = SRTT + max(G, K * RTTVAR) where G is clock granularity and K is 4
+        let rto = self.srtt + (self.rttvar * 4).max(std::time::Duration::from_millis(1));
+        
+        // Blend base timeout with RTT-calculated timeout
+        let adaptive_timeout = std::time::Duration::from_nanos(
+            ((1.0 - weight) * base_timeout.as_nanos() as f64 + weight * rto.as_nanos() as f64) as u64
+        );
+        
+        adaptive_timeout
+    }
 }
 
 /// Pending Interest Table entry
@@ -291,6 +415,10 @@ pub struct PendingInterestEntry {
     pub alternative_addrs: Vec<SocketAddr>,
     /// Current destination index
     pub current_addr_index: usize,
+    /// RTT measurements for this destination
+    pub rtt_measurement: RttMeasurement,
+    /// Adaptive timeout value
+    pub adaptive_timeout: Option<std::time::Duration>,
 }
 
 /// Interest transmission result
@@ -331,13 +459,45 @@ pub struct TransmissionConfig {
 }
 
 /// Pending Interest Table
-#[derive(Debug, Default)]
 pub struct PendingInterestTable {
     /// Entries indexed by Interest name
     entries: std::collections::HashMap<String, PendingInterestEntry>,
+    /// Timeout event callback
+    timeout_callback: Option<TimeoutEventCallback>,
+    /// Cleanup task cancellation notify
+    cleanup_notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for PendingInterestTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInterestTable")
+            .field("entries", &self.entries)
+            .field("timeout_callback", &self.timeout_callback.as_ref().map(|_| "Some(callback)"))
+            .field("cleanup_notify", &self.cleanup_notify)
+            .finish()
+    }
+}
+
+impl Default for PendingInterestTable {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            timeout_callback: None,
+            cleanup_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl PendingInterestTable {
+    /// Create a new PendingInterestTable with timeout callback
+    pub fn new(timeout_callback: Option<TimeoutEventCallback>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            timeout_callback,
+            cleanup_notify: Arc::new(Notify::new()),
+        }
+    }
+    
     /// Add a pending Interest
     pub fn add_interest(&mut self, entry: PendingInterestEntry) {
         self.entries.insert(entry.name.clone(), entry);
@@ -353,13 +513,26 @@ impl PendingInterestTable {
         self.entries.get(name)
     }
     
+    /// Get a mutable reference to a pending Interest
+    pub fn get_interest_mut(&mut self, name: &str) -> Option<&mut PendingInterestEntry> {
+        self.entries.get_mut(name)
+    }
+    
+    /// Update RTT for a specific Interest
+    pub fn update_rtt(&mut self, name: &str, rtt: std::time::Duration) {
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.rtt_measurement.update(rtt);
+        }
+    }
+    
     /// Get all expired Interests
     pub fn get_expired_interests(&self) -> Vec<String> {
         let now = std::time::Instant::now();
         self.entries
             .iter()
             .filter_map(|(name, entry)| {
-                if now.duration_since(entry.sent_at) > entry.lifetime {
+                let effective_timeout = entry.adaptive_timeout.unwrap_or(entry.lifetime);
+                if now.duration_since(entry.sent_at) > effective_timeout {
                     Some(name.clone())
                 } else {
                     None
@@ -368,28 +541,206 @@ impl PendingInterestTable {
             .collect()
     }
     
-    /// Clean up expired Interests
+    /// Get Interests ready for retry
+    pub fn get_retry_interests(&self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if entry.retransmissions >= 3 {
+                    return None; // Max retries reached
+                }
+                
+                let should_retry = if let Some(last_retry) = entry.last_retry {
+                    now.duration_since(last_retry) >= entry.retry_timeout
+                } else {
+                    now.duration_since(entry.sent_at) >= entry.retry_timeout
+                };
+                
+                if should_retry {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    
+    /// Clean up expired Interests with timeout event notification
     pub fn cleanup_expired(&mut self) -> usize {
         let expired_names = self.get_expired_interests();
         let count = expired_names.len();
         
         for name in expired_names {
-            self.entries.remove(&name);
+            if let Some(entry) = self.entries.remove(&name) {
+                // Notify timeout event if callback is set
+                if let Some(ref callback) = self.timeout_callback {
+                    let elapsed = std::time::Instant::now().duration_since(entry.sent_at);
+                    let event = TimeoutEvent::InterestExpired {
+                        name: entry.name.clone(),
+                        remote_addr: entry.remote_addr,
+                        elapsed,
+                        retransmissions: entry.retransmissions,
+                    };
+                    callback(event);
+                }
+            }
         }
         
         count
+    }
+    
+    /// Process retry interests with timeout event notification
+    pub fn process_retries(&mut self) -> Vec<PendingInterestEntry> {
+        let retry_names = self.get_retry_interests();
+        let mut retry_entries = Vec::new();
+        
+        for name in retry_names {
+            if let Some(entry) = self.entries.get_mut(&name) {
+                entry.retransmissions += 1;
+                entry.last_retry = Some(std::time::Instant::now());
+                
+                // Update retry timeout with exponential backoff
+                entry.retry_timeout = std::time::Duration::from_millis(
+                    (entry.retry_timeout.as_millis() as f64 * 2.0) as u64
+                );
+                
+                // Notify retry event if callback is set
+                if let Some(ref callback) = self.timeout_callback {
+                    let event = TimeoutEvent::InterestRetry {
+                        name: entry.name.clone(),
+                        remote_addr: entry.remote_addr,
+                        attempt: entry.retransmissions,
+                        backoff_duration: entry.retry_timeout,
+                    };
+                    callback(event);
+                }
+                
+                retry_entries.push(entry.clone());
+            }
+        }
+        
+        retry_entries
+    }
+    
+    /// Set timeout event callback
+    pub fn set_timeout_callback(&mut self, callback: TimeoutEventCallback) {
+        self.timeout_callback = Some(callback);
+    }
+    
+    /// Get number of pending Interests
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    
+    /// Check if table is empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
 impl NdnQuicTransport {
     /// Create a new NDN-over-QUIC transport
     pub fn new(quic_transport: Arc<QuicTransport>, config: NdnQuicConfig) -> Self {
-        Self {
+        // Initialize stream multiplexer if enabled
+        let stream_multiplexer = if config.enable_stream_multiplexing {
+            Some(Arc::new(StreamMultiplexer::new(config.stream_multiplexer_config.clone())))
+        } else {
+            None
+        };
+
+        let transport = Self {
             quic_transport,
-            config,
+            config: config.clone(),
             next_sequence: Arc::new(RwLock::new(0)),
             pending_interests: Arc::new(RwLock::new(PendingInterestTable::default())),
+            timeout_task_handle: Arc::new(RwLock::new(None)),
+            stream_multiplexer,
+        };
+        
+        // Start proactive timeout management if enabled
+        if config.proactive_timeout_management {
+            transport.start_timeout_management();
         }
+        
+        transport
+    }
+    
+    /// Set timeout event callback
+    pub async fn set_timeout_callback(&self, callback: TimeoutEventCallback) {
+        let mut pit = self.pending_interests.write().await;
+        pit.set_timeout_callback(callback);
+    }
+    
+    /// Start proactive timeout management service
+    pub fn start_timeout_management(&self) {
+        let pending_interests = self.pending_interests.clone();
+        let cleanup_interval = self.config.cleanup_interval;
+        let _config = self.config.clone();
+        
+        let task = tokio::spawn(async move {
+            let mut interval = interval(cleanup_interval);
+            
+            loop {
+                interval.tick().await;
+                
+                // Perform cleanup and retries
+                {
+                    let mut pit = pending_interests.write().await;
+                    
+                    // Clean up expired Interests
+                    let expired_count = pit.cleanup_expired();
+                    if expired_count > 0 {
+                        debug!("Cleaned up {} expired Interests", expired_count);
+                    }
+                    
+                    // Process retries
+                    let retry_entries = pit.process_retries();
+                    if !retry_entries.is_empty() {
+                        debug!("Processed {} Interest retries", retry_entries.len());
+                    }
+                }
+                
+                // Check if we should continue running
+                {
+                    let pit = pending_interests.read().await;
+                    if pit.is_empty() {
+                        // Wait before checking again when no pending Interests
+                        sleep(cleanup_interval * 2).await;
+                    }
+                }
+            }
+        });
+        
+        // Store the task handle
+        if let Ok(mut handle) = self.timeout_task_handle.try_write() {
+            *handle = Some(task);
+        }
+    }
+    
+    /// Stop proactive timeout management service
+    pub async fn stop_timeout_management(&self) {
+        let mut handle = self.timeout_task_handle.write().await;
+        if let Some(task) = handle.take() {
+            task.abort();
+            debug!("Stopped timeout management service");
+        }
+    }
+    
+    /// Calculate adaptive timeout for an Interest
+    pub fn calculate_adaptive_timeout(
+        &self,
+        rtt_measurement: &RttMeasurement,
+        base_timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        if !self.config.adaptive_timeout {
+            return base_timeout;
+        }
+        
+        let adaptive_timeout = rtt_measurement.calculate_timeout(base_timeout, self.config.rtt_timeout_weight);
+        
+        // Ensure timeout is within reasonable bounds
+        adaptive_timeout.max(self.config.min_timeout).min(self.config.max_backoff)
     }
     
     /// Get the next sequence number
@@ -448,20 +799,32 @@ impl NdnQuicTransport {
         let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), sequence)?;
         let name = interest.name.to_string();
         
+        // Calculate adaptive timeout if enabled
+        let base_timeout = interest.interest_lifetime.unwrap_or_else(|| {
+            std::time::Duration::from_millis(self.config.max_interest_lifetime)
+        });
+        
+        let rtt_measurement = RttMeasurement::default();
+        let adaptive_timeout = if self.config.adaptive_timeout {
+            Some(self.calculate_adaptive_timeout(&rtt_measurement, base_timeout))
+        } else {
+            None
+        };
+        
         // Create initial PIT entry
         let entry = PendingInterestEntry {
             name: name.clone(),
             remote_addr: destinations[0],
             sent_at: std::time::Instant::now(),
-            lifetime: interest.interest_lifetime.unwrap_or_else(|| {
-                std::time::Duration::from_millis(self.config.max_interest_lifetime)
-            }),
+            lifetime: base_timeout,
             retransmissions: 0,
             sequence,
             last_retry: None,
             retry_timeout: self.config.interest_timeout,
             alternative_addrs: destinations.clone(),
             current_addr_index: 0,
+            rtt_measurement,
+            adaptive_timeout,
         };
 
         // Add to pending Interest table
@@ -589,6 +952,8 @@ impl NdnQuicTransport {
             retry_timeout: self.config.interest_timeout,
             alternative_addrs: destinations.clone(),
             current_addr_index: 0,
+            rtt_measurement: RttMeasurement::default(),
+            adaptive_timeout: None,
         };
 
         {
@@ -645,6 +1010,31 @@ impl NdnQuicTransport {
         })
     }
     
+    /// Handle incoming Data packet (satisfies pending Interest)
+    pub async fn handle_data_reception(&self, data: &Data, _remote_addr: SocketAddr) -> Result<()> {
+        let name = data.name.to_string();
+        let now = std::time::Instant::now();
+        
+        // Remove corresponding Interest from PIT and measure RTT
+        let mut _rtt_measurement = None;
+        {
+            let mut pit = self.pending_interests.write().await;
+            if let Some(entry) = pit.remove_interest(&name) {
+                let rtt = now.duration_since(entry.sent_at);
+                _rtt_measurement = Some(rtt);
+                
+                debug!("Satisfied Interest: {} from {} (RTT: {:?})", 
+                       name, entry.remote_addr, rtt);
+                
+                // Update global RTT statistics if performance monitoring is enabled
+                info!("Interest satisfied: {} RTT: {:?} attempts: {}", 
+                      name, rtt, entry.retransmissions + 1);
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// Send an NDN Data packet
     pub async fn send_data(&self, data: &Data, remote_addr: SocketAddr) -> Result<()> {
         let sequence = self.next_sequence().await;
@@ -665,6 +1055,198 @@ impl NdnQuicTransport {
         debug!("Sent Data: {} to {}", name, remote_addr);
         Ok(())
     }
+
+    // ==================== STREAM MULTIPLEXING METHODS ====================
+
+    /// Send Interest using stream multiplexing (if enabled)
+    pub async fn send_interest_multiplexed(
+        &self,
+        interest: &Interest,
+        remote_addr: SocketAddr,
+        priority: Option<StreamPriority>,
+    ) -> Result<()> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            // Get connection
+            let connection = self.quic_transport.connect(remote_addr).await?;
+            
+            // Create frame
+            let sequence = self.next_sequence().await;
+            let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), sequence)?;
+            
+            // Get stream and send
+            let stream_id = multiplexer.get_send_stream(&connection, priority).await?;
+            multiplexer.send_on_stream(stream_id, &frame).await?;
+            
+            // Add to PIT
+            let entry = PendingInterestEntry {
+                name: interest.name.to_string(),
+                remote_addr,
+                sent_at: std::time::Instant::now(),
+                lifetime: interest.interest_lifetime.unwrap_or_else(|| {
+                    std::time::Duration::from_millis(self.config.max_interest_lifetime)
+                }),
+                retransmissions: 0,
+                sequence,
+                last_retry: None,
+                retry_timeout: self.config.interest_timeout,
+                alternative_addrs: vec![remote_addr],
+                current_addr_index: 0,
+                rtt_measurement: RttMeasurement::default(),
+                adaptive_timeout: None,
+            };
+
+            {
+                let mut pit = self.pending_interests.write().await;
+                pit.add_interest(entry);
+            }
+
+            // Return stream to pool for reuse
+            multiplexer.return_stream(stream_id).await?;
+            
+            debug!("Sent Interest via multiplexed stream: {} to {}", interest.name, remote_addr);
+            Ok(())
+        } else {
+            // Fall back to non-multiplexed method
+            self.send_interest(interest, remote_addr).await
+        }
+    }
+
+    /// Send Data using stream multiplexing (if enabled)
+    pub async fn send_data_multiplexed(
+        &self,
+        data: &Data,
+        remote_addr: SocketAddr,
+        priority: Option<StreamPriority>,
+    ) -> Result<()> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            // Get connection
+            let connection = self.quic_transport.connect(remote_addr).await?;
+            
+            // Create frame
+            let sequence = self.next_sequence().await;
+            let frame = NdnFrame::from_packet(&Packet::Data(data.clone()), sequence)?;
+            
+            // Get stream and send
+            let stream_id = multiplexer.get_send_stream(&connection, priority).await?;
+            multiplexer.send_on_stream(stream_id, &frame).await?;
+            
+            // Remove corresponding Interest from PIT
+            let name = data.name.to_string();
+            {
+                let mut pit = self.pending_interests.write().await;
+                if let Some(entry) = pit.remove_interest(&name) {
+                    debug!("Satisfied Interest: {} from {}", name, entry.remote_addr);
+                }
+            }
+
+            // Return stream to pool for reuse
+            multiplexer.return_stream(stream_id).await?;
+            
+            debug!("Sent Data via multiplexed stream: {} to {}", name, remote_addr);
+            Ok(())
+        } else {
+            // Fall back to non-multiplexed method
+            self.send_data(data, remote_addr).await
+        }
+    }
+
+    /// Send Interest request and wait for Data response using bidirectional stream multiplexing
+    pub async fn send_interest_request_multiplexed(
+        &self,
+        interest: &Interest,
+        remote_addr: SocketAddr,
+        timeout: Duration,
+        priority: Option<StreamPriority>,
+    ) -> Result<Data> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            // Get connection
+            let connection = self.quic_transport.connect(remote_addr).await?;
+            
+            // Create request frame
+            let sequence = self.next_sequence().await;
+            let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), sequence)?;
+            
+            // Send request and wait for response
+            let response_frame = multiplexer.send_request(&connection, &frame, timeout, priority).await?;
+            
+            // Convert response frame back to Data packet
+            match response_frame.to_packet()? {
+                Packet::Data(data) => {
+                    debug!("Received Data response via multiplexed stream: {}", data.name);
+                    Ok(data)
+                }
+                _ => Err(anyhow::anyhow!("Expected Data response, got different packet type")),
+            }
+        } else {
+            return Err(anyhow::anyhow!("Stream multiplexing not enabled"));
+        }
+    }
+
+    /// Send multiple concurrent Interest requests using stream multiplexing
+    pub async fn send_concurrent_interests_multiplexed(
+        &self,
+        interests: Vec<Interest>,
+        remote_addr: SocketAddr,
+        timeout: Duration,
+        priority: Option<StreamPriority>,
+    ) -> Result<Vec<Result<Data>>> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            let connection = self.quic_transport.connect(remote_addr).await?;
+            let mut tasks = Vec::new();
+
+            // Launch concurrent requests
+            for interest in interests {
+                let connection = connection.clone();
+                let multiplexer = multiplexer.clone();
+                let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), 
+                                                 self.next_sequence().await)?;
+                
+                let task = tokio::spawn(async move {
+                    let response_frame = multiplexer.send_request(&connection, &frame, timeout, priority).await?;
+                    match response_frame.to_packet()? {
+                        Packet::Data(data) => Ok(data),
+                        _ => Err(anyhow::anyhow!("Expected Data response")),
+                    }
+                });
+                
+                tasks.push(task);
+            }
+
+            // Collect results
+            let mut results = Vec::new();
+            for task in tasks {
+                match task.await {
+                    Ok(result) => results.push(result),
+                    Err(e) => results.push(Err(anyhow::anyhow!("Task error: {}", e))),
+                }
+            }
+
+            debug!("Completed {} concurrent Interest requests", results.len());
+            Ok(results)
+        } else {
+            return Err(anyhow::anyhow!("Stream multiplexing not enabled"));
+        }
+    }
+
+    /// Get stream multiplexer statistics
+    pub async fn get_stream_multiplexer_stats(&self) -> Result<HashMap<String, u64>> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            Ok(multiplexer.get_stats().await)
+        } else {
+            Err(anyhow::anyhow!("Stream multiplexing not enabled"))
+        }
+    }
+
+    /// Close all streams for a specific connection
+    pub async fn close_connection_streams(&self, remote_addr: SocketAddr) -> Result<()> {
+        if let Some(ref multiplexer) = self.stream_multiplexer {
+            multiplexer.cleanup_connection(remote_addr).await
+        } else {
+            Ok(()) // No-op if multiplexing not enabled
+        }
+    }
+
+    // ==================== END STREAM MULTIPLEXING METHODS ====================
     
     /// Send an NDN frame over QUIC
     async fn send_frame(&self, frame: &NdnFrame, remote_addr: SocketAddr) -> Result<()> {
@@ -816,6 +1398,11 @@ impl NdnQuicTransport {
     /// Get the NDN configuration
     pub fn config(&self) -> &NdnQuicConfig {
         &self.config
+    }
+
+    /// Get the stream multiplexer (if enabled)
+    pub fn stream_multiplexer(&self) -> Option<&Arc<StreamMultiplexer>> {
+        self.stream_multiplexer.as_ref()
     }
 
     /// Retry expired Interests with exponential backoff
@@ -1091,6 +1678,8 @@ mod tests {
             retry_timeout: std::time::Duration::from_millis(100),
             alternative_addrs: Vec::new(),
             current_addr_index: 0,
+            rtt_measurement: RttMeasurement::default(),
+            adaptive_timeout: None,
         };
         
         pit.add_interest(entry.clone());
