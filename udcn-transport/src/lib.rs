@@ -4,11 +4,13 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 pub mod quic;
+pub mod quic_pool;
 
 pub use tcp::*;
 pub use udp::*;
 pub use unix::*;
 pub use quic::*;
+pub use quic_pool::*;
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
