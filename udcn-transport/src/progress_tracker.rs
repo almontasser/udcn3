@@ -1027,12 +1027,12 @@ mod tests {
 
     #[test]
     fn test_progress_events() {
-        let tracker = ProgressTracker::default();
+        let tracker = Arc::new(ProgressTracker::default());
         let mut receiver = tracker.subscribe_events();
         let session_id = TransferSessionId::new("test_file.txt", "client1");
         
         // Start transfer in background
-        let tracker_clone = tracker.clone();
+        let tracker_clone = Arc::clone(&tracker);
         let session_id_clone = session_id.clone();
         thread::spawn(move || {
             tracker_clone.start_transfer(

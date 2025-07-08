@@ -16,6 +16,7 @@ pub mod file_chunking;
 pub mod data_publisher;
 pub mod concurrent_server;
 pub mod progress_tracker;
+pub mod file_interest_generator;
 
 pub use tcp::*;
 pub use udp::*;

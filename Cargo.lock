@@ -1974,6 +1974,7 @@ dependencies = [
  "aya-log",
  "bincode",
  "env_logger 0.10.2",
+ "fastrand",
  "libc",
  "log",
  "num_cpus",
@@ -1986,6 +1987,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "tracing",
  "udcn-common",
  "udcn-core",
 ]

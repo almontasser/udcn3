@@ -404,7 +404,7 @@
         "dependencies": [
           7
         ],
-        "status": "in-progress",
+        "status": "done",
         "subtasks": [
           {
             "id": 1,
@@ -460,7 +460,7 @@
         "dependencies": [
           8
         ],
-        "status": "pending",
+        "status": "in-progress",
         "subtasks": [
           {
             "id": 1,
@@ -468,7 +468,7 @@
             "description": "Create a separate module for generating and managing interests/requests for data chunks",
             "dependencies": [],
             "details": "Design and implement interest packet generation, interest state tracking, and interest retransmission logic as a standalone component",
-            "status": "pending",
+            "status": "done",
             "testStrategy": ""
           },
           {
@@ -1135,7 +1135,7 @@
     ],
     "metadata": {
       "created": "2025-07-07T14:00:07.094Z",
-      "updated": "2025-07-08T16:51:03.979Z",
+      "updated": "2025-07-08T20:16:55.291Z",
       "description": "Tasks for master context"
     }
   }

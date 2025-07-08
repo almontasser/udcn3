@@ -20,6 +20,8 @@ serde = { workspace = true, features = ["derive"] }
 bincode = "1.3"
 thiserror = "1.0"
 num_cpus = "1.16"
+fastrand = "2.0"
+tracing = "0.1"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
