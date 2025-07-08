@@ -17,6 +17,10 @@ pub mod data_publisher;
 pub mod concurrent_server;
 pub mod progress_tracker;
 pub mod file_interest_generator;
+pub mod data_reception_handler;
+pub mod file_reassembly;
+pub mod file_integrity;
+pub mod pipeline_coordinator;
 
 pub use tcp::*;
 pub use udp::*;
@@ -45,6 +49,12 @@ pub use data_publisher::{DataPacketPublisher, PublisherConfig, PublishStats, Pub
 
 // Concurrent server exports
 pub use concurrent_server::{ConcurrentServer, ConcurrentServerConfig, ServerStats, RequestResponse, ConcurrentServerError};
+
+// File reassembly exports
+pub use file_reassembly::{FileReassemblyEngine, ReassemblyConfig, ReassemblyStatus, ReassemblyProgress, ReassemblyStats};
+
+// File integrity exports
+pub use file_integrity::{FileIntegrityEngine, IntegrityConfig, IntegrityStatus, IntegrityResult, ChecksumResult, SignatureResult, ChecksumAlgorithm, SignatureAlgorithm, IntegrityError, IntegrityStats};
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
