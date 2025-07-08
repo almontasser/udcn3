@@ -11,6 +11,11 @@ anyhow = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 libc = { workspace = true }
+quinn = "0.10"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-native-certs = "0.6"
+rcgen = "0.12"
+time = "0.3"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
