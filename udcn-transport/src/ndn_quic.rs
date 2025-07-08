@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashMap;
 use anyhow::Result;
-use log::{info, debug, warn};
+use log::{info, debug, warn, error};
 use tokio::sync::RwLock;
 use quinn::{Connection, SendStream, RecvStream};
+use tokio::time::{sleep, Duration};
 
 use udcn_core::packets::{Packet, Interest, Data};
 use crate::quic::QuicTransport;
@@ -228,6 +229,12 @@ pub struct NdnQuicConfig {
     pub interest_timeout: std::time::Duration,
     /// Maximum number of retransmissions
     pub max_retransmissions: u32,
+    /// Exponential backoff multiplier for retransmissions
+    pub backoff_multiplier: f64,
+    /// Maximum backoff duration
+    pub max_backoff: std::time::Duration,
+    /// Enable adaptive timeout based on RTT
+    pub adaptive_timeout: bool,
 }
 
 impl Default for NdnQuicConfig {
@@ -241,11 +248,15 @@ impl Default for NdnQuicConfig {
             compression: false,
             interest_timeout: std::time::Duration::from_millis(1000),
             max_retransmissions: 3,
+            backoff_multiplier: 2.0,
+            max_backoff: std::time::Duration::from_secs(10),
+            adaptive_timeout: true,
         }
     }
 }
 
 /// NDN-over-QUIC transport implementation
+#[derive(Clone)]
 pub struct NdnQuicTransport {
     /// Underlying QUIC transport
     quic_transport: Arc<QuicTransport>,
@@ -272,6 +283,51 @@ pub struct PendingInterestEntry {
     pub retransmissions: u32,
     /// Sequence number of the Interest
     pub sequence: u64,
+    /// Last retransmission time
+    pub last_retry: Option<std::time::Instant>,
+    /// Current retry timeout
+    pub retry_timeout: std::time::Duration,
+    /// Alternative destination addresses to try
+    pub alternative_addrs: Vec<SocketAddr>,
+    /// Current destination index
+    pub current_addr_index: usize,
+}
+
+/// Interest transmission result
+#[derive(Debug, Clone)]
+pub enum TransmissionResult {
+    /// Successfully sent to destination
+    Success {
+        destination: SocketAddr,
+        sequence: u64,
+        rtt_estimate: Option<Duration>,
+    },
+    /// Failed after all retries
+    Failed {
+        last_error: String,
+        attempts: u32,
+        destinations_tried: Vec<SocketAddr>,
+    },
+    /// Timed out waiting for response
+    Timeout {
+        elapsed: Duration,
+        attempts: u32,
+    },
+}
+
+/// Interest transmission configuration
+#[derive(Debug, Clone)]
+pub struct TransmissionConfig {
+    /// Maximum number of destinations to try
+    pub max_destinations: usize,
+    /// Enable parallel transmission to multiple destinations
+    pub parallel_transmission: bool,
+    /// Retry delay multiplier
+    pub retry_delay_multiplier: f64,
+    /// Maximum retry delay
+    pub max_retry_delay: Duration,
+    /// Connection health threshold for destination selection
+    pub health_threshold: f64,
 }
 
 /// Pending Interest Table
@@ -343,34 +399,250 @@ impl NdnQuicTransport {
         *seq
     }
     
-    /// Send an NDN Interest packet
+    /// Send an NDN Interest packet (basic version)
     pub async fn send_interest(&self, interest: &Interest, remote_addr: SocketAddr) -> Result<()> {
+        let transmission_config = TransmissionConfig {
+            max_destinations: 1,
+            parallel_transmission: false,
+            retry_delay_multiplier: self.config.backoff_multiplier,
+            max_retry_delay: self.config.max_backoff,
+            health_threshold: 0.7,
+        };
+        
+        let result = self.transmit_interest_with_retry(interest, vec![remote_addr], &transmission_config).await?;
+        
+        match result {
+            TransmissionResult::Success { destination, sequence, .. } => {
+                debug!("Successfully sent Interest: {} to {}, seq: {}", interest.name, destination, sequence);
+                Ok(())
+            }
+            TransmissionResult::Failed { last_error, attempts, destinations_tried } => {
+                error!("Failed to send Interest: {} after {} attempts to destinations {:?}: {}", 
+                       interest.name, attempts, destinations_tried, last_error);
+                Err(anyhow::anyhow!("Interest transmission failed: {}", last_error))
+            }
+            TransmissionResult::Timeout { elapsed, attempts } => {
+                error!("Interest transmission timed out: {} after {} attempts in {:?}", 
+                       interest.name, attempts, elapsed);
+                Err(anyhow::anyhow!("Interest transmission timed out after {:?}", elapsed))
+            }
+        }
+    }
+
+    /// Enhanced Interest transmission with retry logic and multiple destinations
+    pub async fn transmit_interest_with_retry(
+        &self, 
+        interest: &Interest, 
+        destinations: Vec<SocketAddr>,
+        config: &TransmissionConfig
+    ) -> Result<TransmissionResult> {
+        if destinations.is_empty() {
+            return Ok(TransmissionResult::Failed {
+                last_error: "No destinations provided".to_string(),
+                attempts: 0,
+                destinations_tried: vec![],
+            });
+        }
+
         let sequence = self.next_sequence().await;
         let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), sequence)?;
-        
-        // Add to pending Interest table
         let name = interest.name.to_string();
+        
+        // Create initial PIT entry
         let entry = PendingInterestEntry {
             name: name.clone(),
-            remote_addr,
+            remote_addr: destinations[0],
             sent_at: std::time::Instant::now(),
             lifetime: interest.interest_lifetime.unwrap_or_else(|| {
                 std::time::Duration::from_millis(self.config.max_interest_lifetime)
             }),
             retransmissions: 0,
             sequence,
+            last_retry: None,
+            retry_timeout: self.config.interest_timeout,
+            alternative_addrs: destinations.clone(),
+            current_addr_index: 0,
         };
-        
+
+        // Add to pending Interest table
         {
             let mut pit = self.pending_interests.write().await;
-            pit.add_interest(entry);
+            pit.add_interest(entry.clone());
         }
-        
-        // Send the frame
-        self.send_frame(&frame, remote_addr).await?;
-        
-        debug!("Sent Interest: {} to {}", name, remote_addr);
-        Ok(())
+
+        let transmission_start = std::time::Instant::now();
+        let mut last_error = String::new();
+        let mut destinations_tried = Vec::new();
+        let mut total_attempts = 0;
+
+        // Try each destination with retries
+        for (dest_index, &destination) in destinations.iter().enumerate() {
+            if dest_index >= config.max_destinations {
+                break;
+            }
+
+            destinations_tried.push(destination);
+            
+            // Attempt transmission to this destination with retries
+            let mut attempts = 0;
+            let mut current_timeout = self.config.interest_timeout;
+            
+            while attempts <= self.config.max_retransmissions {
+                total_attempts += 1;
+                attempts += 1;
+                
+                // Check if we've exceeded the Interest lifetime
+                if transmission_start.elapsed() > entry.lifetime {
+                    return Ok(TransmissionResult::Timeout {
+                        elapsed: transmission_start.elapsed(),
+                        attempts: total_attempts,
+                    });
+                }
+
+                // Send the frame
+                match self.send_frame(&frame, destination).await {
+                    Ok(()) => {
+                        // Update PIT entry
+                        {
+                            let mut pit = self.pending_interests.write().await;
+                            if let Some(pit_entry) = pit.entries.get_mut(&name) {
+                                pit_entry.retransmissions = attempts - 1;
+                                pit_entry.last_retry = Some(std::time::Instant::now());
+                                pit_entry.current_addr_index = dest_index;
+                                pit_entry.remote_addr = destination;
+                            }
+                        }
+
+                        debug!("Sent Interest: {} to {} (attempt {}/{})", 
+                               name, destination, attempts, self.config.max_retransmissions + 1);
+
+                        // For successful transmission, return success
+                        // In a real implementation, you'd wait for Data response here
+                        return Ok(TransmissionResult::Success {
+                            destination,
+                            sequence,
+                            rtt_estimate: None, // Would be calculated from response timing
+                        });
+                    }
+                    Err(e) => {
+                        last_error = e.to_string();
+                        error!("Failed to send Interest: {} to {} (attempt {}): {}", 
+                               name, destination, attempts, last_error);
+                        
+                        // Don't retry if this was the last attempt for this destination
+                        if attempts > self.config.max_retransmissions {
+                            break;
+                        }
+                        
+                        // Exponential backoff
+                        let delay = Duration::from_millis(
+                            (current_timeout.as_millis() as f64 * config.retry_delay_multiplier) as u64
+                        ).min(config.max_retry_delay);
+                        
+                        debug!("Retrying Interest: {} to {} in {:?}", name, destination, delay);
+                        sleep(delay).await;
+                        current_timeout = delay;
+                    }
+                }
+            }
+        }
+
+        // Clean up PIT entry on complete failure
+        {
+            let mut pit = self.pending_interests.write().await;
+            pit.remove_interest(&name);
+        }
+
+        Ok(TransmissionResult::Failed {
+            last_error,
+            attempts: total_attempts,
+            destinations_tried,
+        })
+    }
+
+    /// Send Interest with parallel transmission to multiple destinations
+    pub async fn send_interest_multicast(
+        &self, 
+        interest: &Interest, 
+        destinations: Vec<SocketAddr>,
+        config: &TransmissionConfig
+    ) -> Result<TransmissionResult> {
+        if !config.parallel_transmission {
+            return self.transmit_interest_with_retry(interest, destinations, config).await;
+        }
+
+        let sequence = self.next_sequence().await;
+        let frame = NdnFrame::from_packet(&Packet::Interest(interest.clone()), sequence)?;
+        let name = interest.name.to_string();
+
+        // Create PIT entry
+        let entry = PendingInterestEntry {
+            name: name.clone(),
+            remote_addr: destinations[0],
+            sent_at: std::time::Instant::now(),
+            lifetime: interest.interest_lifetime.unwrap_or_else(|| {
+                std::time::Duration::from_millis(self.config.max_interest_lifetime)
+            }),
+            retransmissions: 0,
+            sequence,
+            last_retry: None,
+            retry_timeout: self.config.interest_timeout,
+            alternative_addrs: destinations.clone(),
+            current_addr_index: 0,
+        };
+
+        {
+            let mut pit = self.pending_interests.write().await;
+            pit.add_interest(entry.clone());
+        }
+
+        // Send to all destinations in parallel
+        let tasks: Vec<_> = destinations.iter().take(config.max_destinations).map(|&dest| {
+            let frame = frame.clone();
+            let transport = self.clone();
+            
+            tokio::spawn(async move {
+                transport.send_frame(&frame, dest).await.map(|_| dest)
+            })
+        }).collect();
+
+        let _transmission_start = std::time::Instant::now();
+        let mut destinations_tried = Vec::new();
+        let mut last_error = String::new();
+
+        // Wait for first successful transmission
+        for task in tasks {
+            match task.await {
+                Ok(Ok(destination)) => {
+                    destinations_tried.push(destination);
+                    debug!("Multicast Interest: {} successfully sent to {}", name, destination);
+                    
+                    return Ok(TransmissionResult::Success {
+                        destination,
+                        sequence,
+                        rtt_estimate: None,
+                    });
+                }
+                Ok(Err(e)) => {
+                    last_error = e.to_string();
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                }
+            }
+        }
+
+        // Clean up PIT entry on complete failure
+        {
+            let mut pit = self.pending_interests.write().await;
+            pit.remove_interest(&name);
+        }
+
+        Ok(TransmissionResult::Failed {
+            last_error,
+            attempts: destinations_tried.len() as u32,
+            destinations_tried,
+        })
     }
     
     /// Send an NDN Data packet
@@ -544,6 +816,110 @@ impl NdnQuicTransport {
     /// Get the NDN configuration
     pub fn config(&self) -> &NdnQuicConfig {
         &self.config
+    }
+
+    /// Retry expired Interests with exponential backoff
+    pub async fn retry_expired_interests(&self) -> Result<usize> {
+        let mut retried_count = 0;
+        let expired_interests = {
+            let pit = self.pending_interests.read().await;
+            pit.get_expired_interests()
+        };
+
+        for interest_name in expired_interests {
+            // Get the PIT entry
+            let entry = {
+                let pit = self.pending_interests.read().await;
+                pit.get_interest(&interest_name).cloned()
+            };
+
+            if let Some(entry) = entry {
+                // Check if we can retry
+                if entry.retransmissions < self.config.max_retransmissions {
+                    // Calculate backoff delay
+                    let backoff_delay = Duration::from_millis(
+                        (entry.retry_timeout.as_millis() as f64 * self.config.backoff_multiplier) as u64
+                    ).min(self.config.max_backoff);
+
+                    // Check if enough time has passed since last retry
+                    if let Some(last_retry) = entry.last_retry {
+                        if last_retry.elapsed() < backoff_delay {
+                            continue; // Not ready to retry yet
+                        }
+                    }
+
+                    // Try next destination in the list
+                    let next_addr_index = (entry.current_addr_index + 1) % entry.alternative_addrs.len();
+                    let next_addr = entry.alternative_addrs[next_addr_index];
+
+                    // Create Interest packet for retry
+                    let name = udcn_core::packets::Name::from_str(&entry.name);
+                    let interest = Interest::new(name).with_lifetime(entry.lifetime);
+
+                    // Retry transmission
+                    match self.send_interest(&interest, next_addr).await {
+                        Ok(()) => {
+                            // Update PIT entry
+                            {
+                                let mut pit = self.pending_interests.write().await;
+                                if let Some(pit_entry) = pit.entries.get_mut(&interest_name) {
+                                    pit_entry.retransmissions += 1;
+                                    pit_entry.last_retry = Some(std::time::Instant::now());
+                                    pit_entry.retry_timeout = backoff_delay;
+                                    pit_entry.current_addr_index = next_addr_index;
+                                    pit_entry.remote_addr = next_addr;
+                                }
+                            }
+                            
+                            debug!("Retried Interest: {} to {} (attempt {})", 
+                                   interest_name, next_addr, entry.retransmissions + 1);
+                            retried_count += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to retry Interest: {} to {}: {}", 
+                                  interest_name, next_addr, e);
+                        }
+                    }
+                } else {
+                    // Remove from PIT if max retries exceeded
+                    {
+                        let mut pit = self.pending_interests.write().await;
+                        pit.remove_interest(&interest_name);
+                    }
+                    
+                    warn!("Interest exceeded max retries and was removed: {}", interest_name);
+                }
+            }
+        }
+
+        Ok(retried_count)
+    }
+
+    /// Get comprehensive Interest transmission statistics
+    pub async fn get_transmission_stats(&self) -> Result<HashMap<String, u64>> {
+        let pit = self.pending_interests.read().await;
+        let mut stats = HashMap::new();
+        
+        let mut total_retransmissions = 0;
+        let mut active_interests = 0;
+        let mut expired_interests = 0;
+        
+        for entry in pit.entries.values() {
+            active_interests += 1;
+            total_retransmissions += entry.retransmissions as u64;
+            
+            if std::time::Instant::now().duration_since(entry.sent_at) > entry.lifetime {
+                expired_interests += 1;
+            }
+        }
+        
+        stats.insert("active_interests".to_string(), active_interests);
+        stats.insert("total_retransmissions".to_string(), total_retransmissions);
+        stats.insert("expired_interests".to_string(), expired_interests);
+        stats.insert("avg_retransmissions".to_string(), 
+                     if active_interests > 0 { total_retransmissions / active_interests } else { 0 });
+        
+        Ok(stats)
     }
 }
 

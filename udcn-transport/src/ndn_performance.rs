@@ -602,6 +602,9 @@ impl NdnPerformanceConfig {
             compression: false, // Can be added based on workload
             interest_timeout: self.ndn_tuning.interest_timeout,
             max_retransmissions: self.ndn_tuning.max_retransmissions,
+            backoff_multiplier: 2.0,
+            max_backoff: std::time::Duration::from_secs(10),
+            adaptive_timeout: true,
         }
     }
     
