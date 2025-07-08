@@ -18,3 +18,6 @@ clap = { workspace = true }
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
 udcn-transport = { path = "../udcn-transport" }
+
+[dev-dependencies]
+tempfile = "3.0"
