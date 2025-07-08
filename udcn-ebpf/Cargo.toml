@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 udcn-common = { path = "../udcn-common" }
 
+# eBPF program dependencies
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
 
