@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -152,8 +152,146 @@ impl Daemon {
 
     pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Reloading configuration");
-        // TODO: Implement configuration reload
-        Ok(())
+        
+        // Create a configuration manager for policy enforcement
+        let config_manager = crate::config::ConfigManager::new();
+        
+        // Attempt to reload the configuration
+        match self.config.reload(&config_manager) {
+            Ok(()) => {
+                info!("Configuration reloaded successfully from: {}", self.config.runtime.config_path);
+                info!("Reload count: {}", self.config.runtime.reload_count);
+                
+                // Apply network configuration changes if services are running
+                if let Some(ref face_manager) = self.face_manager {
+                    // Network configuration might affect face management
+                    info!("Applying network configuration changes to Face Manager");
+                    // Face manager doesn't need restart for network config changes
+                }
+                
+                if let Some(ref routing_manager) = self.routing_manager {
+                    // Update routing manager with new network settings if needed
+                    let routing_config = crate::routing::RoutingConfig {
+                        ..Default::default()
+                    };
+                    
+                    if let Err(e) = routing_manager.update_config(routing_config).await {
+                        error!("Failed to update routing configuration: {}", e);
+                        return Err(e);
+                    }
+                    info!("Applied network configuration changes to Routing Manager");
+                }
+                
+                // Apply logging configuration changes
+                self.apply_logging_config();
+                
+                Ok(())
+            },
+            Err(e) => {
+                error!("Failed to reload configuration: {}", e);
+                
+                // Attempt rollback if enabled
+                if self.config.runtime.rollback_enabled {
+                    warn!("Attempting to rollback to previous configuration");
+                    if let Err(rollback_err) = self.config.rollback() {
+                        error!("Failed to rollback configuration: {}", rollback_err);
+                        return Err(format!("Config reload failed: {}. Rollback also failed: {}", e, rollback_err).into());
+                    }
+                    warn!("Successfully rolled back to previous configuration");
+                }
+                
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Apply logging configuration changes
+    fn apply_logging_config(&self) {
+        // Update log level based on new configuration
+        match self.config.logging.level.as_str() {
+            "trace" => log::set_max_level(log::LevelFilter::Trace),
+            "debug" => log::set_max_level(log::LevelFilter::Debug),
+            "info" => log::set_max_level(log::LevelFilter::Info),
+            "warn" => log::set_max_level(log::LevelFilter::Warn),
+            "error" => log::set_max_level(log::LevelFilter::Error),
+            _ => {
+                warn!("Invalid log level '{}', keeping current level", self.config.logging.level);
+            }
+        }
+        
+        info!("Applied logging configuration: level={}, file={:?}", 
+              self.config.logging.level, self.config.logging.file);
+    }
+
+    /// Get configuration admin interface
+    pub fn get_config_admin(&self) -> crate::config::ConfigAdmin {
+        use std::sync::{Arc, Mutex};
+        
+        let config = Arc::new(Mutex::new(self.config.clone()));
+        let manager = Arc::new(Mutex::new(crate::config::ConfigManager::new()));
+        
+        crate::config::ConfigAdmin::new(config, manager)
+    }
+
+    /// Update configuration section at runtime
+    pub async fn update_config_section(&mut self, section: crate::config::ConfigSection, toml_str: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let admin = self.get_config_admin();
+        
+        match admin.update_section(section.clone(), toml_str) {
+            Ok(restart_required) => {
+                // Update our local config copy
+                self.config = admin.config.lock().unwrap().clone();
+                
+                // Apply changes based on section
+                match section {
+                    crate::config::ConfigSection::Network => {
+                        // Apply network changes to running services
+                        if let Some(ref routing_manager) = self.routing_manager {
+                            let routing_config = crate::routing::RoutingConfig {
+                                ..Default::default()
+                            };
+                            routing_manager.update_config(routing_config).await?;
+                        }
+                    },
+                    crate::config::ConfigSection::Logging => {
+                        self.apply_logging_config();
+                    },
+                    crate::config::ConfigSection::Daemon => {
+                        // Daemon config changes typically require restart
+                        warn!("Daemon configuration changed - restart may be required");
+                    },
+                    crate::config::ConfigSection::All => {
+                        // Full config update
+                        self.apply_logging_config();
+                        if let Some(ref routing_manager) = self.routing_manager {
+                            let routing_config = crate::routing::RoutingConfig {
+                                ..Default::default()
+                            };
+                            routing_manager.update_config(routing_config).await?;
+                        }
+                    }
+                }
+                
+                info!("Configuration section {:?} updated successfully", section);
+                Ok(restart_required)
+            },
+            Err(e) => {
+                error!("Failed to update configuration section {:?}: {}", section, e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Get current configuration as TOML string
+    pub fn get_config_toml(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let admin = self.get_config_admin();
+        admin.get_config().map_err(|e| e.into())
+    }
+
+    /// Validate current configuration
+    pub fn validate_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let admin = self.get_config_admin();
+        admin.validate().map_err(|e| e.into())
     }
 
     /// Get packet statistics from the eBPF program
