@@ -13,14 +13,11 @@ use core::mem;
 /// XDP program entry point for UDCN packet processing
 #[xdp]
 pub fn udcn(ctx: XdpContext) -> u32 {
-    match try_udcn(ctx) {
-        Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
-    }
+    try_udcn(ctx)
 }
 
 /// Main packet processing logic
-fn try_udcn(ctx: XdpContext) -> Result<u32, u32> {
+fn try_udcn(ctx: XdpContext) -> u32 {
     let start_time = unsafe { bpf_ktime_get_ns() };
     
     // Get packet data bounds
@@ -32,7 +29,7 @@ fn try_udcn(ctx: XdpContext) -> Result<u32, u32> {
         info!(&ctx, "Invalid packet: data_start >= data_end");
         let processing_time = unsafe { bpf_ktime_get_ns() } - start_time;
         update_packet_stats(&ctx, false, false, 0, processing_time);
-        return Ok(xdp_action::XDP_DROP);
+        return xdp_action::XDP_DROP;
     }
     
     let packet_len = (data_end - data_start) as u64;
@@ -44,7 +41,7 @@ fn try_udcn(ctx: XdpContext) -> Result<u32, u32> {
             info!(&ctx, "Failed to parse Ethernet header");
             let processing_time = unsafe { bpf_ktime_get_ns() } - start_time;
             update_packet_stats(&ctx, false, false, packet_len, processing_time);
-            return Ok(xdp_action::XDP_DROP);
+            return xdp_action::XDP_DROP;
         }
     };
     
@@ -79,11 +76,11 @@ fn try_udcn(ctx: XdpContext) -> Result<u32, u32> {
         Ok(action) => {
             let allowed = action == xdp_action::XDP_PASS;
             update_packet_stats(&ctx, true, allowed, packet_len, processing_time);
-            Ok(action)
+            action
         }
-        Err(e) => {
+        Err(_) => {
             update_packet_stats(&ctx, false, false, packet_len, processing_time);
-            Err(e)
+            xdp_action::XDP_ABORTED
         }
     }
 }
@@ -394,13 +391,13 @@ fn process_data_packet(ctx: &XdpContext, data_start: usize) -> Result<u32, u32> 
     let data_end = ctx.data_end();
     
     // Parse TLV length for Data packet
-    let (data_length, tlv_header_size) = match parse_tlv_length(ctx, data_start + 1) {
-        Ok(result) => result,
-        Err(_) => {
-            info!(ctx, "Failed to parse Data TLV length");
-            return Ok(xdp_action::XDP_DROP);
-        }
-    };
+    let tlv_result = parse_tlv_length(ctx, data_start + 1);
+    if tlv_result == 0 {
+        info!(ctx, "Failed to parse Data TLV length");
+        return Ok(xdp_action::XDP_DROP);
+    }
+    let data_length = (tlv_result >> 16) as usize;
+    let tlv_header_size = (tlv_result & 0xFFFF) as usize;
     
     // Validate Data packet bounds
     if data_start + tlv_header_size + data_length > data_end {
@@ -412,7 +409,8 @@ fn process_data_packet(ctx: &XdpContext, data_start: usize) -> Result<u32, u32> 
     info!(ctx, "Data packet: length={}, content_start={}", data_length, data_content_start);
     
     // Extract name hash from Data packet (first element should be Name TLV)
-    if let Ok(name_hash) = extract_interest_name_hash(ctx, data_content_start) {
+    let name_hash = extract_interest_name_hash(ctx, data_content_start);
+    if name_hash != 0 {
         // Check if there's a corresponding PIT entry
         match pit_remove(ctx, name_hash) {
             Ok(pit_entry) => {
@@ -438,7 +436,7 @@ fn process_data_packet(ctx: &XdpContext, data_start: usize) -> Result<u32, u32> 
                 }
                 
                 // Forward to primary face
-                if let Ok(face_info) = face_get_forwarding_info(ctx, pit_entry.incoming_face) {
+                if face_get_forwarding_info(ctx, pit_entry.incoming_face) == 1 {
                     face_update_stats(ctx, pit_entry.incoming_face, 1, 0, data_length as u64, 0);
                     info!(ctx, "Forwarding Data to primary face: {}", pit_entry.incoming_face);
                 } else {
@@ -449,7 +447,7 @@ fn process_data_packet(ctx: &XdpContext, data_start: usize) -> Result<u32, u32> 
                 for i in 0..pit_entry.additional_faces_count {
                     let face_key = (name_hash << 8) | (i as u64);
                     if let Some(face_entry) = unsafe { PIT_ADDITIONAL_FACES.get(&face_key) } {
-                        if let Ok(_face_info) = face_get_forwarding_info(ctx, face_entry.face_id) {
+                        if face_get_forwarding_info(ctx, face_entry.face_id) == 1 {
                             face_update_stats(ctx, face_entry.face_id, 1, 0, data_length as u64, 0);
                             info!(ctx, "Forwarding Data to additional face: {}", face_entry.face_id);
                         } else {
@@ -491,14 +489,14 @@ fn process_interest_packet(ctx: &XdpContext, interest_start: usize) -> Result<u3
     let data_end = ctx.data_end();
     
     // Parse TLV length for Interest packet
-    let (interest_length, tlv_header_size) = match parse_tlv_length(ctx, interest_start + 1) {
-        Ok(result) => result,
-        Err(_) => {
-            info!(ctx, "Failed to parse Interest TLV length");
-            update_packet_stats(ctx, false, false, 0, 0);
-            return Ok(xdp_action::XDP_DROP);
-        }
-    };
+    let tlv_result = parse_tlv_length(ctx, interest_start + 1);
+    if tlv_result == 0 {
+        info!(ctx, "Failed to parse Interest TLV length");
+        update_packet_stats(ctx, false, false, 0, 0);
+        return Ok(xdp_action::XDP_DROP);
+    }
+    let interest_length = (tlv_result >> 16) as usize;
+    let tlv_header_size = (tlv_result & 0xFFFF) as usize;
     
     // Validate Interest packet bounds
     if interest_start + tlv_header_size + interest_length > data_end {
@@ -523,7 +521,8 @@ fn process_interest_packet(ctx: &XdpContext, interest_start: usize) -> Result<u3
     info!(ctx, "Interest name parsed: length={}, components={}", name_length, component_count);
     
     // Extract name hash for filtering, CS lookup, and PIT operations
-    if let Ok(name_hash) = extract_interest_name_hash(ctx, interest_content_start) {
+    let name_hash = extract_interest_name_hash(ctx, interest_content_start);
+    if name_hash != 0 {
         // Check Content Store first for cached data
         match cs_lookup(ctx, name_hash) {
             Ok(cs_entry) => {
@@ -606,29 +605,32 @@ fn process_interest_packet(ctx: &XdpContext, interest_start: usize) -> Result<u3
 }
 
 /// Extract Interest name hash for filtering
-fn extract_interest_name_hash(ctx: &XdpContext, name_start: usize) -> Result<u64, ()> {
+/// Returns hash value, or 0 on error
+fn extract_interest_name_hash(ctx: &XdpContext, name_start: usize) -> u64 {
     let data_end = ctx.data_end();
     
     // Check if we have enough data for Name TLV header
     if name_start + 2 > data_end {
-        return Err(());
+        return 0;
     }
     
     // Verify this is a Name TLV
     let name_type = unsafe { *(name_start as *const u8) };
     if name_type != NDN_TLV_NAME {
-        return Err(());
+        return 0;
     }
     
     // Parse name length
-    let (name_length, name_header_size) = match parse_tlv_length(ctx, name_start + 1) {
-        Ok(result) => result,
-        Err(_) => return Err(()),
-    };
+    let tlv_result = parse_tlv_length(ctx, name_start + 1);
+    if tlv_result == 0 {
+        return 0;
+    }
+    let name_length = (tlv_result >> 16) as usize;
+    let name_header_size = (tlv_result & 0xFFFF) as usize;
     
     // Validate name bounds
     if name_start + name_header_size + name_length > data_end {
-        return Err(());
+        return 0;
     }
     
     // Calculate simple hash of name content (limited to avoid stack issues)
@@ -644,7 +646,7 @@ fn extract_interest_name_hash(ctx: &XdpContext, name_start: usize) -> Result<u64
         hash = ((hash << 5).wrapping_add(hash)).wrapping_add(byte as u64);
     }
     
-    Ok(hash)
+    hash
 }
 
 /// Apply filtering rules to Interest packet
@@ -822,18 +824,21 @@ fn update_packet_stats(ctx: &XdpContext, valid_packet: bool, allowed: bool, byte
 }
 
 /// Parse TLV length field according to NDN TLV specification
-fn parse_tlv_length(ctx: &XdpContext, length_start: usize) -> Result<(usize, usize), ()> {
+/// Returns combined value: (length << 16) | header_size, or 0 on error
+fn parse_tlv_length(ctx: &XdpContext, length_start: usize) -> u64 {
     let data_end = ctx.data_end();
     
     if length_start >= data_end {
-        return Err(());
+        return 0;
     }
     
     let first_byte = unsafe { *(length_start as *const u8) };
     
     // Single byte length (0-252)
     if first_byte <= 252 {
-        return Ok((first_byte as usize, 2)); // 1 byte type + 1 byte length
+        let length = first_byte as usize;
+        let header_size = 2usize; // 1 byte type + 1 byte length
+        return ((length as u64) << 16) | (header_size as u64);
     }
     
     // Multi-byte length encoding
@@ -841,37 +846,40 @@ fn parse_tlv_length(ctx: &XdpContext, length_start: usize) -> Result<(usize, usi
         253 => {
             // 2-byte length
             if length_start + 2 >= data_end {
-                return Err(());
+                return 0;
             }
             let length = unsafe {
                 let ptr = (length_start + 1) as *const u16;
                 u16::from_be(*ptr) as usize
             };
-            Ok((length, 4)) // 1 byte type + 1 byte prefix + 2 byte length
+            let header_size = 4usize; // 1 byte type + 1 byte prefix + 2 byte length
+            ((length as u64) << 16) | (header_size as u64)
         }
         254 => {
             // 4-byte length
             if length_start + 4 >= data_end {
-                return Err(());
+                return 0;
             }
             let length = unsafe {
                 let ptr = (length_start + 1) as *const u32;
                 u32::from_be(*ptr) as usize
             };
-            Ok((length, 6)) // 1 byte type + 1 byte prefix + 4 byte length
+            let header_size = 6usize; // 1 byte type + 1 byte prefix + 4 byte length
+            ((length as u64) << 16) | (header_size as u64)
         }
         255 => {
             // 8-byte length (not commonly used in practice)
             if length_start + 8 >= data_end {
-                return Err(());
+                return 0;
             }
             let length = unsafe {
                 let ptr = (length_start + 1) as *const u64;
                 u64::from_be(*ptr) as usize
             };
-            Ok((length, 10)) // 1 byte type + 1 byte prefix + 8 byte length
+            let header_size = 10usize; // 1 byte type + 1 byte prefix + 8 byte length
+            ((length as u64) << 16) | (header_size as u64)
         }
-        _ => Err(()),
+        _ => 0,
     }
 }
 
@@ -892,13 +900,13 @@ fn parse_interest_name(ctx: &XdpContext, name_start: usize) -> Result<(usize, u3
     }
     
     // Parse name length
-    let (name_length, name_header_size) = match parse_tlv_length(ctx, name_start + 1) {
-        Ok(result) => result,
-        Err(_) => {
-            info!(ctx, "Failed to parse Name TLV length");
-            return Err(());
-        }
-    };
+    let tlv_result = parse_tlv_length(ctx, name_start + 1);
+    if tlv_result == 0 {
+        info!(ctx, "Failed to parse Name TLV length");
+        return Err(());
+    }
+    let name_length = (tlv_result >> 16) as usize;
+    let name_header_size = (tlv_result & 0xFFFF) as usize;
     
     // Validate name bounds
     if name_start + name_header_size + name_length > data_end {
@@ -939,10 +947,12 @@ fn count_name_components(ctx: &XdpContext, name_content_start: usize, name_lengt
         }
         
         // Parse component length
-        let (component_length, component_header_size) = match parse_tlv_length(ctx, current_pos + 1) {
-            Ok(result) => result,
-            Err(_) => break,
-        };
+        let tlv_result = parse_tlv_length(ctx, current_pos + 1);
+        if tlv_result == 0 {
+            break;
+        }
+        let component_length = (tlv_result >> 16) as usize;
+        let component_header_size = (tlv_result & 0xFFFF) as usize;
         
         // Validate component bounds
         if current_pos + component_header_size + component_length > name_end {
@@ -1458,10 +1468,12 @@ fn extract_nonce_from_interest(ctx: &XdpContext, interest_content_start: usize) 
     }
     
     // Parse name length and skip the name
-    let (name_length, name_header_size) = match parse_tlv_length(ctx, current_pos + 1) {
-        Ok(result) => result,
-        Err(_) => return Err(()),
-    };
+    let tlv_result = parse_tlv_length(ctx, current_pos + 1);
+    if tlv_result == 0 {
+        return Err(());
+    }
+    let name_length = (tlv_result >> 16) as usize;
+    let name_header_size = (tlv_result & 0xFFFF) as usize;
     
     current_pos += name_header_size + name_length;
     
@@ -1471,10 +1483,12 @@ fn extract_nonce_from_interest(ctx: &XdpContext, interest_content_start: usize) 
         
         if tlv_type == 0x0A { // NDN_TLV_NONCE
             // Parse nonce length
-            let (nonce_length, nonce_header_size) = match parse_tlv_length(ctx, current_pos + 1) {
-                Ok(result) => result,
-                Err(_) => return Err(()),
-            };
+            let tlv_result = parse_tlv_length(ctx, current_pos + 1);
+            if tlv_result == 0 {
+                return Err(());
+            }
+            let nonce_length = (tlv_result >> 16) as usize;
+            let nonce_header_size = (tlv_result & 0xFFFF) as usize;
             
             if nonce_length == 4 && current_pos + nonce_header_size + 4 <= data_end {
                 // Extract 4-byte nonce
@@ -1487,16 +1501,18 @@ fn extract_nonce_from_interest(ctx: &XdpContext, interest_content_start: usize) 
         }
         
         // Skip this TLV
-        let (tlv_length, tlv_header_size) = match parse_tlv_length(ctx, current_pos + 1) {
-            Ok(result) => result,
-            Err(_) => break,
-        };
+        let tlv_result = parse_tlv_length(ctx, current_pos + 1);
+        if tlv_result == 0 {
+            break;
+        }
+        let tlv_length = (tlv_result >> 16) as usize;
+        let tlv_header_size = (tlv_result & 0xFFFF) as usize;
         
         current_pos += tlv_header_size + tlv_length;
     }
     
     // No nonce found, generate a simple one based on name hash
-    let name_hash = extract_interest_name_hash(ctx, interest_content_start).unwrap_or(0);
+    let name_hash = extract_interest_name_hash(ctx, interest_content_start);
     Ok((name_hash & 0xFFFFFFFF) as u32)
 }
 
@@ -1547,20 +1563,21 @@ fn face_update_with_packet_info(ctx: &XdpContext, face_id: u32, is_incoming: boo
 }
 
 /// Get face information for PIT entry forwarding
-fn face_get_forwarding_info(ctx: &XdpContext, face_id: u32) -> Result<FaceInfo, ()> {
+/// Returns 1 if face is active, 0 if face is down or not found
+fn face_get_forwarding_info(ctx: &XdpContext, face_id: u32) -> u32 {
     match unsafe { FACE_TABLE.get(&face_id) } {
         Some(face_info) => {
             // Check if face is still active
             if face_info.state & 0x01 != 0 { // FACE_STATE_UP
-                Ok(*face_info)
+                1
             } else {
                 info!(ctx, "Face {} is down", face_id);
-                Err(())
+                0
             }
         }
         None => {
             info!(ctx, "Face {} not found", face_id);
-            Err(())
+            0
         }
     }
 }
@@ -1711,14 +1728,12 @@ fn cs_insert(ctx: &XdpContext, name_hash: u64, data_size: u32, freshness_period_
     
     if entries_to_evict > 0 {
         // Perform efficient LRU eviction
-        match cs_evict_multiple_lru_entries(ctx, entries_to_evict) {
-            Ok(evicted) => {
-                info!(ctx, "CS evicted {} entries (requested: {})", evicted, entries_to_evict);
-            }
-            Err(_) => {
-                info!(ctx, "CS eviction failed, attempting insertion anyway");
-                // Continue with insertion even if eviction failed partially
-            }
+        let evicted = cs_evict_multiple_lru_entries(ctx, entries_to_evict);
+        if evicted > 0 {
+            info!(ctx, "CS evicted {} entries (requested: {})", evicted, entries_to_evict);
+        } else {
+            info!(ctx, "CS eviction failed, attempting insertion anyway");
+            // Continue with insertion even if eviction failed partially
         }
     }
     
@@ -2177,8 +2192,12 @@ fn cs_performance_monitor(ctx: &XdpContext) -> Result<(), ()> {
 }
 
 /// Evict multiple LRU entries to make room for new insertions - uses optimized batch eviction
-fn cs_evict_multiple_lru_entries(ctx: &XdpContext, entries_needed: u32) -> Result<u32, ()> {
-    cs_evict_multiple_lru_entries_optimized(ctx, entries_needed)
+/// Returns number of entries evicted, or 0 on failure
+fn cs_evict_multiple_lru_entries(ctx: &XdpContext, entries_needed: u32) -> u32 {
+    match cs_evict_multiple_lru_entries_optimized(ctx, entries_needed) {
+        Ok(count) => count,
+        Err(_) => 0,
+    }
 }
 
 /// Update LRU state minimum sequence tracking based on evictions
@@ -2363,7 +2382,8 @@ fn cs_periodic_cleanup(ctx: &XdpContext) {
         // Cache is over 80% full, perform aggressive LRU eviction
         let entries_to_evict = (MAX_CS_ENTRIES as u32 / 8).max(1); // Evict at least 12.5% of cache
         
-        if let Ok(evicted) = cs_evict_multiple_lru_entries(ctx, entries_to_evict) {
+        let evicted = cs_evict_multiple_lru_entries(ctx, entries_to_evict);
+        if evicted > 0 {
             info!(ctx, "Aggressive CS cleanup evicted {} entries, utilization was {}%", 
                   evicted, cache_utilization_percent);
         }
