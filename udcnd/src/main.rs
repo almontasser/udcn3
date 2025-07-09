@@ -8,6 +8,7 @@ mod config;
 mod daemon;
 mod ebpf;
 mod service;
+mod routing;
 
 use config::Config;
 use daemon::Daemon;

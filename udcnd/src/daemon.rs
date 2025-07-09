@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::{error, info};
@@ -6,12 +7,14 @@ use tokio::sync::RwLock;
 use crate::config::Config;
 use crate::ebpf::EbpfManager;
 use crate::face_manager::{FaceManager, FaceConfig};
+use crate::routing::{RoutingManager, RoutingConfig, RoutingStrategy};
 use crate::service::Service;
 
 pub struct Daemon {
     config: Config,
     ebpf_manager: Option<EbpfManager>,
     face_manager: Option<FaceManager>,
+    routing_manager: Option<Arc<RoutingManager>>,
     // For now, we'll manage services differently until we need them
     _services: Arc<RwLock<Vec<String>>>,
 }
@@ -22,6 +25,7 @@ impl Daemon {
             config,
             ebpf_manager: None,
             face_manager: None,
+            routing_manager: None,
             _services: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -57,6 +61,18 @@ impl Daemon {
         
         self.face_manager = Some(face_manager);
 
+        // Initialize Routing Manager
+        let local_address = SocketAddr::from(([127, 0, 0, 1], 6363)); // Default NDN port
+        let routing_manager = Arc::new(RoutingManager::new(local_address));
+        
+        // Start the routing manager service
+        if let Err(e) = routing_manager.start().await {
+            error!("Failed to start Routing Manager: {}", e);
+            return Err(e);
+        }
+        
+        self.routing_manager = Some(routing_manager);
+
         info!("All services started successfully");
 
         Ok(())
@@ -65,7 +81,15 @@ impl Daemon {
     pub async fn stop(&mut self) {
         info!("Stopping UDCN Daemon services");
 
-        // Stop Face Manager first
+        // Stop Routing Manager first
+        if let Some(ref routing_manager) = self.routing_manager {
+            if let Err(e) = routing_manager.stop().await {
+                error!("Failed to stop Routing Manager: {}", e);
+            }
+        }
+        self.routing_manager = None;
+
+        // Stop Face Manager
         if let Some(ref face_manager) = self.face_manager {
             if let Err(e) = face_manager.stop().await {
                 error!("Failed to stop Face Manager: {}", e);
@@ -255,5 +279,95 @@ impl Daemon {
     /// Check if the eBPF program is loaded
     pub fn is_ebpf_loaded(&self) -> bool {
         self.ebpf_manager.as_ref().map(|m| m.is_loaded()).unwrap_or(false)
+    }
+
+    // === ROUTING OPERATIONS API ===
+
+    /// Process incoming Interest packet
+    pub async fn process_interest(&self, interest: udcn_core::packets::Interest, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.process_interest(interest, incoming_face).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Process incoming Data packet
+    pub async fn process_data(&self, data: udcn_core::packets::Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.process_data(data, incoming_face).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Add a FIB entry
+    pub async fn add_fib_entry(&self, prefix: &str, next_hop: std::net::SocketAddr, cost: u32) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.add_fib_entry(prefix, next_hop, cost).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Remove a FIB entry
+    pub async fn remove_fib_entry(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.remove_fib_entry(prefix).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Set routing strategy for a name prefix
+    pub async fn set_routing_strategy(&self, prefix: String, strategy: RoutingStrategy) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.set_strategy(prefix, strategy).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Get routing strategy for a name prefix
+    pub async fn get_routing_strategy(&self, prefix: &str) -> Result<RoutingStrategy, Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => Ok(manager.get_strategy(prefix).await),
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Get routing statistics
+    pub async fn get_routing_stats(&self) -> Result<crate::routing::RoutingStats, Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => Ok(manager.get_stats().await),
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Reset routing statistics
+    pub async fn reset_routing_stats(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => { manager.reset_stats().await; Ok(()) },
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Update routing configuration
+    pub async fn update_routing_config(&self, config: RoutingConfig) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => manager.update_config(config).await,
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Get current routing configuration
+    pub async fn get_routing_config(&self) -> Result<RoutingConfig, Box<dyn std::error::Error>> {
+        match &self.routing_manager {
+            Some(manager) => Ok(manager.get_config().await),
+            None => Err("Routing manager not initialized".into()),
+        }
+    }
+
+    /// Check if routing manager is running
+    pub async fn is_routing_active(&self) -> bool {
+        match &self.routing_manager {
+            Some(manager) => manager.is_running().await,
+            None => false,
+        }
     }
 }

@@ -21,6 +21,7 @@ async-trait = "0.1"
 toml = "0.8"
 tracing = "0.1"
 thiserror = "1.0"
+futures = "0.3"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
