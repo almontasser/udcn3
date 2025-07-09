@@ -284,6 +284,8 @@ pub enum ChunkingError {
     InvalidConfiguration { message: String },
     #[error("Memory limit exceeded: {used} bytes (max: {limit})")]
     MemoryLimitExceeded { used: usize, limit: usize },
+    #[error("Invalid chunk offset: {offset} (total chunks: {total_chunks})")]
+    InvalidChunkOffset { offset: u32, total_chunks: u32 },
 }
 
 /// Streaming file reader for large files with memory management
@@ -745,6 +747,94 @@ impl FileChunker {
         }
     }
 
+    /// Create chunks for a file starting from a specific chunk offset (for resume)
+    pub fn chunk_file_resume<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        base_name: &Name,
+        start_chunk_offset: u32,
+        chunk_bitmap: Option<&[u8]>,
+    ) -> Result<FileChunkIterator, ChunkingError> {
+        self.validate_config()?;
+        let metadata = self.prepare_file(path.as_ref())?.clone();
+        
+        // Validate start_chunk_offset
+        if start_chunk_offset as usize > metadata.total_chunks {
+            return Err(ChunkingError::InvalidChunkOffset { 
+                offset: start_chunk_offset, 
+                total_chunks: metadata.total_chunks as u32
+            });
+        }
+        
+        // Use large file reader if available, otherwise regular file
+        if let Some(reader) = self.large_file_reader.take() {
+            Ok(FileChunkIterator::new_with_large_file_reader_resume(
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                reader,
+                start_chunk_offset,
+                chunk_bitmap,
+            ))
+        } else {
+            let file = File::open(path.as_ref())?;
+            Ok(FileChunkIterator::new_resume(
+                file,
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                start_chunk_offset,
+                chunk_bitmap,
+            ))
+        }
+    }
+    
+    /// Create chunks for a file with resume capability and progress callback
+    pub fn chunk_file_resume_with_progress<P: AsRef<Path>, F>(
+        &mut self,
+        path: P,
+        base_name: &Name,
+        start_chunk_offset: u32,
+        chunk_bitmap: Option<&[u8]>,
+        progress_callback: F,
+    ) -> Result<FileChunkIterator, ChunkingError>
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
+        self.validate_config()?;
+        let metadata = self.prepare_file(path.as_ref())?.clone();
+        
+        // Validate start_chunk_offset
+        if start_chunk_offset as usize > metadata.total_chunks {
+            return Err(ChunkingError::InvalidChunkOffset { 
+                offset: start_chunk_offset, 
+                total_chunks: metadata.total_chunks as u32
+            });
+        }
+        
+        // Use large file reader if available, otherwise regular file
+        if let Some(reader) = self.large_file_reader.take() {
+            Ok(FileChunkIterator::new_with_large_file_reader_resume(
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                reader,
+                start_chunk_offset,
+                chunk_bitmap,
+            ).with_progress_callback(progress_callback))
+        } else {
+            let file = File::open(path.as_ref())?;
+            Ok(FileChunkIterator::new_resume(
+                file,
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                start_chunk_offset,
+                chunk_bitmap,
+            ).with_progress_callback(progress_callback))
+        }
+    }
+
     /// Estimate optimal chunk size based on file size and transport
     pub fn estimate_optimal_chunk_size(file_size: u64, transport_mtu: usize) -> usize {
         const MIN_CHUNK_SIZE: usize = 1024;    // 1KB minimum
@@ -775,6 +865,7 @@ pub struct FileChunkIterator {
     current_offset: u64,
     progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
     large_file_reader: Option<LargeFileReader>,
+    chunk_bitmap: Option<Vec<u8>>,
 }
 
 impl FileChunkIterator {
@@ -796,6 +887,32 @@ impl FileChunkIterator {
             current_offset: 0,
             progress_callback: None,
             large_file_reader: None,
+            chunk_bitmap: None,
+        }
+    }
+
+    fn new_resume(
+        mut file: File,
+        base_name: Name,
+        metadata: FileMetadata,
+        config: ChunkingConfig,
+        start_chunk_offset: u32,
+        chunk_bitmap: Option<&[u8]>,
+    ) -> Self {
+        // Seek to the starting chunk position
+        let start_offset = (start_chunk_offset as usize * config.chunk_size) as u64;
+        let _ = file.seek(SeekFrom::Start(start_offset));
+        
+        Self {
+            file: Some(file),
+            base_name,
+            metadata,
+            config,
+            current_sequence: start_chunk_offset as usize,
+            current_offset: start_offset,
+            progress_callback: None,
+            large_file_reader: None,
+            chunk_bitmap: chunk_bitmap.map(|b| b.to_vec()),
         }
     }
 
@@ -814,6 +931,30 @@ impl FileChunkIterator {
             current_offset: 0,
             progress_callback: None,
             large_file_reader: Some(large_file_reader),
+            chunk_bitmap: None,
+        }
+    }
+
+    fn new_with_large_file_reader_resume(
+        base_name: Name,
+        metadata: FileMetadata,
+        config: ChunkingConfig,
+        large_file_reader: LargeFileReader,
+        start_chunk_offset: u32,
+        chunk_bitmap: Option<&[u8]>,
+    ) -> Self {
+        let current_offset = (start_chunk_offset as usize * config.chunk_size) as u64;
+        
+        Self {
+            file: None,
+            base_name,
+            metadata,
+            config,
+            current_sequence: start_chunk_offset as usize,
+            current_offset,
+            progress_callback: None,
+            large_file_reader: Some(large_file_reader),
+            chunk_bitmap: chunk_bitmap.map(|b| b.to_vec()),
         }
     }
 
@@ -861,75 +1002,96 @@ impl Iterator for FileChunkIterator {
     type Item = Result<FileChunk, ChunkingError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_sequence >= self.metadata.total_chunks {
-            return None;
-        }
-
-        let sequence = self.current_sequence;
-        let is_final = sequence == self.metadata.total_chunks - 1;
-        
-        // Calculate chunk size
-        let remaining_bytes = self.metadata.file_size - self.current_offset;
-        let chunk_size = if is_final {
-            remaining_bytes as usize
-        } else {
-            self.config.chunk_size
-        };
-
-        // Read chunk data using appropriate method
-        let chunk_data = if let Some(ref mut reader) = self.large_file_reader {
-            match reader.read_chunk(sequence, chunk_size) {
-                Ok(data) => data,
-                Err(e) => return Some(Err(e)),
+        // Find next chunk that needs to be sent
+        loop {
+            if self.current_sequence >= self.metadata.total_chunks {
+                return None;
             }
-        } else if let Some(ref mut file) = self.file {
-            let mut data = vec![0u8; chunk_size];
-            match file.read_exact(&mut data) {
-                Ok(()) => data,
-                Err(e) => return Some(Err(ChunkingError::Io(e))),
-            }
-        } else {
-            return Some(Err(ChunkingError::MetadataError("No file or reader available".to_string())));
-        };
 
-        let chunk_info = ChunkInfo {
-            sequence,
-            size: chunk_data.len(),
-            offset: self.current_offset,
-            is_final,
-            file_metadata: if sequence == 0 && self.config.include_metadata {
-                Some(self.metadata.clone())
+            let sequence = self.current_sequence;
+            
+            // Check if this chunk is already completed according to the bitmap
+            if let Some(ref bitmap) = self.chunk_bitmap {
+                let byte_idx = (sequence / 8) as usize;
+                let bit_idx = sequence % 8;
+                
+                if byte_idx < bitmap.len() {
+                    let is_completed = (bitmap[byte_idx] & (1 << bit_idx)) != 0;
+                    if is_completed {
+                        // Skip this chunk and move to next
+                        self.current_sequence += 1;
+                        self.current_offset = (self.current_sequence * self.config.chunk_size) as u64;
+                        continue;
+                    }
+                }
+            }
+
+            let is_final = sequence == self.metadata.total_chunks - 1;
+            
+            // Calculate chunk size
+            let remaining_bytes = self.metadata.file_size - self.current_offset;
+            let chunk_size = if is_final {
+                remaining_bytes as usize
             } else {
-                None
-            },
-        };
+                self.config.chunk_size
+            };
 
-        let chunk_data_len = chunk_data.len();
-        let chunk = FileChunk::new(
-            &self.base_name,
-            sequence,
-            chunk_data,
-            chunk_info,
-        );
+            // Read chunk data using appropriate method
+            let chunk_data = if let Some(ref mut reader) = self.large_file_reader {
+                match reader.read_chunk(sequence, chunk_size) {
+                    Ok(data) => data,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else if let Some(ref mut file) = self.file {
+                let mut data = vec![0u8; chunk_size];
+                match file.read_exact(&mut data) {
+                    Ok(()) => data,
+                    Err(e) => return Some(Err(ChunkingError::Io(e))),
+                }
+            } else {
+                return Some(Err(ChunkingError::MetadataError("No file or reader available".to_string())));
+            };
 
-        // Update state for next iteration
-        self.current_sequence += 1;
-        self.current_offset += chunk_data_len as u64;
+            let chunk_info = ChunkInfo {
+                sequence,
+                size: chunk_data.len(),
+                offset: self.current_offset,
+                is_final,
+                file_metadata: if sequence == 0 && self.config.include_metadata {
+                    Some(self.metadata.clone())
+                } else {
+                    None
+                },
+            };
 
-        debug!(
-            "Generated chunk {}/{}: {} bytes{}",
-            sequence + 1, 
-            self.metadata.total_chunks, 
-            chunk_data_len,
-            if self.large_file_reader.is_some() { " (streaming)" } else { "" }
-        );
+            let chunk_data_len = chunk_data.len();
+            let chunk = FileChunk::new(
+                &self.base_name,
+                sequence,
+                chunk_data,
+                chunk_info,
+            );
 
-        // Report progress if callback is set
-        if let Some(callback) = &self.progress_callback {
-            callback(sequence + 1, self.metadata.total_chunks);
+            // Update state for next iteration
+            self.current_sequence += 1;
+            self.current_offset += chunk_data_len as u64;
+
+            debug!(
+                "Generated chunk {}/{}: {} bytes{} (resume mode: {})",
+                sequence + 1, 
+                self.metadata.total_chunks, 
+                chunk_data_len,
+                if self.large_file_reader.is_some() { " (streaming)" } else { "" },
+                self.chunk_bitmap.is_some()
+            );
+
+            // Report progress if callback is set
+            if let Some(callback) = &self.progress_callback {
+                callback(sequence + 1, self.metadata.total_chunks);
+            }
+
+            return Some(Ok(chunk));
         }
-
-        Some(Ok(chunk))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

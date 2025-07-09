@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::fs;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use log::{debug, info, warn, error};
@@ -48,6 +50,8 @@ pub enum TransferState {
     Active,
     /// Transfer is paused
     Paused,
+    /// Transfer was interrupted (network/system failure)
+    Interrupted,
     /// Transfer completed successfully
     Completed,
     /// Transfer failed with error
@@ -216,6 +220,131 @@ pub struct FileTransferProgress {
     pub retried_chunks: u32,
     /// Client identifier
     pub client_id: Option<String>,
+    /// Path to checkpoint file for resume capability
+    pub checkpoint_path: Option<String>,
+    /// Last checkpoint save time
+    #[serde(skip, default = "Instant::now")]
+    pub last_checkpoint_time: Instant,
+    /// Checkpoint save interval in seconds
+    pub checkpoint_interval: u64,
+}
+
+/// Checkpoint data for resuming interrupted transfers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferCheckpoint {
+    /// Session identifier
+    pub session_id: TransferSessionId,
+    /// File name
+    pub file_name: String,
+    /// File size
+    pub file_size: u64,
+    /// Total chunks
+    pub total_chunks: u32,
+    /// Chunks successfully sent
+    pub chunks_sent: u32,
+    /// Bytes successfully sent
+    pub bytes_sent: u64,
+    /// Failed chunks to retry
+    pub failed_chunks: u32,
+    /// Retried chunks count
+    pub retried_chunks: u32,
+    /// Client identifier
+    pub client_id: Option<String>,
+    /// Checkpoint creation timestamp
+    pub checkpoint_time: std::time::SystemTime,
+    /// File hash for integrity verification
+    pub file_hash: Option<String>,
+    /// Chunk completion bitmap (bit per chunk)
+    pub chunk_bitmap: Vec<u8>,
+}
+
+impl TransferCheckpoint {
+    /// Create a new checkpoint from current progress
+    pub fn from_progress(progress: &FileTransferProgress) -> Self {
+        let chunk_bitmap = Self::create_chunk_bitmap(progress.total_chunks, progress.chunks_sent);
+        
+        Self {
+            session_id: progress.session_id.clone(),
+            file_name: progress.file_name.clone(),
+            file_size: progress.file_size,
+            total_chunks: progress.total_chunks,
+            chunks_sent: progress.chunks_sent,
+            bytes_sent: progress.bytes_sent,
+            failed_chunks: progress.failed_chunks,
+            retried_chunks: progress.retried_chunks,
+            client_id: progress.client_id.clone(),
+            checkpoint_time: std::time::SystemTime::now(),
+            file_hash: None, // Will be set separately
+            chunk_bitmap,
+        }
+    }
+    
+    /// Create a bitmap representing completed chunks
+    fn create_chunk_bitmap(total_chunks: u32, chunks_sent: u32) -> Vec<u8> {
+        let bitmap_size = ((total_chunks + 7) / 8) as usize;
+        let mut bitmap = vec![0u8; bitmap_size];
+        
+        // Set bits for completed chunks (simplified - assumes sequential completion)
+        for chunk_idx in 0..chunks_sent {
+            let byte_idx = (chunk_idx / 8) as usize;
+            let bit_idx = chunk_idx % 8;
+            if byte_idx < bitmap.len() {
+                bitmap[byte_idx] |= 1 << bit_idx;
+            }
+        }
+        
+        bitmap
+    }
+    
+    /// Check if a specific chunk is marked as completed
+    pub fn is_chunk_completed(&self, chunk_idx: u32) -> bool {
+        let byte_idx = (chunk_idx / 8) as usize;
+        let bit_idx = chunk_idx % 8;
+        
+        if byte_idx >= self.chunk_bitmap.len() {
+            return false;
+        }
+        
+        (self.chunk_bitmap[byte_idx] & (1 << bit_idx)) != 0
+    }
+    
+    /// Mark a chunk as completed in the bitmap
+    pub fn mark_chunk_completed(&mut self, chunk_idx: u32) {
+        let byte_idx = (chunk_idx / 8) as usize;
+        let bit_idx = chunk_idx % 8;
+        
+        if byte_idx < self.chunk_bitmap.len() {
+            self.chunk_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+    }
+    
+    /// Get the next chunk that needs to be sent
+    pub fn get_next_chunk_to_send(&self) -> Option<u32> {
+        for chunk_idx in 0..self.total_chunks {
+            if !self.is_chunk_completed(chunk_idx) {
+                return Some(chunk_idx);
+            }
+        }
+        None
+    }
+    
+    /// Validate checkpoint integrity
+    pub fn validate(&self) -> Result<(), String> {
+        if self.chunks_sent > self.total_chunks {
+            return Err("Chunks sent exceeds total chunks".to_string());
+        }
+        
+        if self.bytes_sent > self.file_size {
+            return Err("Bytes sent exceeds file size".to_string());
+        }
+        
+        let expected_bitmap_size = ((self.total_chunks + 7) / 8) as usize;
+        if self.chunk_bitmap.len() != expected_bitmap_size {
+            return Err("Chunk bitmap size mismatch".to_string());
+        }
+        
+        Ok(())
+    }
 }
 
 impl FileTransferProgress {
@@ -242,6 +371,9 @@ impl FileTransferProgress {
             failed_chunks: 0,
             retried_chunks: 0,
             client_id: None,
+            checkpoint_path: None,
+            last_checkpoint_time: now,
+            checkpoint_interval: 30, // Default 30 seconds
         }
     }
 
@@ -398,6 +530,244 @@ impl ProgressTracker {
             event_sender,
             _event_receiver: event_receiver,
         }
+    }
+
+    /// Save a checkpoint for a transfer session
+    pub fn save_checkpoint(&self, session_id: &TransferSessionId, checkpoint_dir: &str) -> Result<String, String> {
+        let transfers = self.transfers.read().map_err(|e| e.to_string())?;
+        
+        if let Some(progress) = transfers.get(session_id) {
+            let checkpoint = TransferCheckpoint::from_progress(progress);
+            let checkpoint_path = format!("{}/checkpoint_{}.json", checkpoint_dir, session_id.0);
+            
+            // Create directory if it doesn't exist
+            if let Some(parent) = PathBuf::from(&checkpoint_path).parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    error!("Failed to create checkpoint directory: {}", e);
+                    format!("Failed to create checkpoint directory: {}", e)
+                })?;
+            }
+            
+            // Serialize and save checkpoint
+            let checkpoint_json = serde_json::to_string_pretty(&checkpoint).map_err(|e| {
+                error!("Failed to serialize checkpoint: {}", e);
+                format!("Failed to serialize checkpoint: {}", e)
+            })?;
+            
+            fs::write(&checkpoint_path, checkpoint_json).map_err(|e| {
+                error!("Failed to write checkpoint file: {}", e);
+                format!("Failed to write checkpoint file: {}", e)
+            })?;
+            
+            // Update progress with checkpoint path
+            drop(transfers);
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+            if let Some(progress) = transfers.get_mut(session_id) {
+                progress.checkpoint_path = Some(checkpoint_path.clone());
+                progress.last_checkpoint_time = Instant::now();
+            }
+            
+            info!("Checkpoint saved for session {} at: {}", session_id.0, checkpoint_path);
+            Ok(checkpoint_path)
+        } else {
+            error!("Cannot save checkpoint for unknown session: {}", session_id.0);
+            Err("Transfer session not found".to_string())
+        }
+    }
+    
+    /// Load a checkpoint and restore transfer progress
+    pub fn load_checkpoint(&self, checkpoint_path: &str) -> Result<TransferSessionId, String> {
+        // Read checkpoint file
+        let checkpoint_data = fs::read_to_string(checkpoint_path).map_err(|e| {
+            error!("Failed to read checkpoint file: {}", e);
+            format!("Failed to read checkpoint file: {}", e)
+        })?;
+        
+        // Deserialize checkpoint
+        let checkpoint: TransferCheckpoint = serde_json::from_str(&checkpoint_data).map_err(|e| {
+            error!("Failed to deserialize checkpoint: {}", e);
+            format!("Failed to deserialize checkpoint: {}", e)
+        })?;
+        
+        // Validate checkpoint
+        checkpoint.validate().map_err(|e| {
+            error!("Invalid checkpoint: {}", e);
+            format!("Invalid checkpoint: {}", e)
+        })?;
+        
+        // Create progress from checkpoint
+        let mut progress = FileTransferProgress::new(
+            checkpoint.session_id.clone(),
+            checkpoint.file_name.clone(),
+            checkpoint.file_size,
+            checkpoint.total_chunks,
+        );
+        
+        // Restore progress state
+        progress.state = TransferState::Interrupted;
+        progress.chunks_sent = checkpoint.chunks_sent;
+        progress.bytes_sent = checkpoint.bytes_sent;
+        progress.failed_chunks = checkpoint.failed_chunks;
+        progress.retried_chunks = checkpoint.retried_chunks;
+        progress.client_id = checkpoint.client_id.clone();
+        progress.checkpoint_path = Some(checkpoint_path.to_string());
+        
+        // Add to transfers
+        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+        transfers.insert(checkpoint.session_id.clone(), progress);
+        
+        info!(
+            "Checkpoint loaded for session {} | Progress: {:.1}% | Chunks: {}/{}",
+            checkpoint.session_id.0,
+            (checkpoint.bytes_sent as f64 / checkpoint.file_size as f64) * 100.0,
+            checkpoint.chunks_sent,
+            checkpoint.total_chunks
+        );
+        
+        self.update_metrics();
+        Ok(checkpoint.session_id)
+    }
+    
+    /// Resume a transfer from an interrupted state
+    pub fn resume_from_checkpoint(&self, session_id: &TransferSessionId) -> Result<TransferCheckpoint, String> {
+        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+        
+        if let Some(progress) = transfers.get_mut(session_id) {
+            match progress.state {
+                TransferState::Interrupted | TransferState::Paused => {
+                    // Load checkpoint if available
+                    if let Some(checkpoint_path) = &progress.checkpoint_path {
+                        let checkpoint_data = fs::read_to_string(checkpoint_path).map_err(|e| {
+                            error!("Failed to read checkpoint file: {}", e);
+                            format!("Failed to read checkpoint file: {}", e)
+                        })?;
+                        
+                        let checkpoint: TransferCheckpoint = serde_json::from_str(&checkpoint_data).map_err(|e| {
+                            error!("Failed to deserialize checkpoint: {}", e);
+                            format!("Failed to deserialize checkpoint: {}", e)
+                        })?;
+                        
+                        checkpoint.validate().map_err(|e| {
+                            error!("Invalid checkpoint: {}", e);
+                            format!("Invalid checkpoint: {}", e)
+                        })?;
+                        
+                        // Resume from checkpoint
+                        progress.state = TransferState::Active;
+                        progress.chunks_sent = checkpoint.chunks_sent;
+                        progress.bytes_sent = checkpoint.bytes_sent;
+                        progress.failed_chunks = checkpoint.failed_chunks;
+                        progress.retried_chunks = checkpoint.retried_chunks;
+                        
+                        info!(
+                            "Resumed transfer from checkpoint: {} | Progress: {:.1}% | Next chunk: {}",
+                            session_id.0,
+                            (checkpoint.bytes_sent as f64 / checkpoint.file_size as f64) * 100.0,
+                            checkpoint.get_next_chunk_to_send().unwrap_or(0)
+                        );
+                        
+                        // Send state change event
+                        let event = ProgressEvent::state_changed(
+                            session_id.clone(),
+                            TransferState::Interrupted,
+                            TransferState::Active,
+                        );
+                        let _ = self.event_sender.send(event);
+                        
+                        self.update_metrics();
+                        Ok(checkpoint)
+                    } else {
+                        // No checkpoint available, resume from current state
+                        progress.state = TransferState::Active;
+                        
+                        info!("Resumed transfer without checkpoint: {}", session_id.0);
+                        
+                        // Create basic checkpoint from current progress
+                        let checkpoint = TransferCheckpoint::from_progress(progress);
+                        
+                        // Send state change event
+                        let event = ProgressEvent::state_changed(
+                            session_id.clone(),
+                            TransferState::Interrupted,
+                            TransferState::Active,
+                        );
+                        let _ = self.event_sender.send(event);
+                        
+                        self.update_metrics();
+                        Ok(checkpoint)
+                    }
+                }
+                _ => {
+                    warn!("Cannot resume session {} - transfer is not interrupted or paused", session_id.0);
+                    Err("Transfer is not interrupted or paused".to_string())
+                }
+            }
+        } else {
+            error!("Cannot resume unknown session: {}", session_id.0);
+            Err("Transfer session not found".to_string())
+        }
+    }
+    
+    /// Automatically save checkpoints for active transfers
+    pub fn auto_save_checkpoints(&self, checkpoint_dir: &str) -> Result<usize, String> {
+        let mut saved_count = 0;
+        
+        // Collect session IDs that need checkpoints
+        let sessions_to_save: Vec<TransferSessionId> = {
+            let transfers = self.transfers.read().map_err(|e| e.to_string())?;
+            transfers.iter()
+                .filter_map(|(session_id, progress)| {
+                    if progress.is_active() {
+                        let elapsed_since_checkpoint = progress.last_checkpoint_time.elapsed();
+                        if elapsed_since_checkpoint.as_secs() >= progress.checkpoint_interval {
+                            Some(session_id.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        
+        // Save checkpoints for collected sessions
+        for session_id in sessions_to_save {
+            if let Ok(_) = self.save_checkpoint(&session_id, checkpoint_dir) {
+                saved_count += 1;
+            }
+        }
+        
+        if saved_count > 0 {
+            debug!("Auto-saved {} checkpoints", saved_count);
+        }
+        
+        Ok(saved_count)
+    }
+    
+    /// Clean up checkpoint files for completed/failed transfers
+    pub fn cleanup_checkpoints(&self, checkpoint_dir: &str) -> Result<usize, String> {
+        let transfers = self.transfers.read().map_err(|e| e.to_string())?;
+        let mut cleaned_count = 0;
+        
+        for progress in transfers.values() {
+            if (progress.is_complete() || progress.is_failed()) && progress.checkpoint_path.is_some() {
+                let checkpoint_path = progress.checkpoint_path.as_ref().unwrap();
+                
+                if let Err(e) = fs::remove_file(checkpoint_path) {
+                    warn!("Failed to remove checkpoint file {}: {}", checkpoint_path, e);
+                } else {
+                    debug!("Cleaned up checkpoint file: {}", checkpoint_path);
+                    cleaned_count += 1;
+                }
+            }
+        }
+        
+        if cleaned_count > 0 {
+            info!("Cleaned up {} checkpoint files", cleaned_count);
+        }
+        
+        Ok(cleaned_count)
     }
 
     /// Start tracking a new file transfer
@@ -815,29 +1185,48 @@ impl ProgressTracker {
         }
     }
 
-    /// Resume a paused transfer
+    /// Resume a paused or interrupted transfer
     pub fn resume_transfer(&self, session_id: &TransferSessionId) -> Result<(), String> {
         let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
         
         if let Some(progress) = transfers.get_mut(session_id) {
-            if matches!(progress.state, TransferState::Paused) {
-                progress.state = TransferState::Active;
-                
-                info!("Resumed transfer session: {}", session_id.0);
-                
-                // Send state change event
-                let event = ProgressEvent::state_changed(
-                    session_id.clone(),
-                    TransferState::Paused,
-                    TransferState::Active,
-                );
-                let _ = self.event_sender.send(event);
-                
-                self.update_metrics();
-                Ok(())
-            } else {
-                warn!("Cannot resume session {} - transfer is not paused", session_id.0);
-                Err("Transfer is not paused".to_string())
+            match progress.state {
+                TransferState::Paused => {
+                    progress.state = TransferState::Active;
+                    
+                    info!("Resumed paused transfer session: {}", session_id.0);
+                    
+                    // Send state change event
+                    let event = ProgressEvent::state_changed(
+                        session_id.clone(),
+                        TransferState::Paused,
+                        TransferState::Active,
+                    );
+                    let _ = self.event_sender.send(event);
+                    
+                    self.update_metrics();
+                    Ok(())
+                }
+                TransferState::Interrupted => {
+                    progress.state = TransferState::Active;
+                    
+                    info!("Resumed interrupted transfer session: {}", session_id.0);
+                    
+                    // Send state change event
+                    let event = ProgressEvent::state_changed(
+                        session_id.clone(),
+                        TransferState::Interrupted,
+                        TransferState::Active,
+                    );
+                    let _ = self.event_sender.send(event);
+                    
+                    self.update_metrics();
+                    Ok(())
+                }
+                _ => {
+                    warn!("Cannot resume session {} - transfer is not paused or interrupted", session_id.0);
+                    Err("Transfer is not paused or interrupted".to_string())
+                }
             }
         } else {
             error!("Cannot resume unknown session: {}", session_id.0);
