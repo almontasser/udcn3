@@ -65,3 +65,5 @@ async fn main() {
     info!("Shutting down UDCN Daemon");
     daemon.stop().await;
 }
+
+mod face_manager;
