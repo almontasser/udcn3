@@ -329,7 +329,7 @@ pub enum ReassemblyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet_fragmentation::{PacketFragmenter, FragmentationConfig};
+    use crate::{PacketFragmenter, FragmentationConfig, FragmentHeader, Fragment};
 
     #[test]
     fn test_single_fragment_reassembly() {

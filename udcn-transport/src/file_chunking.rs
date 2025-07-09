@@ -69,7 +69,7 @@ impl ChunkingConfig {
 }
 
 /// Metadata about a file being chunked
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileMetadata {
     /// Original file path
     pub file_path: PathBuf,
