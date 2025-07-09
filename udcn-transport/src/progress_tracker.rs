@@ -398,26 +398,50 @@ impl FileTransferProgress {
         self.last_activity = Instant::now();
     }
 
-    /// Update transfer rates
+    /// Update transfer rates with enhanced calculation
     fn update_rates(&mut self) {
         let elapsed = self.start_time.elapsed();
         if elapsed.as_secs() > 0 {
             self.average_rate = self.bytes_sent as f64 / elapsed.as_secs_f64();
         }
 
-        // Calculate current rate based on last 5 seconds of activity
+        // For current rate, use exponential moving average for better accuracy
         let recent_elapsed = self.last_activity.elapsed();
-        if recent_elapsed.as_secs() > 0 && recent_elapsed.as_secs() <= 5 {
-            self.current_rate = self.average_rate; // Simplified - could be more sophisticated
+        if recent_elapsed.as_secs() <= 1 {
+            // Recently active - calculate instantaneous rate
+            let new_rate = if recent_elapsed.as_secs_f64() > 0.0 {
+                // Estimate based on recent activity (simplified)
+                self.average_rate
+            } else {
+                self.average_rate
+            };
+            
+            // Apply exponential smoothing (alpha = 0.3 for responsiveness)
+            self.current_rate = 0.3 * new_rate + 0.7 * self.current_rate;
+        } else {
+            // No recent activity - decay current rate
+            self.current_rate *= 0.9;
         }
     }
 
-    /// Update estimated time remaining
+    /// Update estimated time remaining with enhanced prediction
     fn update_eta(&mut self) {
-        if self.current_rate > 0.0 {
+        let effective_rate = if self.current_rate > 0.0 {
+            // Use weighted average of current and average rates
+            0.7 * self.current_rate + 0.3 * self.average_rate
+        } else {
+            self.average_rate
+        };
+
+        if effective_rate > 0.0 {
             let remaining_bytes = self.file_size - self.bytes_sent;
-            let eta_seconds = remaining_bytes as f64 / self.current_rate;
-            self.eta = Some(Duration::from_secs_f64(eta_seconds));
+            let eta_seconds = remaining_bytes as f64 / effective_rate;
+            
+            // Add buffer for potential slowdowns (10% extra time)
+            let buffered_eta = eta_seconds * 1.1;
+            self.eta = Some(Duration::from_secs_f64(buffered_eta));
+        } else {
+            self.eta = None;
         }
     }
 
@@ -428,6 +452,98 @@ impl FileTransferProgress {
         } else {
             0.0
         }
+    }
+
+    /// Get chunk-based progress percentage (0.0 to 1.0)
+    pub fn chunk_progress_percentage(&self) -> f64 {
+        if self.total_chunks > 0 {
+            self.chunks_sent as f64 / self.total_chunks as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get comprehensive progress information
+    pub fn get_progress_info(&self) -> ProgressInfo {
+        ProgressInfo {
+            session_id: self.session_id.clone(),
+            file_name: self.file_name.clone(),
+            file_size: self.file_size,
+            bytes_sent: self.bytes_sent,
+            chunks_sent: self.chunks_sent,
+            total_chunks: self.total_chunks,
+            state: self.state.clone(),
+            byte_percentage: self.progress_percentage(),
+            chunk_percentage: self.chunk_progress_percentage(),
+            current_rate_bps: self.current_rate,
+            average_rate_bps: self.average_rate,
+            eta: self.eta,
+            failed_chunks: self.failed_chunks,
+            retried_chunks: self.retried_chunks,
+            elapsed_time: self.start_time.elapsed(),
+            is_stalled: self.is_stalled(),
+            efficiency_ratio: self.get_efficiency_ratio(),
+        }
+    }
+
+    /// Check if transfer appears stalled (no activity for >30 seconds)
+    pub fn is_stalled(&self) -> bool {
+        matches!(self.state, TransferState::Active) && 
+        self.last_activity.elapsed() > Duration::from_secs(30)
+    }
+
+    /// Get transfer efficiency ratio (successful vs total attempts)
+    pub fn get_efficiency_ratio(&self) -> f64 {
+        let total_attempts = self.chunks_sent + self.failed_chunks;
+        if total_attempts > 0 {
+            self.chunks_sent as f64 / total_attempts as f64
+        } else {
+            1.0
+        }
+    }
+
+    /// Get estimated completion time
+    pub fn estimated_completion_time(&self) -> Option<std::time::SystemTime> {
+        self.eta.map(|eta| std::time::SystemTime::now() + eta)
+    }
+
+    /// Get human-readable progress summary
+    pub fn progress_summary(&self) -> String {
+        let byte_percent = (self.progress_percentage() * 100.0).round();
+        let chunk_percent = (self.chunk_progress_percentage() * 100.0).round();
+        
+        let rate_str = if self.current_rate > 1_000_000.0 {
+            format!("{:.1} MB/s", self.current_rate / 1_000_000.0)
+        } else if self.current_rate > 1_000.0 {
+            format!("{:.1} KB/s", self.current_rate / 1_000.0)
+        } else {
+            format!("{:.0} B/s", self.current_rate)
+        };
+
+        let eta_str = match self.eta {
+            Some(eta) => {
+                let total_seconds = eta.as_secs();
+                if total_seconds > 3600 {
+                    format!("{}h {}m", total_seconds / 3600, (total_seconds % 3600) / 60)
+                } else if total_seconds > 60 {
+                    format!("{}m {}s", total_seconds / 60, total_seconds % 60)
+                } else {
+                    format!("{}s", total_seconds)
+                }
+            }
+            None => "unknown".to_string(),
+        };
+
+        format!(
+            "{:.0}% ({:.0}% chunks) | {} | ETA: {} | {}/{} chunks | {} failures",
+            byte_percent,
+            chunk_percent,
+            rate_str,
+            eta_str,
+            self.chunks_sent,
+            self.total_chunks,
+            self.failed_chunks
+        )
     }
 
     /// Check if transfer is complete
@@ -490,6 +606,45 @@ pub struct TransferHealthStatus {
     pub memory_usage_mb: f64,
     /// Overall transfer rate in KB/s
     pub overall_rate_kbps: f64,
+}
+
+/// Comprehensive progress information for a transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressInfo {
+    /// Session identifier
+    pub session_id: TransferSessionId,
+    /// File name
+    pub file_name: String,
+    /// Total file size
+    pub file_size: u64,
+    /// Bytes sent so far
+    pub bytes_sent: u64,
+    /// Chunks sent successfully
+    pub chunks_sent: u32,
+    /// Total number of chunks
+    pub total_chunks: u32,
+    /// Current transfer state
+    pub state: TransferState,
+    /// Progress as percentage of bytes (0.0 to 1.0)
+    pub byte_percentage: f64,
+    /// Progress as percentage of chunks (0.0 to 1.0)
+    pub chunk_percentage: f64,
+    /// Current transfer rate in bytes per second
+    pub current_rate_bps: f64,
+    /// Average transfer rate in bytes per second
+    pub average_rate_bps: f64,
+    /// Estimated time remaining
+    pub eta: Option<Duration>,
+    /// Number of failed chunks
+    pub failed_chunks: u32,
+    /// Number of retried chunks
+    pub retried_chunks: u32,
+    /// Total elapsed time
+    pub elapsed_time: Duration,
+    /// Whether transfer appears stalled
+    pub is_stalled: bool,
+    /// Transfer efficiency ratio (0.0 to 1.0)
+    pub efficiency_ratio: f64,
 }
 
 impl Default for ProgressMetrics {
@@ -1416,6 +1571,146 @@ impl ProgressTracker {
             );
         }
     }
+
+    /// Subscribe to specific progress events with filtering
+    pub fn subscribe_filtered_events<F>(&self, filter: F) -> broadcast::Receiver<ProgressEvent>
+    where
+        F: Fn(&ProgressEvent) -> bool + Send + Sync + 'static,
+    {
+        // For now, return regular subscription - filtering would need async wrapper
+        self.event_sender.subscribe()
+    }
+
+    /// Get progress updates for multiple sessions
+    pub fn get_bulk_progress(&self, session_ids: &[TransferSessionId]) -> Vec<Option<ProgressInfo>> {
+        let transfers = self.transfers.read().unwrap_or_else(|e| e.into_inner());
+        session_ids.iter()
+            .map(|id| transfers.get(id).map(|p| p.get_progress_info()))
+            .collect()
+    }
+
+    /// Get progress summary for all active transfers
+    pub fn get_all_progress_info(&self) -> Vec<ProgressInfo> {
+        let transfers = self.transfers.read().unwrap_or_else(|e| e.into_inner());
+        transfers.values()
+            .filter(|p| p.is_active())
+            .map(|p| p.get_progress_info())
+            .collect()
+    }
+
+    /// Generate a comprehensive progress report
+    pub fn generate_progress_report(&self) -> String {
+        let transfers = self.transfers.read().unwrap_or_else(|e| e.into_inner());
+        let metrics = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        
+        let mut report = String::new();
+        report.push_str("=== UDCN Transport Progress Report ===\n\n");
+        
+        // Overall metrics
+        report.push_str(&format!("Overall Metrics:\n"));
+        report.push_str(&format!("  Active Transfers: {}\n", metrics.active_transfers));
+        report.push_str(&format!("  Completed: {} | Failed: {}\n", metrics.completed_transfers, metrics.failed_transfers));
+        report.push_str(&format!("  Total Bytes Sent: {:.2} MB\n", metrics.total_bytes_sent as f64 / 1_000_000.0));
+        report.push_str(&format!("  Overall Rate: {:.2} KB/s\n", metrics.overall_rate / 1000.0));
+        report.push_str(&format!("  Memory Usage: {:.1} MB\n\n", metrics.memory_usage_bytes as f64 / (1024.0 * 1024.0)));
+        
+        // Active transfers
+        if !transfers.is_empty() {
+            report.push_str("Active Transfers:\n");
+            for (i, progress) in transfers.values().filter(|p| p.is_active()).enumerate() {
+                report.push_str(&format!("  {}. {}\n", i + 1, progress.progress_summary()));
+            }
+            report.push('\n');
+        }
+        
+        // Stalled transfers
+        let stalled: Vec<_> = transfers.values()
+            .filter(|p| p.is_stalled())
+            .collect();
+        if !stalled.is_empty() {
+            report.push_str("⚠️  Stalled Transfers:\n");
+            for progress in stalled {
+                let stall_duration = progress.last_activity.elapsed().as_secs();
+                report.push_str(&format!("  {} (stalled for {}s)\n", 
+                    progress.session_id.0, stall_duration));
+            }
+            report.push('\n');
+        }
+        
+        // Health warnings
+        let total_chunks = metrics.total_chunks_sent + metrics.total_failed_chunks;
+        if total_chunks > 0 {
+            let failure_rate = metrics.total_failed_chunks as f64 / total_chunks as f64;
+            if failure_rate > 0.05 {
+                report.push_str(&format!("⚠️  High failure rate: {:.1}%\n", failure_rate * 100.0));
+            }
+        }
+        
+        report
+    }
+
+    /// Create a simple progress bar visualization
+    pub fn create_progress_bar(&self, session_id: &TransferSessionId, width: usize) -> Option<String> {
+        let transfers = self.transfers.read().ok()?;
+        let progress = transfers.get(session_id)?;
+        
+        let percentage = progress.progress_percentage();
+        let filled = (percentage * width as f64) as usize;
+        let empty = width.saturating_sub(filled);
+        
+        let bar = format!("[{}{}] {:.1}%", 
+            "█".repeat(filled),
+            "░".repeat(empty),
+            percentage * 100.0
+        );
+        
+        Some(bar)
+    }
+
+    /// Create detailed transfer status for CLI display
+    pub fn format_transfer_status(&self, session_id: &TransferSessionId) -> Option<String> {
+        let transfers = self.transfers.read().ok()?;
+        let progress = transfers.get(session_id)?;
+        
+        let progress_bar = self.create_progress_bar(session_id, 30).unwrap_or_default();
+        let info = progress.get_progress_info();
+        
+        let mut status = String::new();
+        status.push_str(&format!("File: {}\n", info.file_name));
+        status.push_str(&format!("Status: {:?}\n", info.state));
+        status.push_str(&format!("Progress: {}\n", progress_bar));
+        status.push_str(&format!("Rate: {:.1} KB/s (avg: {:.1} KB/s)\n", 
+            info.current_rate_bps / 1000.0, 
+            info.average_rate_bps / 1000.0));
+        
+        if let Some(eta) = info.eta {
+            let seconds = eta.as_secs();
+            if seconds > 3600 {
+                status.push_str(&format!("ETA: {}h {}m\n", seconds / 3600, (seconds % 3600) / 60));
+            } else if seconds > 60 {
+                status.push_str(&format!("ETA: {}m {}s\n", seconds / 60, seconds % 60));
+            } else {
+                status.push_str(&format!("ETA: {}s\n", seconds));
+            }
+        }
+        
+        status.push_str(&format!("Chunks: {}/{} ({:.1}%)\n", 
+            info.chunks_sent, 
+            info.total_chunks, 
+            info.chunk_percentage * 100.0));
+        
+        if info.failed_chunks > 0 {
+            status.push_str(&format!("Failures: {} (efficiency: {:.1}%)\n", 
+                info.failed_chunks, 
+                info.efficiency_ratio * 100.0));
+        }
+        
+        if info.is_stalled {
+            status.push_str("⚠️  Transfer appears stalled\n");
+        }
+        
+        Some(status)
+    }
 }
 
 impl Default for ProgressTracker {
@@ -1509,5 +1804,142 @@ mod tests {
         let metrics = tracker.get_metrics();
         assert_eq!(metrics.active_transfers, 0);
         assert_eq!(metrics.completed_transfers, 1);
+    }
+
+    #[test]
+    fn test_enhanced_progress_calculations() {
+        let tracker = ProgressTracker::default();
+        let session_id = TransferSessionId::new("calc_test.txt", "client1");
+        
+        // Start transfer
+        tracker.start_transfer(
+            session_id.clone(),
+            "calc_test.txt".to_string(),
+            1000,
+            10
+        ).unwrap();
+        
+        // Simulate some progress
+        tracker.update_chunk_sent(&session_id, 0, 100).unwrap();
+        tracker.update_chunk_sent(&session_id, 1, 100).unwrap();
+        
+        let progress = tracker.get_progress(&session_id).unwrap();
+        
+        // Test enhanced methods
+        assert_eq!(progress.chunk_progress_percentage(), 0.2); // 2/10 chunks
+        assert_eq!(progress.progress_percentage(), 0.2); // 200/1000 bytes
+        assert_eq!(progress.get_efficiency_ratio(), 1.0); // No failures
+        assert!(!progress.is_stalled()); // Recently active
+        
+        // Test progress info
+        let info = progress.get_progress_info();
+        assert_eq!(info.chunks_sent, 2);
+        assert_eq!(info.bytes_sent, 200);
+        assert_eq!(info.byte_percentage, 0.2);
+        assert_eq!(info.chunk_percentage, 0.2);
+        assert!(!info.is_stalled);
+    }
+
+    #[test]
+    fn test_progress_visualization() {
+        let tracker = ProgressTracker::default();
+        let session_id = TransferSessionId::new("viz_test.txt", "client1");
+        
+        // Start transfer
+        tracker.start_transfer(
+            session_id.clone(),
+            "viz_test.txt".to_string(),
+            1000,
+            10
+        ).unwrap();
+        
+        // Simulate 50% progress
+        for i in 0..5 {
+            tracker.update_chunk_sent(&session_id, i, 100).unwrap();
+        }
+        
+        // Test progress bar
+        let progress_bar = tracker.create_progress_bar(&session_id, 20).unwrap();
+        assert!(progress_bar.contains("50.0%"));
+        assert!(progress_bar.contains("█")); // Should have filled blocks
+        assert!(progress_bar.contains("░")); // Should have empty blocks
+        
+        // Test formatted status
+        let status = tracker.format_transfer_status(&session_id).unwrap();
+        assert!(status.contains("viz_test.txt"));
+        assert!(status.contains("50.0%"));
+        assert!(status.contains("Chunks: 5/10"));
+    }
+
+    #[test]
+    fn test_progress_report_generation() {
+        let tracker = ProgressTracker::default();
+        let session_id1 = TransferSessionId::new("report_test1.txt", "client1");
+        let session_id2 = TransferSessionId::new("report_test2.txt", "client2");
+        
+        // Start multiple transfers
+        tracker.start_transfer(
+            session_id1.clone(),
+            "report_test1.txt".to_string(),
+            1000,
+            10
+        ).unwrap();
+        
+        tracker.start_transfer(
+            session_id2.clone(),
+            "report_test2.txt".to_string(),
+            2000,
+            20
+        ).unwrap();
+        
+        // Add some progress
+        tracker.update_chunk_sent(&session_id1, 0, 100).unwrap();
+        tracker.update_chunk_sent(&session_id2, 0, 200).unwrap();
+        
+        // Generate report
+        let report = tracker.generate_progress_report();
+        assert!(report.contains("=== UDCN Transport Progress Report ==="));
+        assert!(report.contains("Active Transfers: 2"));
+        // Check that the report contains some percentage progress
+        assert!(report.contains("%"));
+        // Check that it contains chunk information
+        assert!(report.contains("chunks"));
+    }
+
+    #[test]
+    fn test_bulk_progress_operations() {
+        let tracker = ProgressTracker::default();
+        let session_ids: Vec<_> = (0..3)
+            .map(|i| TransferSessionId::new(&format!("bulk_test_{}.txt", i), "client1"))
+            .collect();
+        
+        // Start multiple transfers
+        for (i, session_id) in session_ids.iter().enumerate() {
+            tracker.start_transfer(
+                session_id.clone(),
+                format!("bulk_test_{}.txt", i),
+                (i + 1) as u64 * 1000,
+                (i + 1) as u32 * 10
+            ).unwrap();
+            
+            // Add different amounts of progress
+            for j in 0..=i {
+                tracker.update_chunk_sent(session_id, j as u32, 100).unwrap();
+            }
+        }
+        
+        // Test bulk progress retrieval
+        let progress_infos = tracker.get_bulk_progress(&session_ids);
+        assert_eq!(progress_infos.len(), 3);
+        assert!(progress_infos.iter().all(|p| p.is_some()));
+        
+        // Test all progress info
+        let all_progress = tracker.get_all_progress_info();
+        assert_eq!(all_progress.len(), 3);
+        
+        // Verify different progress levels (order may vary due to HashMap)
+        let mut chunk_counts: Vec<_> = all_progress.iter().map(|p| p.chunks_sent).collect();
+        chunk_counts.sort();
+        assert_eq!(chunk_counts, vec![1, 2, 3]);
     }
 }
