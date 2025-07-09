@@ -310,7 +310,7 @@ impl FileTransferProgress {
 
     /// Check if transfer is active
     pub fn is_active(&self) -> bool {
-        matches!(self.state, TransferState::Active)
+        matches!(self.state, TransferState::Active | TransferState::Initializing)
     }
 }
 
@@ -408,38 +408,42 @@ impl ProgressTracker {
         file_size: u64,
         total_chunks: u32,
     ) -> Result<(), String> {
-        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
-        
-        if transfers.len() >= self.config.max_concurrent_transfers {
-            warn!("Maximum concurrent transfers reached: {}", self.config.max_concurrent_transfers);
-            return Err("Maximum concurrent transfers reached".to_string());
-        }
+        let event = {
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+            
+            if transfers.len() >= self.config.max_concurrent_transfers {
+                warn!("Maximum concurrent transfers reached: {}", self.config.max_concurrent_transfers);
+                return Err("Maximum concurrent transfers reached".to_string());
+            }
 
-        let progress = FileTransferProgress::new(
-            session_id.clone(),
-            file_name.clone(),
-            file_size,
-            total_chunks,
-        );
+            let progress = FileTransferProgress::new(
+                session_id.clone(),
+                file_name.clone(),
+                file_size,
+                total_chunks,
+            );
 
-        transfers.insert(session_id.clone(), progress);
+            transfers.insert(session_id.clone(), progress);
+            
+            // Log transfer start
+            info!(
+                "Started transfer session: {} | File: {} | Size: {} bytes | Chunks: {}",
+                session_id.0, file_name, file_size, total_chunks
+            );
+            
+            debug!(
+                "Transfer session {} initialized with {} concurrent transfers active",
+                session_id.0, transfers.len()
+            );
+            
+            // Create event
+            ProgressEvent::transfer_started(session_id, file_name, file_size, total_chunks)
+        }; // Release write lock here
         
-        // Log transfer start
-        info!(
-            "Started transfer session: {} | File: {} | Size: {} bytes | Chunks: {}",
-            session_id.0, file_name, file_size, total_chunks
-        );
-        
-        debug!(
-            "Transfer session {} initialized with {} concurrent transfers active",
-            session_id.0, transfers.len()
-        );
-        
-        // Send event
-        let event = ProgressEvent::transfer_started(session_id, file_name, file_size, total_chunks);
+        // Send event after releasing lock
         let _ = self.event_sender.send(event);
 
-        // Update metrics
+        // Update metrics after releasing lock
         self.update_metrics();
 
         Ok(())
@@ -452,37 +456,47 @@ impl ProgressTracker {
         chunk_id: u32,
         chunk_size: u64,
     ) -> Result<(), String> {
-        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
-        
-        if let Some(progress) = transfers.get_mut(session_id) {
-            progress.update_chunk_sent(chunk_size);
+        let (event, update_needed) = {
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
             
-            // Log chunk progress
-            debug!(
-                "Chunk sent: {} | Session: {} | Chunk: {} | Size: {} bytes | Progress: {:.1}%",
-                session_id.0, session_id.0, chunk_id, chunk_size, progress.progress_percentage() * 100.0
-            );
-            
-            // Log milestone progress
-            let progress_pct = progress.progress_percentage();
-            if progress_pct >= 0.25 && progress_pct < 0.26 {
-                info!("Transfer {} reached 25% completion", session_id.0);
-            } else if progress_pct >= 0.5 && progress_pct < 0.51 {
-                info!("Transfer {} reached 50% completion", session_id.0);
-            } else if progress_pct >= 0.75 && progress_pct < 0.76 {
-                info!("Transfer {} reached 75% completion", session_id.0);
+            if let Some(progress) = transfers.get_mut(session_id) {
+                progress.update_chunk_sent(chunk_size);
+                
+                // Log chunk progress
+                debug!(
+                    "Chunk sent: {} | Session: {} | Chunk: {} | Size: {} bytes | Progress: {:.1}%",
+                    session_id.0, session_id.0, chunk_id, chunk_size, progress.progress_percentage() * 100.0
+                );
+                
+                // Log milestone progress
+                let progress_pct = progress.progress_percentage();
+                if progress_pct >= 0.25 && progress_pct < 0.26 {
+                    info!("Transfer {} reached 25% completion", session_id.0);
+                } else if progress_pct >= 0.5 && progress_pct < 0.51 {
+                    info!("Transfer {} reached 50% completion", session_id.0);
+                } else if progress_pct >= 0.75 && progress_pct < 0.76 {
+                    info!("Transfer {} reached 75% completion", session_id.0);
+                }
+                
+                // Create event
+                let event = ProgressEvent::chunk_sent(session_id.clone(), chunk_id, chunk_size);
+                (Some(event), true)
+            } else {
+                error!("Attempted to update chunk for unknown session: {}", session_id.0);
+                (None, false)
             }
-            
-            // Send event
-            let event = ProgressEvent::chunk_sent(session_id.clone(), chunk_id, chunk_size);
+        }; // Release write lock here
+        
+        // Send event after releasing lock
+        if let Some(event) = event {
             let _ = self.event_sender.send(event);
-            
-            // Update metrics
+        }
+        
+        // Update metrics after releasing lock
+        if update_needed {
             self.update_metrics();
-            
             Ok(())
         } else {
-            error!("Attempted to update chunk for unknown session: {}", session_id.0);
             Err("Transfer session not found".to_string())
         }
     }
@@ -494,36 +508,46 @@ impl ProgressTracker {
         chunk_id: u32,
         error: String,
     ) -> Result<(), String> {
-        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
-        
-        if let Some(progress) = transfers.get_mut(session_id) {
-            progress.update_chunk_failed();
+        let (event, update_needed) = {
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
             
-            // Log chunk failure
-            warn!(
-                "Chunk failed: {} | Session: {} | Chunk: {} | Error: {} | Failed chunks: {}",
-                session_id.0, session_id.0, chunk_id, error, progress.failed_chunks
-            );
-            
-            // Log warning if failure rate is high
-            let failure_rate = progress.failed_chunks as f64 / (progress.chunks_sent + progress.failed_chunks) as f64;
-            if failure_rate > 0.1 && progress.failed_chunks > 5 {
+            if let Some(progress) = transfers.get_mut(session_id) {
+                progress.update_chunk_failed();
+                
+                // Log chunk failure
                 warn!(
-                    "High failure rate detected for session {}: {:.1}% ({} failures)",
-                    session_id.0, failure_rate * 100.0, progress.failed_chunks
+                    "Chunk failed: {} | Session: {} | Chunk: {} | Error: {} | Failed chunks: {}",
+                    session_id.0, session_id.0, chunk_id, error, progress.failed_chunks
                 );
+                
+                // Log warning if failure rate is high
+                let failure_rate = progress.failed_chunks as f64 / (progress.chunks_sent + progress.failed_chunks) as f64;
+                if failure_rate > 0.1 && progress.failed_chunks > 5 {
+                    warn!(
+                        "High failure rate detected for session {}: {:.1}% ({} failures)",
+                        session_id.0, failure_rate * 100.0, progress.failed_chunks
+                    );
+                }
+                
+                // Create event
+                let event = ProgressEvent::chunk_failed(session_id.clone(), chunk_id, error);
+                (Some(event), true)
+            } else {
+                error!("Attempted to update chunk failure for unknown session: {}", session_id.0);
+                (None, false)
             }
-            
-            // Send event
-            let event = ProgressEvent::chunk_failed(session_id.clone(), chunk_id, error);
+        }; // Release write lock here
+        
+        // Send event after releasing lock
+        if let Some(event) = event {
             let _ = self.event_sender.send(event);
-            
-            // Update metrics
+        }
+        
+        // Update metrics after releasing lock
+        if update_needed {
             self.update_metrics();
-            
             Ok(())
         } else {
-            error!("Attempted to update chunk failure for unknown session: {}", session_id.0);
             Err("Transfer session not found".to_string())
         }
     }
@@ -555,92 +579,113 @@ impl ProgressTracker {
 
     /// Complete a transfer
     pub fn complete_transfer(&self, session_id: &TransferSessionId) -> Result<(), String> {
-        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
-        
-        if let Some(progress) = transfers.get_mut(session_id) {
-            progress.state = TransferState::Completed;
-            let duration = progress.start_time.elapsed();
+        let (event_data, update_needed) = {
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
             
-            // Log transfer completion with detailed statistics
-            info!(
-                "Transfer completed: {} | Duration: {:.2}s | Bytes: {} | Chunks: {}/{} | Rate: {:.2} KB/s | Failures: {}",
-                session_id.0,
-                duration.as_secs_f64(),
-                progress.bytes_sent,
-                progress.chunks_sent,
-                progress.total_chunks,
-                progress.average_rate / 1024.0,
-                progress.failed_chunks
-            );
-            
-            // Log performance metrics
-            if progress.failed_chunks > 0 {
-                let failure_rate = progress.failed_chunks as f64 / progress.total_chunks as f64;
-                debug!(
-                    "Transfer {} completed with {:.1}% failure rate ({} retries)",
-                    session_id.0, failure_rate * 100.0, progress.retried_chunks
+            if let Some(progress) = transfers.get_mut(session_id) {
+                progress.state = TransferState::Completed;
+                let duration = progress.start_time.elapsed();
+                
+                // Log transfer completion with detailed statistics
+                info!(
+                    "Transfer completed: {} | Duration: {:.2}s | Bytes: {} | Chunks: {}/{} | Rate: {:.2} KB/s | Failures: {}",
+                    session_id.0,
+                    duration.as_secs_f64(),
+                    progress.bytes_sent,
+                    progress.chunks_sent,
+                    progress.total_chunks,
+                    progress.average_rate / 1024.0,
+                    progress.failed_chunks
                 );
+                
+                // Log performance metrics
+                if progress.failed_chunks > 0 {
+                    let failure_rate = progress.failed_chunks as f64 / progress.total_chunks as f64;
+                    debug!(
+                        "Transfer {} completed with {:.1}% failure rate ({} retries)",
+                        session_id.0, failure_rate * 100.0, progress.retried_chunks
+                    );
+                }
+                
+                // Create event data
+                let event = ProgressEvent::transfer_completed(
+                    session_id.clone(),
+                    progress.bytes_sent,
+                    duration,
+                );
+                
+                (Some(event), true)
+            } else {
+                error!("Attempted to complete unknown transfer session: {}", session_id.0);
+                (None, false)
             }
-            
-            // Send event
-            let event = ProgressEvent::transfer_completed(
-                session_id.clone(),
-                progress.bytes_sent,
-                duration,
-            );
+        }; // Release write lock here
+        
+        // Send event after releasing lock
+        if let Some(event) = event_data {
             let _ = self.event_sender.send(event);
-            
-            // Update metrics
+        }
+        
+        // Update metrics after releasing lock
+        if update_needed {
             self.update_metrics();
-            
             Ok(())
         } else {
-            error!("Attempted to complete unknown transfer session: {}", session_id.0);
             Err("Transfer session not found".to_string())
         }
     }
 
     /// Fail a transfer
     pub fn fail_transfer(&self, session_id: &TransferSessionId, error: String) -> Result<(), String> {
-        let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+        let (event, update_needed) = {
+            let mut transfers = self.transfers.write().map_err(|e| e.to_string())?;
+            
+            if let Some(progress) = transfers.get_mut(session_id) {
+                progress.state = TransferState::Failed { error: error.clone() };
+                let duration = progress.start_time.elapsed();
+                
+                // Log transfer failure with context
+                error!(
+                    "Transfer failed: {} | Error: {} | Duration: {:.2}s | Progress: {:.1}% | Bytes sent: {} | Chunks: {}/{} | Failures: {}",
+                    session_id.0,
+                    error,
+                    duration.as_secs_f64(),
+                    progress.progress_percentage() * 100.0,
+                    progress.bytes_sent,
+                    progress.chunks_sent,
+                    progress.total_chunks,
+                    progress.failed_chunks
+                );
+                
+                // Log additional context for debugging
+                debug!(
+                    "Transfer {} failed after {} chunk failures and {} retries",
+                    session_id.0, progress.failed_chunks, progress.retried_chunks
+                );
+                
+                // Create event
+                let event = ProgressEvent::transfer_failed(
+                    session_id.clone(),
+                    error,
+                    progress.bytes_sent,
+                );
+                (Some(event), true)
+            } else {
+                error!("Attempted to fail unknown transfer session: {}", session_id.0);
+                (None, false)
+            }
+        }; // Release write lock here
         
-        if let Some(progress) = transfers.get_mut(session_id) {
-            progress.state = TransferState::Failed { error: error.clone() };
-            let duration = progress.start_time.elapsed();
-            
-            // Log transfer failure with context
-            error!(
-                "Transfer failed: {} | Error: {} | Duration: {:.2}s | Progress: {:.1}% | Bytes sent: {} | Chunks: {}/{} | Failures: {}",
-                session_id.0,
-                error,
-                duration.as_secs_f64(),
-                progress.progress_percentage() * 100.0,
-                progress.bytes_sent,
-                progress.chunks_sent,
-                progress.total_chunks,
-                progress.failed_chunks
-            );
-            
-            // Log additional context for debugging
-            debug!(
-                "Transfer {} failed after {} chunk failures and {} retries",
-                session_id.0, progress.failed_chunks, progress.retried_chunks
-            );
-            
-            // Send event
-            let event = ProgressEvent::transfer_failed(
-                session_id.clone(),
-                error,
-                progress.bytes_sent,
-            );
+        // Send event after releasing lock
+        if let Some(event) = event {
             let _ = self.event_sender.send(event);
-            
-            // Update metrics
+        }
+        
+        // Update metrics after releasing lock
+        if update_needed {
             self.update_metrics();
-            
             Ok(())
         } else {
-            error!("Attempted to fail unknown transfer session: {}", session_id.0);
             Err("Transfer session not found".to_string())
         }
     }

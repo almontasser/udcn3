@@ -25,7 +25,7 @@ thiserror = "1.0"
 futures = "0.3"
 notify = "6.0"
 
-udcn-common = { path = "../udcn-common" }
+udcn-common = { path = "../udcn-common", features = ["user"] }
 udcn-core = { path = "../udcn-core" }
 udcn-transport = { path = "../udcn-transport" }
 

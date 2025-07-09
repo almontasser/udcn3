@@ -83,7 +83,7 @@ impl EbpfManager {
         // Detach the program from the interface
         if let Some(bpf_arc) = &self.bpf {
             let bpf = bpf_arc.read().await;
-            if let Ok(program) = bpf.program("udcn") {
+            if let Some(program) = bpf.program("udcn") {
                 if let Ok(program) = program.try_into() as Result<&Xdp, _> {
                     // XDP programs detach automatically when dropped, but we can be explicit
                     // program.detach(&self.interface_name)?;
@@ -137,7 +137,9 @@ impl EbpfManager {
     pub async fn get_packet_stats(&self) -> Result<PacketStats, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
             let bpf = bpf_arc.read().await;
-            let stats_map: HashMap<_, u32, PacketStats> = bpf.map("PACKET_STATS")?.try_into()?;
+            let map = bpf.map("PACKET_STATS")
+                .ok_or("PACKET_STATS map not found")?;
+            let stats_map: HashMap<&aya::maps::MapData, u32, PacketStats> = map.try_into()?;
             
             // Get statistics from the map (key 0 is typically used for global stats)
             match stats_map.get(&0, 0) {
@@ -188,7 +190,9 @@ impl EbpfManager {
     pub async fn get_cs_stats(&self) -> Result<ContentStoreStats, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
             let bpf = bpf_arc.read().await;
-            let cs_stats_map: HashMap<_, u32, ContentStoreStats> = bpf.map("CS_STATS")?.try_into()?;
+            let map = bpf.map("CS_STATS")
+                .ok_or("CS_STATS map not found")?;
+            let cs_stats_map: HashMap<&aya::maps::MapData, u32, ContentStoreStats> = map.try_into()?;
             
             // Get CS statistics from the map (key 0 is typically used for global stats)
             match cs_stats_map.get(&0, 0) {
@@ -226,8 +230,10 @@ impl EbpfManager {
     /// Add a face to the face table
     pub async fn add_face(&self, face_id: u32, face_info: &FaceInfo) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let mut face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("FACE_TABLE")
+                .ok_or("FACE_TABLE map not found")?;
+            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
             
             // Insert the face into the eBPF face table
             face_table.insert(face_id, face_info.clone(), 0)?;
@@ -242,8 +248,10 @@ impl EbpfManager {
     /// Remove a face from the face table
     pub async fn remove_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let mut face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("FACE_TABLE")
+                .ok_or("FACE_TABLE map not found")?;
+            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
             
             // Remove the face from the eBPF face table
             face_table.remove(&face_id)?;
@@ -259,7 +267,9 @@ impl EbpfManager {
     pub async fn get_face(&self, face_id: u32) -> Result<FaceInfo, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
             let bpf = bpf_arc.read().await;
-            let face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            let map = bpf.map("FACE_TABLE")
+                .ok_or("FACE_TABLE map not found")?;
+            let face_table: HashMap<&aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
             
             // Get the face from the eBPF face table
             match face_table.get(&face_id, 0) {
