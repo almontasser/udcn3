@@ -15,6 +15,15 @@ pub const MAX_PAYLOAD_SIZE: usize = 65536;
 /// eBPF map key size
 pub const MAP_KEY_SIZE: usize = 32;
 
+/// Maximum PIT entries
+pub const MAX_PIT_ENTRIES: usize = 8192;
+
+/// PIT entry timeout in nanoseconds (10 seconds)
+pub const PIT_ENTRY_TIMEOUT_NS: u64 = 10_000_000_000;
+
+/// PIT cleanup interval in nanoseconds (1 second)
+pub const PIT_CLEANUP_INTERVAL_NS: u64 = 1_000_000_000;
+
 /// XDP action codes used by UDCN
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +254,192 @@ impl UdcnName {
     }
 }
 
+/// PIT entry structure for tracking pending Interests
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PitEntry {
+    /// Interest name hash for fast lookup
+    pub name_hash: u64,
+    /// Primary incoming face identifier
+    pub incoming_face: u32,
+    /// Primary Interest nonce for deduplication
+    pub nonce: u32,
+    /// Expiration timestamp (in nanoseconds since boot)
+    pub expiry_time: u64,
+    /// Creation timestamp
+    pub created_time: u64,
+    /// Number of times this Interest has been seen
+    pub interest_count: u32,
+    /// PIT entry state flags
+    pub state: u8,
+    /// Number of additional faces (for aggregation)
+    pub additional_faces_count: u8,
+    /// Padding for alignment
+    pub _padding: [u8; 2],
+}
+
+/// Maximum number of additional faces that can be tracked per PIT entry
+pub const MAX_ADDITIONAL_FACES: usize = 4;
+
+/// PIT face entry for tracking additional faces in aggregation
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PitFaceEntry {
+    /// Face identifier
+    pub face_id: u32,
+    /// Nonce for this face
+    pub nonce: u32,
+    /// Timestamp when this face was added
+    pub timestamp: u64,
+}
+
+impl PitEntry {
+    pub const fn new() -> Self {
+        Self {
+            name_hash: 0,
+            incoming_face: 0,
+            nonce: 0,
+            expiry_time: 0,
+            created_time: 0,
+            interest_count: 0,
+            state: 0,
+            additional_faces_count: 0,
+            _padding: [0; 2],
+        }
+    }
+}
+
+impl PitFaceEntry {
+    pub const fn new() -> Self {
+        Self {
+            face_id: 0,
+            nonce: 0,
+            timestamp: 0,
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for PitEntry {}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for PitFaceEntry {}
+
+/// PIT entry state flags
+pub const PIT_STATE_ACTIVE: u8 = 0x01;
+pub const PIT_STATE_SATISFIED: u8 = 0x02;
+pub const PIT_STATE_EXPIRED: u8 = 0x04;
+pub const PIT_STATE_AGGREGATED: u8 = 0x08;
+
+/// PIT statistics structure
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PitStats {
+    /// Total number of PIT entries created
+    pub entries_created: u64,
+    /// Total number of PIT entries satisfied
+    pub entries_satisfied: u64,
+    /// Total number of PIT entries expired
+    pub entries_expired: u64,
+    /// Total number of Interest aggregations
+    pub interests_aggregated: u64,
+    /// Current number of active PIT entries
+    pub active_entries: u64,
+    /// Maximum number of entries reached
+    pub max_entries_reached: u64,
+    /// PIT lookup operations
+    pub lookups: u64,
+    /// PIT insertion operations
+    pub insertions: u64,
+    /// PIT deletion operations
+    pub deletions: u64,
+    /// PIT cleanup operations
+    pub cleanups: u64,
+}
+
+impl PitStats {
+    pub const fn new() -> Self {
+        Self {
+            entries_created: 0,
+            entries_satisfied: 0,
+            entries_expired: 0,
+            interests_aggregated: 0,
+            active_entries: 0,
+            max_entries_reached: 0,
+            lookups: 0,
+            insertions: 0,
+            deletions: 0,
+            cleanups: 0,
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for PitStats {}
+
+/// Face information structure for PIT entries
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FaceInfo {
+    /// Face identifier
+    pub face_id: u32,
+    /// Face type (ethernet, ip, etc.)
+    pub face_type: u8,
+    /// Face state flags
+    pub state: u8,
+    /// Interface index
+    pub ifindex: u32,
+    /// MAC address for ethernet faces
+    pub mac_addr: [u8; 6],
+    /// IP address for IP faces
+    pub ip_addr: [u8; 16],
+    /// Port for UDP/TCP faces
+    pub port: u16,
+    /// Last activity timestamp
+    pub last_activity: u64,
+    /// Statistics
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    /// Padding for alignment
+    pub _padding: [u8; 6],
+}
+
+impl FaceInfo {
+    pub const fn new() -> Self {
+        Self {
+            face_id: 0,
+            face_type: 0,
+            state: 0,
+            ifindex: 0,
+            mac_addr: [0; 6],
+            ip_addr: [0; 16],
+            port: 0,
+            last_activity: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            _padding: [0; 6],
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for FaceInfo {}
+
+/// Face type constants
+pub const FACE_TYPE_ETHERNET: u8 = 0x01;
+pub const FACE_TYPE_IP: u8 = 0x02;
+pub const FACE_TYPE_UDP: u8 = 0x03;
+pub const FACE_TYPE_TCP: u8 = 0x04;
+
+/// Face state constants
+pub const FACE_STATE_UP: u8 = 0x01;
+pub const FACE_STATE_DOWN: u8 = 0x02;
+pub const FACE_STATE_CONGESTED: u8 = 0x04;
+
 /// Error codes for UDCN operations
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,4 +462,12 @@ pub enum UdcnError {
     InvalidConfig = 7,
     /// Feature not supported
     NotSupported = 8,
+    /// PIT entry not found
+    PitEntryNotFound = 9,
+    /// PIT table full
+    PitTableFull = 10,
+    /// Interest expired
+    InterestExpired = 11,
+    /// Face not found
+    FaceNotFound = 12,
 }
