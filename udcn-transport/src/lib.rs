@@ -24,6 +24,7 @@ pub mod pipeline_coordinator;
 pub mod packet_fragmentation;
 pub mod packet_reassembly;
 pub mod fragmented_transport;
+pub mod concurrent_transport;
 
 pub use tcp::*;
 pub use udp::*;
@@ -68,10 +69,89 @@ pub use packet_reassembly::{PacketReassembler, ReassemblyConfig as PacketReassem
 // Fragmented transport exports
 pub use fragmented_transport::{FragmentedTransport, FragmentedTransportError};
 
+// Concurrent transport exports
+pub use concurrent_transport::{ConcurrentTransportWrapper, ConcurrentTransportConfig, ConcurrentOperationPool};
+
+/// Synchronous transport trait for backward compatibility
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
     fn receive(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>>;
     fn close(&self) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+/// Async transport trait with thread-safety for concurrent operations
+#[async_trait::async_trait]
+pub trait AsyncTransport: Send + Sync {
+    /// Send data asynchronously
+    async fn send_async(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Receive data asynchronously
+    async fn receive_async(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+    /// Close the transport asynchronously
+    async fn close_async(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Send data to a specific destination
+    async fn send_to_async(&self, data: &[u8], addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Receive data with timeout
+    async fn receive_timeout_async(&self, timeout: std::time::Duration) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Thread-safe transport trait combining sync and async capabilities
+pub trait ConcurrentTransport: Transport + AsyncTransport + Send + Sync + Clone {
+    /// Get transport statistics
+    fn get_stats(&self) -> TransportStats;
+    /// Reset transport statistics
+    fn reset_stats(&self);
+}
+
+/// Transport performance and usage statistics
+#[derive(Debug, Clone)]
+pub struct TransportStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub send_errors: u64,
+    pub receive_errors: u64,
+    pub active_connections: u64,
+    pub total_connections: u64,
+    pub last_activity: Option<std::time::Instant>,
+    pub created_at: std::time::Instant,
+}
+
+impl Default for TransportStats {
+    fn default() -> Self {
+        Self {
+            bytes_sent: 0,
+            bytes_received: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            send_errors: 0,
+            receive_errors: 0,
+            active_connections: 0,
+            total_connections: 0,
+            last_activity: None,
+            created_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl TransportStats {
+    pub fn throughput_bps(&self) -> f64 {
+        let elapsed = self.created_at.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            (self.bytes_sent + self.bytes_received) as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+    
+    pub fn error_rate(&self) -> f64 {
+        let total_ops = self.packets_sent + self.packets_received;
+        if total_ops > 0 {
+            (self.send_errors + self.receive_errors) as f64 / total_ops as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 pub fn init() {

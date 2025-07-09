@@ -2188,12 +2188,14 @@ name = "udcn-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aya",
  "aya-log",
  "bincode",
  "crc32fast",
  "env_logger 0.10.2",
  "fastrand",
+ "futures",
  "libc",
  "log",
  "num_cpus",

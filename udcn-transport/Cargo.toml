@@ -22,6 +22,8 @@ thiserror = "1.0"
 num_cpus = "1.16"
 fastrand = "2.0"
 tracing = "0.1"
+async-trait = "0.1"
+futures = "0.3"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
