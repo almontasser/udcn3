@@ -105,29 +105,37 @@ impl EbpfManager {
     }
 
     /// Get access to a specific eBPF map with default key type
-    /// TODO: This will be properly implemented when the eBPF program is ready
-    pub async fn get_map<T>(&self, name: &str) -> Result<(), Box<dyn std::error::Error>>
+    pub async fn get_map<T>(&self, name: &str) -> Result<HashMap<&aya::maps::MapData, u32, T>, Box<dyn std::error::Error>>
     where
-        T: 'static + Send + Sync,
+        T: 'static + Send + Sync + Clone,
     {
-        warn!("get_map: Using placeholder implementation for map '{}'", name);
-        if self.bpf.is_some() {
-            Ok(())
+        debug!("Getting eBPF map: {}", name);
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let map = bpf.map(name)
+                .ok_or_else(|| format!("Map '{}' not found", name))?;
+            let hash_map: HashMap<&aya::maps::MapData, u32, T> = map.try_into()
+                .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
+            Ok(hash_map)
         } else {
             Err("eBPF program not loaded".into())
         }
     }
 
     /// Get access to a specific eBPF map with custom key type
-    /// TODO: This will be properly implemented when the eBPF program is ready
-    pub async fn get_map_with_key<K, T>(&self, name: &str) -> Result<(), Box<dyn std::error::Error>>
+    pub async fn get_map_with_key<K, T>(&self, name: &str) -> Result<HashMap<&aya::maps::MapData, K, T>, Box<dyn std::error::Error>>
     where
-        K: 'static + Send + Sync,
-        T: 'static + Send + Sync,
+        K: 'static + Send + Sync + Clone,
+        T: 'static + Send + Sync + Clone,
     {
-        warn!("get_map_with_key: Using placeholder implementation for map '{}'", name);
-        if self.bpf.is_some() {
-            Ok(())
+        debug!("Getting eBPF map with custom key: {}", name);
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let map = bpf.map(name)
+                .ok_or_else(|| format!("Map '{}' not found", name))?;
+            let hash_map: HashMap<&aya::maps::MapData, K, T> = map.try_into()
+                .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
+            Ok(hash_map)
         } else {
             Err("eBPF program not loaded".into())
         }
@@ -170,20 +178,38 @@ impl EbpfManager {
 
     /// Get PIT statistics from the eBPF program
     pub async fn get_pit_stats(&self) -> Result<PitStats, Box<dyn std::error::Error>> {
-        // For now, return a placeholder implementation
-        warn!("get_pit_stats: Using placeholder implementation");
-        Ok(PitStats {
-            entries_created: 0,
-            entries_satisfied: 0,
-            entries_expired: 0,
-            interests_aggregated: 0,
-            active_entries: 0,
-            max_entries_reached: 0,
-            lookups: 0,
-            insertions: 0,
-            deletions: 0,
-            cleanups: 0,
-        })
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let map = bpf.map("PIT_STATS")
+                .ok_or("PIT_STATS map not found")?;
+            let pit_stats_map: HashMap<&aya::maps::MapData, u32, PitStats> = map.try_into()?;
+            
+            // Get PIT statistics from the map (key 0 is typically used for global stats)
+            match pit_stats_map.get(&0, 0) {
+                Ok(stats) => {
+                    debug!("Retrieved PIT statistics from eBPF: {:?}", stats);
+                    Ok(stats)
+                }
+                Err(e) => {
+                    warn!("Failed to get PIT statistics from eBPF map: {}", e);
+                    // Return default stats if map read fails
+                    Ok(PitStats {
+                        entries_created: 0,
+                        entries_satisfied: 0,
+                        entries_expired: 0,
+                        interests_aggregated: 0,
+                        active_entries: 0,
+                        max_entries_reached: 0,
+                        lookups: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        cleanups: 0,
+                    })
+                }
+            }
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Get Content Store statistics from the eBPF program
@@ -221,10 +247,20 @@ impl EbpfManager {
 
     /// Update configuration in the eBPF program
     pub async fn update_config(&self, config: &UdcnConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, this is a placeholder
-        warn!("update_config: Using placeholder implementation");
-        debug!("Would update eBPF configuration: {:?}", config);
-        Ok(())
+        if let Some(bpf_arc) = &self.bpf {
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("CONFIG_MAP")
+                .ok_or("CONFIG_MAP map not found")?;
+            let mut config_map: HashMap<&mut aya::maps::MapData, u32, UdcnConfig> = map.try_into()?;
+            
+            // Update the configuration in the eBPF map (key 0 is typically used for global config)
+            config_map.insert(0, config.clone(), 0)?;
+            
+            info!("Updated eBPF configuration: {:?}", config);
+            Ok(())
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Add a face to the face table
@@ -289,16 +325,60 @@ impl EbpfManager {
 
     /// Clear all PIT entries (for debugging/testing)
     pub async fn clear_pit(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, this is a placeholder
-        warn!("clear_pit: Using placeholder implementation");
-        Ok(())
+        if let Some(bpf_arc) = &self.bpf {
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("PIT_TABLE")
+                .ok_or("PIT_TABLE map not found")?;
+            let mut pit_table: HashMap<&mut aya::maps::MapData, u32, PitEntry> = map.try_into()?;
+            
+            // Clear all PIT entries by iterating through and removing each one
+            let mut keys_to_remove = Vec::new();
+            for key in pit_table.keys() {
+                if let Ok(key_value) = key {
+                    keys_to_remove.push(key_value);
+                }
+            }
+            
+            for key in keys_to_remove {
+                if let Err(e) = pit_table.remove(&key) {
+                    warn!("Failed to remove PIT entry {}: {}", key, e);
+                }
+            }
+            
+            info!("Cleared all PIT entries");
+            Ok(())
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Clear all Content Store entries (for debugging/testing)
     pub async fn clear_content_store(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, this is a placeholder
-        warn!("clear_content_store: Using placeholder implementation");
-        Ok(())
+        if let Some(bpf_arc) = &self.bpf {
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("CONTENT_STORE")
+                .ok_or("CONTENT_STORE map not found")?;
+            let mut cs_table: HashMap<&mut aya::maps::MapData, u32, ContentStoreEntry> = map.try_into()?;
+            
+            // Clear all Content Store entries by iterating through and removing each one
+            let mut keys_to_remove = Vec::new();
+            for key in cs_table.keys() {
+                if let Ok(key_value) = key {
+                    keys_to_remove.push(key_value);
+                }
+            }
+            
+            for key in keys_to_remove {
+                if let Err(e) = cs_table.remove(&key) {
+                    warn!("Failed to remove CS entry {}: {}", key, e);
+                }
+            }
+            
+            info!("Cleared all Content Store entries");
+            Ok(())
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Get health status of the eBPF program

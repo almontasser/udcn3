@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use async_trait::async_trait;
+use futures::executor;
 use udcn_common::{FaceInfo, FACE_TYPE_ETHERNET, FACE_TYPE_IP, FACE_TYPE_UDP, FACE_TYPE_TCP, FACE_STATE_UP, FACE_STATE_DOWN};
 
 use crate::service::Service;
@@ -437,8 +438,10 @@ impl Service for FaceManager {
     }
 
     fn is_running(&self) -> bool {
-        // We need to handle the async nature differently
-        false // This is a limitation of the trait, we'll need to use a different approach
+        // Use blocking version for trait requirement
+        executor::block_on(async {
+            *self.running.read().await
+        })
     }
 }
 

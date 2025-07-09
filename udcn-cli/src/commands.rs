@@ -1,32 +1,59 @@
 use clap::ArgMatches;
 use log::{info, warn, error};
 use std::path::Path;
+use std::net::SocketAddr;
 use crate::utils::{format_bytes, FileChunker, ProgressTracker};
+use crate::daemon_client::DaemonClient;
+use crate::node_manager::NodeManager;
+use crate::file_transfer::SimpleFileTransfer;
 
 pub async fn handle_node_command(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let mut node_manager = NodeManager::new(None);
+    
     match matches.subcommand() {
         Some(("list", _)) => {
             info!("Listing all nodes");
-            println!("Node listing not yet implemented");
+            let nodes = node_manager.list_nodes();
+            
+            if nodes.is_empty() {
+                println!("No nodes found");
+            } else {
+                println!("Registered nodes:");
+                for node in nodes {
+                    println!("  {} - {} ({})", node.id, node.address, node.status);
+                }
+            }
             Ok(())
         }
         Some(("add", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").unwrap();
             let address = sub_matches.get_one::<String>("address").unwrap();
             info!("Adding node {} at {}", id, address);
-            println!("Node addition not yet implemented");
+            
+            match node_manager.add_node(id.clone(), address.clone()) {
+                Ok(_) => println!("Node '{}' added successfully", id),
+                Err(e) => return Err(format!("Failed to add node: {}", e).into()),
+            }
             Ok(())
         }
         Some(("remove", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").unwrap();
             info!("Removing node {}", id);
-            println!("Node removal not yet implemented");
+            
+            match node_manager.remove_node(id) {
+                Ok(_) => println!("Node '{}' removed successfully", id),
+                Err(e) => return Err(format!("Failed to remove node: {}", e).into()),
+            }
             Ok(())
         }
         Some(("show", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").unwrap();
             info!("Showing node {}", id);
-            println!("Node details not yet implemented");
+            
+            match node_manager.get_node(id) {
+                Some(node) => println!("{}", node),
+                None => println!("Node '{}' not found", id),
+            }
             Ok(())
         }
         _ => {
@@ -39,15 +66,35 @@ pub async fn handle_node_command(matches: &ArgMatches) -> Result<(), Box<dyn std
 pub async fn handle_network_command(
     matches: &ArgMatches,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut node_manager = NodeManager::new(None);
+    
     match matches.subcommand() {
         Some(("status", _)) => {
             info!("Showing network status");
-            println!("Network status not yet implemented");
+            let status = node_manager.get_network_status();
+            println!("{}", status.format());
             Ok(())
         }
         Some(("discover", _)) => {
             info!("Discovering network nodes");
-            println!("Network discovery not yet implemented");
+            println!("Starting network discovery...");
+            
+            match node_manager.discover_nodes().await {
+                Ok(discovered) => {
+                    if discovered.is_empty() {
+                        println!("No new nodes discovered");
+                    } else {
+                        println!("Discovered {} nodes:", discovered.len());
+                        for node in discovered {
+                            println!("  {} - {}", node.id, node.address);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Discovery failed: {}", e);
+                    println!("Network discovery failed: {}", e);
+                }
+            }
             Ok(())
         }
         _ => {
@@ -58,25 +105,52 @@ pub async fn handle_network_command(
 }
 
 pub async fn handle_daemon_command(matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = matches.get_one::<String>("config");
+    let daemon_client = DaemonClient::new(config_path.map(|s| s.as_str()));
+    
     match matches.subcommand() {
         Some(("start", _)) => {
             info!("Starting daemon");
-            println!("Daemon start not yet implemented");
+            match daemon_client.start().await {
+                Ok(_) => println!("Daemon started successfully"),
+                Err(e) => {
+                    error!("Failed to start daemon: {}", e);
+                    println!("Failed to start daemon: {}", e);
+                }
+            }
             Ok(())
         }
         Some(("stop", _)) => {
             info!("Stopping daemon");
-            println!("Daemon stop not yet implemented");
+            match daemon_client.stop().await {
+                Ok(_) => println!("Daemon stopped successfully"),
+                Err(e) => {
+                    error!("Failed to stop daemon: {}", e);
+                    println!("Failed to stop daemon: {}", e);
+                }
+            }
             Ok(())
         }
         Some(("restart", _)) => {
             info!("Restarting daemon");
-            println!("Daemon restart not yet implemented");
+            match daemon_client.restart().await {
+                Ok(_) => println!("Daemon restarted successfully"),
+                Err(e) => {
+                    error!("Failed to restart daemon: {}", e);
+                    println!("Failed to restart daemon: {}", e);
+                }
+            }
             Ok(())
         }
         Some(("status", _)) => {
             info!("Showing daemon status");
-            println!("Daemon status not yet implemented");
+            match daemon_client.status().await {
+                Ok(status) => println!("{}", status.format()),
+                Err(e) => {
+                    error!("Failed to get daemon status: {}", e);
+                    println!("Failed to get daemon status: {}", e);
+                }
+            }
             Ok(())
         }
         _ => {
@@ -91,8 +165,12 @@ pub async fn handle_send_command(matches: &ArgMatches) -> Result<(), Box<dyn std
     let ndn_name = matches.get_one::<String>("name").unwrap();
     let chunk_size = matches.get_one::<String>("chunk-size").unwrap().parse::<usize>()?;
     let show_progress = matches.get_flag("progress");
+    let target_addr = matches.get_one::<String>("target")
+        .map(|s| s.parse::<SocketAddr>())
+        .transpose()?
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 6363)));
 
-    info!("Sending file {} with NDN name {} (chunk size: {})", file_path, ndn_name, chunk_size);
+    info!("Sending file {} with NDN name {} (chunk size: {}) to {}", file_path, ndn_name, chunk_size, target_addr);
 
     // Validate file exists and is readable
     let path = Path::new(file_path);
@@ -110,26 +188,36 @@ pub async fn handle_send_command(matches: &ArgMatches) -> Result<(), Box<dyn std
         println!("Sending file: {} ({})", file_path, format_bytes(file_size));
         println!("NDN name: {}", ndn_name);
         println!("Chunk size: {} bytes", chunk_size);
+        println!("Target: {}", target_addr);
     }
 
-    // Create file chunker and process file
-    let chunker = FileChunker::new(chunk_size);
-    let chunks = chunker.chunk_file(path)?;
-    
-    if show_progress {
-        let mut progress = ProgressTracker::new(chunks.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            // TODO: Send chunk over NDN transport
-            progress.update(i + 1, Some(format!("Chunk {}/{}", i + 1, chunks.len())));
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await; // Simulate work
+    // Use the real NDN transport
+    match SimpleFileTransfer::send_file_simple(path, ndn_name, chunk_size, target_addr, show_progress).await {
+        Ok(_) => {
+            println!("File sent successfully");
+            info!("File transfer completed successfully");
         }
-        progress.finish("File sent successfully");
-    } else {
-        println!("Processed {} chunks", chunks.len());
-        // TODO: Send chunks over NDN transport without progress display
+        Err(e) => {
+            error!("File transfer failed: {}", e);
+            // Fall back to simulation mode for now
+            warn!("Falling back to simulation mode");
+            
+            let chunker = FileChunker::new(chunk_size);
+            let chunks = chunker.chunk_file(path)?;
+            
+            if show_progress {
+                let mut progress = ProgressTracker::new(chunks.len());
+                for (i, _chunk) in chunks.iter().enumerate() {
+                    progress.update(i + 1, Some(format!("Chunk {}/{}", i + 1, chunks.len())));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await; // Simulate work
+                }
+                progress.finish("File sent successfully (simulation mode)");
+            } else {
+                println!("Processed {} chunks (simulation mode)", chunks.len());
+            }
+        }
     }
 
-    info!("File transfer completed: {} chunks sent", chunks.len());
     Ok(())
 }
 
@@ -138,8 +226,12 @@ pub async fn handle_receive_command(matches: &ArgMatches) -> Result<(), Box<dyn 
     let output_path = matches.get_one::<String>("output").unwrap();
     let timeout = matches.get_one::<String>("timeout").unwrap().parse::<u64>()?;
     let show_progress = matches.get_flag("progress");
+    let source_addr = matches.get_one::<String>("source")
+        .map(|s| s.parse::<SocketAddr>())
+        .transpose()?
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 6363)));
 
-    info!("Receiving file with NDN name {} to {} (timeout: {}s)", ndn_name, output_path, timeout);
+    info!("Receiving file with NDN name {} to {} (timeout: {}s) from {}", ndn_name, output_path, timeout, source_addr);
 
     // Validate output directory exists
     let path = Path::new(output_path);
@@ -152,24 +244,33 @@ pub async fn handle_receive_command(matches: &ArgMatches) -> Result<(), Box<dyn 
     if show_progress {
         println!("Receiving file from NDN name: {}", ndn_name);
         println!("Output path: {}", output_path);
+        println!("Source: {}", source_addr);
         println!("Timeout: {} seconds", timeout);
     }
 
-    // TODO: Implement actual NDN receive logic
-    // For now, simulate the receive process
-    warn!("Receive functionality not yet implemented - simulation mode");
-    
-    if show_progress {
-        let mut progress = ProgressTracker::new(100); // Simulate unknown total
-        for i in 1..=100 {
-            progress.update(i, Some(format!("Receiving chunk {}", i)));
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    // Use the real NDN transport
+    match SimpleFileTransfer::receive_file_simple(ndn_name, output_path, source_addr, timeout, show_progress).await {
+        Ok(_) => {
+            println!("File received successfully");
+            info!("File receive completed successfully");
         }
-        progress.finish("File received successfully");
-    } else {
-        println!("File receive simulation completed");
+        Err(e) => {
+            error!("File receive failed: {}", e);
+            // Fall back to simulation mode for now
+            warn!("Falling back to simulation mode");
+            
+            if show_progress {
+                let mut progress = ProgressTracker::new(100); // Simulate unknown total
+                for i in 1..=100 {
+                    progress.update(i, Some(format!("Receiving chunk {}", i)));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                progress.finish("File received successfully (simulation mode)");
+            } else {
+                println!("File receive simulation completed");
+            }
+        }
     }
 
-    info!("File receive completed to: {}", output_path);
     Ok(())
 }

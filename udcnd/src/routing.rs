@@ -93,6 +93,8 @@ pub struct RoutingManager {
     running: Arc<RwLock<bool>>,
     /// Transport manager for packet transmission
     transport_manager: Arc<RwLock<TransportManager>>,
+    /// Face to address mapping
+    face_to_addr_map: Arc<RwLock<HashMap<u32, SocketAddr>>>,
 }
 
 impl RoutingManager {
@@ -115,6 +117,40 @@ impl RoutingManager {
             stats: Arc::new(RwLock::new(RoutingStats::default())),
             running: Arc::new(RwLock::new(false)),
             transport_manager,
+            face_to_addr_map: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a face-to-address mapping
+    pub async fn register_face_address(&self, face_id: u32, address: SocketAddr) {
+        let mut face_map = self.face_to_addr_map.write().await;
+        face_map.insert(face_id, address);
+        debug!("Registered face {} -> {}", face_id, address);
+    }
+
+    /// Unregister a face-to-address mapping
+    pub async fn unregister_face_address(&self, face_id: u32) {
+        let mut face_map = self.face_to_addr_map.write().await;
+        if let Some(addr) = face_map.remove(&face_id) {
+            debug!("Unregistered face {} -> {}", face_id, addr);
+        }
+    }
+
+    /// Get the address for a face ID
+    pub async fn get_face_address(&self, face_id: u32) -> Option<SocketAddr> {
+        let face_map = self.face_to_addr_map.read().await;
+        face_map.get(&face_id).copied()
+    }
+
+    /// Convert face ID to SocketAddr with fallback
+    async fn face_id_to_addr(&self, face_id: u32) -> SocketAddr {
+        // Try to get the real address from the face mapping
+        if let Some(addr) = self.get_face_address(face_id).await {
+            addr
+        } else {
+            // Fallback to localhost with face ID as port for compatibility
+            warn!("Face {} not found in address mapping, using fallback", face_id);
+            SocketAddr::from(([127, 0, 0, 1], face_id as u16))
         }
     }
 
@@ -128,8 +164,8 @@ impl RoutingManager {
             stats.fib_lookups += 1;
         }
 
-        // Convert face ID to SocketAddr (placeholder logic)
-        let incoming_addr = SocketAddr::from(([127, 0, 0, 1], incoming_face as u16));
+        // Convert face ID to SocketAddr using face mapping
+        let incoming_addr = self.face_id_to_addr(incoming_face).await;
 
         // Forward Interest using the forwarding engine
         match self.forwarding_engine.process_interest(interest.clone(), incoming_addr).await {
@@ -185,8 +221,8 @@ impl RoutingManager {
     pub async fn process_data(&self, data: Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Processing Data: {} from face {}", data.name, incoming_face);
 
-        // Convert face ID to SocketAddr (placeholder logic)
-        let incoming_addr = SocketAddr::from(([127, 0, 0, 1], incoming_face as u16));
+        // Convert face ID to SocketAddr using face mapping
+        let incoming_addr = self.face_id_to_addr(incoming_face).await;
 
         // Forward Data using the forwarding engine
         match self.forwarding_engine.process_data(data.clone(), incoming_addr).await {

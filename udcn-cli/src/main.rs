@@ -5,6 +5,9 @@ use log::error;
 
 mod commands;
 mod utils;
+mod daemon_client;
+mod node_manager;
+mod file_transfer;
 
 use commands::*;
 
@@ -98,6 +101,14 @@ async fn main() {
                         .long("progress")
                         .help("Show progress bar")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("target")
+                        .short('t')
+                        .long("target")
+                        .value_name("ADDRESS")
+                        .help("Target address (default: 127.0.0.1:6363)")
+                        .default_value("127.0.0.1:6363"),
                 ),
         )
         .subcommand(
@@ -133,6 +144,14 @@ async fn main() {
                         .value_name("SECONDS")
                         .help("Timeout in seconds (default: 30)")
                         .default_value("30"),
+                )
+                .arg(
+                    Arg::new("source")
+                        .short('s')
+                        .long("source")
+                        .value_name("ADDRESS")
+                        .help("Source address (default: 127.0.0.1:6363)")
+                        .default_value("127.0.0.1:6363"),
                 ),
         )
         .get_matches();

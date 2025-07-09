@@ -1838,7 +1838,13 @@ mod tests {
                 assert_eq!(id, session_id);
                 assert_eq!(file_name, "test_file.txt");
             }
-            _ => panic!("Expected TransferStarted event"),
+            actual_event => {
+                assert!(
+                    false,
+                    "Expected TransferStarted event, but got: {:?}",
+                    actual_event
+                );
+            }
         }
     }
 

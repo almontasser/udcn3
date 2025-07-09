@@ -191,20 +191,211 @@ impl PerformanceMonitor {
 
     fn get_memory_usage(&self) -> Result<u64, Box<dyn std::error::Error>> {
         // Platform-specific memory usage collection
-        // This is a placeholder implementation
-        Ok(std::process::id() as u64 * 1024 * 1024) // Mock value
+        #[cfg(target_os = "linux")]
+        {
+            // Read from /proc/self/status for current process memory usage
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let kb_value = parts[1].parse::<u64>()?;
+                        return Ok(kb_value * 1024); // Convert KB to bytes
+                    }
+                }
+            }
+            Ok(0)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Use system call to get memory usage on macOS
+            use std::process::Command;
+            let output = Command::new("ps")
+                .args(&["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()?;
+            let rss_kb = String::from_utf8(output.stdout)?
+                .trim()
+                .parse::<u64>()?;
+            Ok(rss_kb * 1024) // Convert KB to bytes
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows implementation would use GetProcessMemoryInfo
+            // For now, return a fallback value
+            Ok(std::process::id() as u64 * 1024 * 1024)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            // Fallback for other platforms
+            Ok(std::process::id() as u64 * 1024 * 1024)
+        }
     }
 
     fn get_cpu_usage(&self) -> Result<f64, Box<dyn std::error::Error>> {
         // Platform-specific CPU usage collection
-        // This is a placeholder implementation
-        Ok(25.0) // Mock value
+        #[cfg(target_os = "linux")]
+        {
+            // Read from /proc/stat for system-wide CPU usage
+            let stat = std::fs::read_to_string("/proc/stat")?;
+            let cpu_line = stat.lines().next().ok_or("No CPU line found")?;
+            let parts: Vec<&str> = cpu_line.split_whitespace().collect();
+            
+            if parts.len() >= 8 {
+                let user: u64 = parts[1].parse()?;
+                let nice: u64 = parts[2].parse()?;
+                let system: u64 = parts[3].parse()?;
+                let idle: u64 = parts[4].parse()?;
+                let iowait: u64 = parts[5].parse()?;
+                let irq: u64 = parts[6].parse()?;
+                let softirq: u64 = parts[7].parse()?;
+                
+                let total = user + nice + system + idle + iowait + irq + softirq;
+                let total_active = total - idle - iowait;
+                
+                if total > 0 {
+                    Ok((total_active as f64 / total as f64) * 100.0)
+                } else {
+                    Ok(0.0)
+                }
+            } else {
+                Ok(0.0)
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Use system call to get CPU usage on macOS
+            use std::process::Command;
+            let output = Command::new("top")
+                .args(&["-l", "1", "-s", "0", "-n", "0"])
+                .output()?;
+            let output_str = String::from_utf8(output.stdout)?;
+            
+            // Parse the CPU usage line from top output
+            for line in output_str.lines() {
+                if line.contains("CPU usage:") {
+                    // Extract CPU usage percentage
+                    if let Some(start) = line.find("CPU usage:") {
+                        let cpu_part = &line[start..];
+                        if let Some(percent_pos) = cpu_part.find('%') {
+                            let before_percent = &cpu_part[..percent_pos];
+                            if let Some(space_pos) = before_percent.rfind(' ') {
+                                let usage_str = &before_percent[space_pos + 1..];
+                                return Ok(usage_str.parse::<f64>().unwrap_or(0.0));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(0.0)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows implementation would use GetSystemTimes or WMI
+            // For now, return a fallback value
+            Ok(25.0)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            // Fallback for other platforms
+            Ok(25.0)
+        }
     }
 
     fn get_network_utilization(&self) -> Result<f64, Box<dyn std::error::Error>> {
         // Platform-specific network utilization collection
-        // This is a placeholder implementation
-        Ok(30.0) // Mock value
+        #[cfg(target_os = "linux")]
+        {
+            // Read from /proc/net/dev for network interface statistics
+            let net_dev = std::fs::read_to_string("/proc/net/dev")?;
+            let mut total_bytes = 0u64;
+            let mut total_packets = 0u64;
+            
+            for line in net_dev.lines().skip(2) { // Skip header lines
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 10 {
+                    // Skip loopback interface
+                    if parts[0].starts_with("lo:") {
+                        continue;
+                    }
+                    
+                    // RX bytes and packets
+                    if let Ok(rx_bytes) = parts[1].parse::<u64>() {
+                        total_bytes += rx_bytes;
+                    }
+                    if let Ok(rx_packets) = parts[2].parse::<u64>() {
+                        total_packets += rx_packets;
+                    }
+                    
+                    // TX bytes and packets
+                    if let Ok(tx_bytes) = parts[9].parse::<u64>() {
+                        total_bytes += tx_bytes;
+                    }
+                    if let Ok(tx_packets) = parts[10].parse::<u64>() {
+                        total_packets += tx_packets;
+                    }
+                }
+            }
+            
+            // Calculate a rough utilization percentage based on bytes
+            // This is a simplified calculation; real network utilization depends on interface capacity
+            let utilization = if total_bytes > 0 {
+                (total_bytes as f64 / 1000000.0).min(100.0) // Normalize to a percentage
+            } else {
+                0.0
+            };
+            
+            Ok(utilization)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Use netstat to get network statistics on macOS
+            use std::process::Command;
+            let output = Command::new("netstat")
+                .args(&["-ibn"])
+                .output()?;
+            let output_str = String::from_utf8(output.stdout)?;
+            
+            let mut total_bytes = 0u64;
+            for line in output_str.lines().skip(1) { // Skip header
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 7 {
+                    // Skip loopback interface
+                    if parts[0].starts_with("lo") {
+                        continue;
+                    }
+                    
+                    // Input bytes (column 7) and output bytes (column 10)
+                    if let Ok(ibytes) = parts[6].parse::<u64>() {
+                        total_bytes += ibytes;
+                    }
+                    if parts.len() >= 10 {
+                        if let Ok(obytes) = parts[9].parse::<u64>() {
+                            total_bytes += obytes;
+                        }
+                    }
+                }
+            }
+            
+            // Calculate a rough utilization percentage
+            let utilization = if total_bytes > 0 {
+                (total_bytes as f64 / 1000000.0).min(100.0) // Normalize to a percentage
+            } else {
+                0.0
+            };
+            
+            Ok(utilization)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows implementation would use GetIfTable or WMI
+            // For now, return a fallback value
+            Ok(30.0)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            // Fallback for other platforms
+            Ok(30.0)
+        }
     }
 }
 
