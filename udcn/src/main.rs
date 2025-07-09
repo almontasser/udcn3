@@ -5,7 +5,7 @@ use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn, info};
 use tokio::signal;
-use udcn_common::PacketStats;
+use udcn_common::{PacketStats, ContentStoreStats};
 
 mod stats;
 use stats::StatsManager;
@@ -31,6 +31,27 @@ fn display_statistics(stats: &PacketStats) {
              stats.control_packets, stats.parse_errors, stats.memory_errors);
     println!("│ Bytes Processed:   {:<10} │ Packets Redirected: {:<7} │ Processing Time: {:<10} ns │", 
              stats.bytes_processed, stats.packets_redirected, stats.processing_time_ns);
+    println!("╰─────────────────────────────────────────────────────────────────────────────────────╯");
+}
+
+fn display_cs_statistics(cs_stats: &ContentStoreStats) {
+    let hit_ratio = if cs_stats.lookups > 0 {
+        (cs_stats.hits as f64 / cs_stats.lookups as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    println!("╭─────────────────────────────────────────────────────────────────────────────────────╮");
+    println!("│                           Content Store Statistics                                   │");
+    println!("├─────────────────────────────────────────────────────────────────────────────────────┤");
+    println!("│ Total Lookups:     {:<10} │ Cache Hits:     {:<10} │ Cache Misses:    {:<10} │", 
+             cs_stats.lookups, cs_stats.hits, cs_stats.misses);
+    println!("│ Hit Ratio:         {:<7.2}%    │ Insertions:     {:<10} │ Evictions:       {:<10} │", 
+             hit_ratio, cs_stats.insertions, cs_stats.evictions);
+    println!("│ Expirations:       {:<10} │ Current Entries:{:<10} │ Bytes Stored:    {:<10} │", 
+             cs_stats.expirations, cs_stats.current_entries, cs_stats.bytes_stored);
+    println!("│ Max Entries Seen:  {:<10} │ Cleanups:       {:<10} │                          │", 
+             cs_stats.max_entries_reached, cs_stats.cleanups);
     println!("╰─────────────────────────────────────────────────────────────────────────────────────╯");
 }
 
@@ -71,9 +92,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("XDP program attached successfully to interface {}", iface);
 
-    // Get the statistics map and create manager
+    // Get the statistics maps and create manager
     let stats_map: HashMap<_, u32, PacketStats> = ebpf.map("PACKET_STATS").unwrap().try_into()?;
-    let mut stats_manager = StatsManager::new(stats_map);
+    let cs_stats_map: HashMap<_, u32, ContentStoreStats> = ebpf.map("CS_STATS").unwrap().try_into()?;
+    let mut stats_manager = StatsManager::with_cs_stats(stats_map, cs_stats_map);
     
     println!("UDCN XDP program is running. Press Ctrl-C to stop.");
     println!("Statistics will be displayed every {} seconds.\n", stats_interval);
@@ -93,10 +115,27 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(rates) = stats_manager.get_rates() {
                             println!("Rates: {}", rates.format());
                         }
+                        
+                        // Display Content Store statistics
+                        match stats_manager.get_current_cs_stats() {
+                            Ok(cs_stats) => {
+                                display_cs_statistics(&cs_stats);
+                                
+                                // Also display CS rates
+                                if let Ok(cs_rates) = stats_manager.get_cs_rates() {
+                                    println!("CS Rates: {}", cs_rates.format());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to get Content Store statistics: {}", e);
+                                display_cs_statistics(&ContentStoreStats::new());
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to get statistics: {}", e);
                         display_statistics(&PacketStats::new());
+                        display_cs_statistics(&ContentStoreStats::new());
                     }
                 }
             }
@@ -113,14 +152,27 @@ async fn main() -> anyhow::Result<()> {
             println!("\nFinal Statistics:");
             display_statistics(&stats);
             
+            // Display final Content Store statistics
+            match stats_manager.get_current_cs_stats() {
+                Ok(cs_stats) => {
+                    display_cs_statistics(&cs_stats);
+                }
+                Err(e) => {
+                    warn!("Failed to get final Content Store statistics: {}", e);
+                    display_cs_statistics(&ContentStoreStats::new());
+                }
+            }
+            
             // Export final statistics as JSON
-            if let Ok(json) = stats_manager.get_stats_json() {
-                println!("\nStatistics JSON:");
+            if let Ok(json) = stats_manager.get_combined_stats_json() {
+                println!("\nCombined Statistics JSON:");
                 println!("{}", json);
             }
         }
         Err(e) => {
             println!("\nFailed to get final statistics: {}", e);
+            display_statistics(&PacketStats::new());
+            display_cs_statistics(&ContentStoreStats::new());
         }
     }
 

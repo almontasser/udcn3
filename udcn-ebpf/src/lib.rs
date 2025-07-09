@@ -2,7 +2,7 @@
 
 // This file exists to enable the library target and contains testable PIT logic.
 
-use udcn_common::{PitEntry, PitStats, FaceInfo, PitFaceEntry, MAX_ADDITIONAL_FACES};
+use udcn_common::{PitEntry, PitStats, FaceInfo, MAX_ADDITIONAL_FACES};
 use udcn_common::{PIT_STATE_ACTIVE, PIT_STATE_SATISFIED, PIT_STATE_EXPIRED};
 
 /// PIT logic that can be tested independently of eBPF infrastructure
@@ -10,7 +10,7 @@ pub mod pit_logic {
     use super::*;
 
     /// Validate PIT entry creation parameters
-    pub fn validate_pit_entry_params(name_hash: u64, face_id: u32, nonce: u32, expiry_time: u64) -> Result<(), &'static str> {
+    pub fn validate_pit_entry_params(name_hash: u64, face_id: u32, _nonce: u32, expiry_time: u64) -> Result<(), &'static str> {
         if name_hash == 0 {
             return Err("Name hash cannot be zero");
         }

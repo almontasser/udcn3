@@ -53,7 +53,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 debug = true
 opt-level = 0
 overflow-checks = true
-panic = "unwind"
+panic = "abort"
 incremental = true
 
 [profile.release]

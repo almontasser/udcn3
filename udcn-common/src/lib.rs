@@ -440,6 +440,150 @@ pub const FACE_STATE_UP: u8 = 0x01;
 pub const FACE_STATE_DOWN: u8 = 0x02;
 pub const FACE_STATE_CONGESTED: u8 = 0x04;
 
+/// Maximum Content Store entries
+pub const MAX_CS_ENTRIES: usize = 4096;
+
+/// Content Store entry timeout in nanoseconds (1 hour)
+pub const CS_ENTRY_TIMEOUT_NS: u64 = 3_600_000_000_000;
+
+/// Maximum content size per entry (64KB)
+pub const MAX_CONTENT_SIZE: usize = 65536;
+
+/// Content Store cleanup interval in entries processed
+pub const CS_CLEANUP_INTERVAL: u32 = 100;
+
+/// Content Store cleanup batch size
+pub const CS_CLEANUP_BATCH_SIZE: u32 = 10;
+
+/// Content Store Entry structure - optimized for memory efficiency
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ContentStoreEntry {
+    /// Name hash for fast lookup (64-bit for collision resistance)
+    pub name_hash: u64,
+    /// Creation timestamp (combined with expiry for space efficiency)
+    pub created_time: u64,
+    /// Last access timestamp (for LRU calculation)
+    pub last_access_time: u64,
+    /// Expiration timestamp (based on FreshnessPeriod)
+    pub expiry_time: u64,
+    /// Data packet hash for integrity verification
+    pub data_hash: u64,
+    /// Data packet size in bytes
+    pub data_size: u32,
+    /// Hit count for popularity tracking (32-bit sufficient for most use cases)
+    pub hit_count: u32,
+    /// LRU sequence number for eviction (32-bit with wraparound handling)
+    pub lru_sequence: u32,
+    /// Content type/format identifier (16-bit sufficient for NDN content types)
+    pub content_type: u16,
+    /// Entry state flags (8-bit sufficient for state representation)
+    pub state: u8,
+    /// Reserved byte for future use or alignment
+    pub _reserved: u8,
+}
+
+impl ContentStoreEntry {
+    pub const fn new() -> Self {
+        Self {
+            name_hash: 0,
+            data_size: 0,
+            content_type: 0,
+            state: 0,
+            _reserved: 0,
+            hit_count: 0,
+            lru_sequence: 0,
+            created_time: 0,
+            last_access_time: 0,
+            expiry_time: 0,
+            data_hash: 0,
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for ContentStoreEntry {}
+
+/// Content Store statistics
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ContentStoreStats {
+    /// Total lookups performed
+    pub lookups: u64,
+    /// Cache hits
+    pub hits: u64,
+    /// Cache misses
+    pub misses: u64,
+    /// Entries inserted
+    pub insertions: u64,
+    /// Entries evicted (LRU)
+    pub evictions: u64,
+    /// Entries expired
+    pub expirations: u64,
+    /// Current number of entries
+    pub current_entries: u64,
+    /// Total bytes stored
+    pub bytes_stored: u64,
+    /// Maximum entries reached
+    pub max_entries_reached: u64,
+    /// Cleanup operations performed
+    pub cleanups: u64,
+}
+
+impl ContentStoreStats {
+    pub const fn new() -> Self {
+        Self {
+            lookups: 0,
+            hits: 0,
+            misses: 0,
+            insertions: 0,
+            evictions: 0,
+            expirations: 0,
+            current_entries: 0,
+            bytes_stored: 0,
+            max_entries_reached: 0,
+            cleanups: 0,
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for ContentStoreStats {}
+
+/// Content Store entry state flags
+pub const CS_STATE_VALID: u8 = 0x01;
+pub const CS_STATE_STALE: u8 = 0x02;
+pub const CS_STATE_PENDING: u8 = 0x04;
+pub const CS_STATE_MARKED_FOR_EVICTION: u8 = 0x08;
+
+/// LRU tracking structure for Content Store
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LruState {
+    /// Global LRU sequence counter
+    pub sequence_counter: u32,
+    /// Minimum sequence number in cache
+    pub min_sequence: u32,
+    /// Maximum sequence number in cache
+    pub max_sequence: u32,
+    /// Reserved for future use
+    pub _reserved: u32,
+}
+
+impl LruState {
+    pub const fn new() -> Self {
+        Self {
+            sequence_counter: 0,
+            min_sequence: 0,
+            max_sequence: 0,
+            _reserved: 0,
+        }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for LruState {}
+
 /// Error codes for UDCN operations
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,4 +614,10 @@ pub enum UdcnError {
     InterestExpired = 11,
     /// Face not found
     FaceNotFound = 12,
+    /// Content Store entry not found
+    CsEntryNotFound = 13,
+    /// Content Store full
+    CsTableFull = 14,
+    /// Content too large
+    ContentTooLarge = 15,
 }

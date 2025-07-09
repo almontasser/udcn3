@@ -1,11 +1,13 @@
 use aya::maps::HashMap;
-use udcn_common::PacketStats;
+use udcn_common::{PacketStats, ContentStoreStats};
 use std::time::{Duration, Instant};
 
 /// Statistics manager for UDCN eBPF programs
 pub struct StatsManager<'a> {
     stats_map: HashMap<&'a aya::maps::MapData, u32, PacketStats>,
+    cs_stats_map: Option<HashMap<&'a aya::maps::MapData, u32, ContentStoreStats>>,
     last_stats: Option<PacketStats>,
+    last_cs_stats: Option<ContentStoreStats>,
     last_update: Option<Instant>,
 }
 
@@ -14,7 +16,23 @@ impl<'a> StatsManager<'a> {
     pub fn new(stats_map: HashMap<&'a aya::maps::MapData, u32, PacketStats>) -> Self {
         Self {
             stats_map,
+            cs_stats_map: None,
             last_stats: None,
+            last_cs_stats: None,
+            last_update: None,
+        }
+    }
+
+    /// Create a new statistics manager with content store statistics
+    pub fn with_cs_stats(
+        stats_map: HashMap<&'a aya::maps::MapData, u32, PacketStats>,
+        cs_stats_map: HashMap<&'a aya::maps::MapData, u32, ContentStoreStats>,
+    ) -> Self {
+        Self {
+            stats_map,
+            cs_stats_map: Some(cs_stats_map),
+            last_stats: None,
+            last_cs_stats: None,
             last_update: None,
         }
     }
@@ -30,6 +48,23 @@ impl<'a> StatsManager<'a> {
         self.last_update = Some(Instant::now());
         
         Ok(stats)
+    }
+
+    /// Get current Content Store statistics from the eBPF map
+    pub fn get_current_cs_stats(&mut self) -> Result<ContentStoreStats, Box<dyn std::error::Error>> {
+        if let Some(ref cs_stats_map) = self.cs_stats_map {
+            let stats = match cs_stats_map.get(&0, 0) {
+                Ok(stats) => stats,
+                Err(_) => ContentStoreStats::new(),
+            };
+            
+            self.last_cs_stats = Some(stats);
+            self.last_update = Some(Instant::now());
+            
+            Ok(stats)
+        } else {
+            Ok(ContentStoreStats::new())
+        }
     }
 
     /// Get statistics formatted as JSON
@@ -48,6 +83,66 @@ impl<'a> StatsManager<'a> {
             "control_packets": stats.control_packets,
             "parse_errors": stats.parse_errors,
             "memory_errors": stats.memory_errors,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        
+        Ok(json.to_string())
+    }
+
+    /// Get Content Store statistics formatted as JSON
+    pub fn get_cs_stats_json(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let cs_stats = self.get_current_cs_stats()?;
+        let json = serde_json::json!({
+            "lookups": cs_stats.lookups,
+            "hits": cs_stats.hits,
+            "misses": cs_stats.misses,
+            "hit_ratio": if cs_stats.lookups > 0 { cs_stats.hits as f64 / cs_stats.lookups as f64 } else { 0.0 },
+            "insertions": cs_stats.insertions,
+            "evictions": cs_stats.evictions,
+            "expirations": cs_stats.expirations,
+            "current_entries": cs_stats.current_entries,
+            "bytes_stored": cs_stats.bytes_stored,
+            "max_entries_reached": cs_stats.max_entries_reached,
+            "cleanups": cs_stats.cleanups,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        
+        Ok(json.to_string())
+    }
+
+    /// Get combined statistics (both packet and content store) formatted as JSON
+    pub fn get_combined_stats_json(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let stats = self.get_current_stats()?;
+        let cs_stats = self.get_current_cs_stats()?;
+        
+        let json = serde_json::json!({
+            "packet_stats": {
+                "packets_processed": stats.packets_processed,
+                "packets_dropped": stats.packets_dropped,
+                "packets_passed": stats.packets_passed,
+                "packets_redirected": stats.packets_redirected,
+                "bytes_processed": stats.bytes_processed,
+                "processing_time_ns": stats.processing_time_ns,
+                "interest_packets": stats.interest_packets,
+                "data_packets": stats.data_packets,
+                "nack_packets": stats.nack_packets,
+                "control_packets": stats.control_packets,
+                "parse_errors": stats.parse_errors,
+                "memory_errors": stats.memory_errors,
+            },
+            "content_store_stats": {
+                "lookups": cs_stats.lookups,
+                "hits": cs_stats.hits,
+                "misses": cs_stats.misses,
+                "hit_ratio": if cs_stats.lookups > 0 { cs_stats.hits as f64 / cs_stats.lookups as f64 } else { 0.0 },
+                "insertions": cs_stats.insertions,
+                "evictions": cs_stats.evictions,
+                "expirations": cs_stats.expirations,
+                "current_entries": cs_stats.current_entries,
+                "bytes_stored": cs_stats.bytes_stored,
+                "max_entries_reached": cs_stats.max_entries_reached,
+                "cleanups": cs_stats.cleanups,
+            },
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
         
@@ -93,11 +188,61 @@ impl<'a> StatsManager<'a> {
         }
     }
 
+    /// Calculate Content Store rates (lookups per second, hit ratio, etc.) since last update
+    pub fn get_cs_rates(&mut self) -> Result<ContentStoreRates, Box<dyn std::error::Error>> {
+        let current_cs_stats = self.get_current_cs_stats()?;
+        let current_time = Instant::now();
+        
+        if let (Some(last_cs_stats), Some(last_time)) = (self.last_cs_stats, self.last_update) {
+            let time_diff = current_time.duration_since(last_time).as_secs_f64();
+            
+            if time_diff > 0.0 {
+                let lookups_per_sec = (current_cs_stats.lookups - last_cs_stats.lookups) as f64 / time_diff;
+                let hits_per_sec = (current_cs_stats.hits - last_cs_stats.hits) as f64 / time_diff;
+                let misses_per_sec = (current_cs_stats.misses - last_cs_stats.misses) as f64 / time_diff;
+                let insertions_per_sec = (current_cs_stats.insertions - last_cs_stats.insertions) as f64 / time_diff;
+                let evictions_per_sec = (current_cs_stats.evictions - last_cs_stats.evictions) as f64 / time_diff;
+                let hit_ratio = if current_cs_stats.lookups > 0 { 
+                    current_cs_stats.hits as f64 / current_cs_stats.lookups as f64 
+                } else { 
+                    0.0 
+                };
+                
+                return Ok(ContentStoreRates {
+                    lookups_per_sec,
+                    hits_per_sec,
+                    misses_per_sec,
+                    insertions_per_sec,
+                    evictions_per_sec,
+                    hit_ratio,
+                    time_period: time_diff,
+                });
+            }
+        }
+        
+        let hit_ratio = if current_cs_stats.lookups > 0 { 
+            current_cs_stats.hits as f64 / current_cs_stats.lookups as f64 
+        } else { 
+            0.0 
+        };
+        
+        Ok(ContentStoreRates {
+            lookups_per_sec: 0.0,
+            hits_per_sec: 0.0,
+            misses_per_sec: 0.0,
+            insertions_per_sec: 0.0,
+            evictions_per_sec: 0.0,
+            hit_ratio,
+            time_period: 0.0,
+        })
+    }
+
     /// Reset statistics counters in the eBPF map
     pub fn reset_stats(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Note: For now, we can't reset the eBPF map from userspace easily
         // This would require a more complex implementation
         self.last_stats = Some(PacketStats::new());
+        self.last_cs_stats = Some(ContentStoreStats::new());
         self.last_update = Some(Instant::now());
         Ok(())
     }
@@ -112,6 +257,18 @@ pub struct StatsRates {
     pub time_period: f64,
 }
 
+/// Content Store statistics rates structure
+#[derive(Debug, Clone)]
+pub struct ContentStoreRates {
+    pub lookups_per_sec: f64,
+    pub hits_per_sec: f64,
+    pub misses_per_sec: f64,
+    pub insertions_per_sec: f64,
+    pub evictions_per_sec: f64,
+    pub hit_ratio: f64,
+    pub time_period: f64,
+}
+
 impl StatsRates {
     /// Format rates as a human-readable string
     pub fn format(&self) -> String {
@@ -120,6 +277,22 @@ impl StatsRates {
             self.packets_per_sec,
             self.bytes_per_sec,
             self.dropped_per_sec,
+            self.time_period
+        )
+    }
+}
+
+impl ContentStoreRates {
+    /// Format Content Store rates as a human-readable string
+    pub fn format(&self) -> String {
+        format!(
+            "Lookups/sec: {:.2}, Hits/sec: {:.2}, Misses/sec: {:.2}, Hit ratio: {:.2}%, Insertions/sec: {:.2}, Evictions/sec: {:.2} (over {:.2}s)",
+            self.lookups_per_sec,
+            self.hits_per_sec,
+            self.misses_per_sec,
+            self.hit_ratio * 100.0,
+            self.insertions_per_sec,
+            self.evictions_per_sec,
             self.time_period
         )
     }
