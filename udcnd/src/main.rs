@@ -6,6 +6,7 @@ use tokio::signal;
 
 mod config;
 mod daemon;
+mod ebpf;
 mod service;
 
 use config::Config;

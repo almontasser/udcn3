@@ -21,6 +21,7 @@ pub struct NetworkConfig {
     pub bind_address: String,
     pub port: u16,
     pub max_connections: usize,
+    pub interface: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,7 @@ impl Default for Config {
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
                 max_connections: 1000,
+                interface: "eth0".to_string(),
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
