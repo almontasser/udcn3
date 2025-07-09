@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(feature = "user")]
+use aya::Pod;
+
 /// Maximum length for UDCN names
 pub const MAX_NAME_LENGTH: usize = 256;
 
@@ -79,6 +82,9 @@ impl PacketStats {
     }
 }
 
+#[cfg(feature = "user")]
+unsafe impl Pod for PacketStats {}
+
 /// Packet metadata structure shared between kernel and userspace
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +139,9 @@ impl PacketMetadata {
         }
     }
 }
+
+#[cfg(feature = "user")]
+unsafe impl Pod for PacketMetadata {}
 
 /// Configuration structure for UDCN eBPF programs
 #[repr(C)]

@@ -362,6 +362,7 @@ dependencies = [
  "android-tzdata",
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -1888,10 +1889,12 @@ dependencies = [
  "aya",
  "aya-build",
  "aya-log",
+ "chrono",
  "clap",
  "env_logger 0.11.8",
  "libc",
  "log",
+ "serde_json",
  "tokio",
  "udcn-common",
  "udcn-ebpf",
