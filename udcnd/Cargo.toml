@@ -13,6 +13,7 @@ aya = { workspace = true }
 aya-log = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+libc = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 clap = { workspace = true }
@@ -27,3 +28,8 @@ notify = "6.0"
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
 udcn-transport = { path = "../udcn-transport" }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+udcn-ebpf = { path = "../udcn-ebpf" }

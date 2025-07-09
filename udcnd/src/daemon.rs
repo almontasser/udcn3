@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
@@ -14,7 +14,7 @@ use crate::protocols::NdnOspfHandler;
 
 pub struct Daemon {
     config: Config,
-    ebpf_manager: Option<EbpfManager>,
+    ebpf_manager: Option<Arc<EbpfManager>>,
     face_manager: Option<Arc<FaceManager>>,
     routing_manager: Option<Arc<RoutingManager>>,
     control_plane_manager: Option<Arc<ControlPlaneManager>>,
@@ -52,10 +52,11 @@ impl Daemon {
             return Err(e);
         }
 
-        self.ebpf_manager = Some(ebpf_manager);
+        let ebpf_manager = Arc::new(ebpf_manager);
+        self.ebpf_manager = Some(ebpf_manager.clone());
 
         // Initialize Face Manager with eBPF integration
-        let face_manager = Arc::new(FaceManager::new());
+        let face_manager = Arc::new(FaceManager::new().with_ebpf_manager(ebpf_manager.clone()));
         
         // Start the face manager service
         if let Err(e) = face_manager.start().await {
@@ -72,6 +73,12 @@ impl Daemon {
         // Start the routing manager service
         if let Err(e) = routing_manager.start().await {
             error!("Failed to start Routing Manager: {}", e);
+            return Err(e);
+        }
+        
+        // Load FIB entries from configuration
+        if let Err(e) = self.load_fib_entries(&routing_manager).await {
+            error!("Failed to load FIB entries: {}", e);
             return Err(e);
         }
         
@@ -140,9 +147,17 @@ impl Daemon {
         self.face_manager = None;
 
         // Unload eBPF program
-        if let Some(ref mut ebpf_manager) = self.ebpf_manager {
-            if let Err(e) = ebpf_manager.unload_program().await {
-                error!("Failed to unload eBPF program: {}", e);
+        if let Some(ebpf_manager) = self.ebpf_manager.take() {
+            // Extract the manager from Arc to get mutable access
+            match Arc::try_unwrap(ebpf_manager) {
+                Ok(mut manager) => {
+                    if let Err(e) = manager.unload_program().await {
+                        error!("Failed to unload eBPF program: {}", e);
+                    }
+                }
+                Err(_) => {
+                    error!("Failed to get exclusive access to eBPF manager for unloading");
+                }
             }
         }
         self.ebpf_manager = None;
@@ -179,6 +194,13 @@ impl Daemon {
                         error!("Failed to update routing configuration: {}", e);
                         return Err(e);
                     }
+                    
+                    // Reload FIB entries from updated configuration
+                    if let Err(e) = self.load_fib_entries(routing_manager).await {
+                        error!("Failed to reload FIB entries: {}", e);
+                        return Err(e);
+                    }
+                    
                     info!("Applied network configuration changes to Routing Manager");
                 }
                 
@@ -253,6 +275,12 @@ impl Daemon {
                             routing_manager.update_config(routing_config).await?;
                         }
                     },
+                    crate::config::ConfigSection::Routing => {
+                        // Apply routing configuration changes
+                        if let Some(ref routing_manager) = self.routing_manager {
+                            self.load_fib_entries(routing_manager).await?;
+                        }
+                    },
                     crate::config::ConfigSection::Logging => {
                         self.apply_logging_config();
                     },
@@ -268,6 +296,7 @@ impl Daemon {
                                 ..Default::default()
                             };
                             routing_manager.update_config(routing_config).await?;
+                            self.load_fib_entries(routing_manager).await?;
                         }
                     }
                 }
@@ -586,5 +615,73 @@ impl Daemon {
             Some(manager) => manager.is_running(),
             None => false,
         }
+    }
+
+    /// Load FIB entries from configuration
+    async fn load_fib_entries(&self, routing_manager: &RoutingManager) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Loading FIB entries from configuration");
+        
+        // Convert default strategy string to RoutingStrategy enum
+        let default_strategy = match self.config.routing.default_strategy.as_str() {
+            "BestRoute" => RoutingStrategy::BestRoute,
+            "Multicast" => RoutingStrategy::Multicast,
+            "Broadcast" => RoutingStrategy::Broadcast,
+            "LoadBalancing" => RoutingStrategy::LoadBalancing,
+            _ => {
+                warn!("Unknown routing strategy '{}', using BestRoute", self.config.routing.default_strategy);
+                RoutingStrategy::BestRoute
+            }
+        };
+        
+        // Update routing configuration
+        let routing_config = RoutingConfig {
+            default_strategy,
+            enable_interest_aggregation: self.config.routing.enable_interest_aggregation,
+            enable_content_store: self.config.routing.enable_content_store,
+            max_next_hops: self.config.routing.max_next_hops,
+            pit_lifetime_ms: self.config.routing.pit_lifetime_ms,
+            content_store_size: self.config.routing.content_store_size,
+        };
+        
+        routing_manager.update_config(routing_config).await?;
+        
+        // Load FIB entries
+        let mut loaded_entries = 0;
+        let mut skipped_entries = 0;
+        
+        for entry in &self.config.routing.fib_entries {
+            if !entry.enabled {
+                debug!("Skipping disabled FIB entry: {}", entry.prefix);
+                skipped_entries += 1;
+                continue;
+            }
+            
+            // Parse next hop address
+            let next_hop_addr = match entry.next_hop.parse::<SocketAddr>() {
+                Ok(addr) => addr,
+                Err(e) => {
+                    error!("Invalid next hop address '{}' for FIB entry '{}': {}", 
+                           entry.next_hop, entry.prefix, e);
+                    skipped_entries += 1;
+                    continue;
+                }
+            };
+            
+            // Add FIB entry
+            if let Err(e) = routing_manager.add_fib_entry(&entry.prefix, next_hop_addr, entry.cost).await {
+                error!("Failed to add FIB entry '{}' -> '{}': {}", 
+                       entry.prefix, entry.next_hop, e);
+                skipped_entries += 1;
+            } else {
+                debug!("Added FIB entry: {} -> {} (cost: {})", 
+                       entry.prefix, entry.next_hop, entry.cost);
+                loaded_entries += 1;
+            }
+        }
+        
+        info!("FIB configuration loaded: {} entries loaded, {} skipped", 
+              loaded_entries, skipped_entries);
+        
+        Ok(())
     }
 }

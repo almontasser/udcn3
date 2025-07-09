@@ -2215,10 +2215,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aya",
+ "aya-build",
  "aya-log",
  "clap",
  "env_logger 0.11.8",
  "futures",
+ "libc",
  "log",
  "notify",
  "serde",
@@ -2228,6 +2230,7 @@ dependencies = [
  "tracing",
  "udcn-common",
  "udcn-core",
+ "udcn-ebpf",
  "udcn-transport",
 ]
 

@@ -752,7 +752,7 @@
         "dependencies": [
           13
         ],
-        "status": "in-progress",
+        "status": "done",
         "subtasks": [
           {
             "id": 1,
@@ -1135,7 +1135,7 @@
     ],
     "metadata": {
       "created": "2025-07-07T14:00:07.094Z",
-      "updated": "2025-07-09T08:38:01.832Z",
+      "updated": "2025-07-09T09:08:07.052Z",
       "description": "Tasks for master context"
     }
   }

@@ -9,6 +9,7 @@ use udcn_core::packets::{Interest, Data};
 use udcn_transport::{NdnForwardingEngine, ForwardingConfig, ForwardingDecision};
 
 use crate::service::Service;
+use crate::transport_manager::{TransportManager, TransportConfig};
 
 /// Routing strategy type
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,6 +71,12 @@ pub struct RoutingStats {
     pub cs_hits: u64,
     /// Number of FIB lookups
     pub fib_lookups: u64,
+    /// Total number of packets sent
+    pub packets_sent: u64,
+    /// Total bytes sent
+    pub bytes_sent: u64,
+    /// Total Data packets sent
+    pub data_sent: u64,
 }
 
 /// Routing Manager service for NDN packet forwarding
@@ -84,6 +91,8 @@ pub struct RoutingManager {
     stats: Arc<RwLock<RoutingStats>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
+    /// Transport manager for packet transmission
+    transport_manager: Arc<RwLock<TransportManager>>,
 }
 
 impl RoutingManager {
@@ -92,12 +101,20 @@ impl RoutingManager {
         let forwarding_config = ForwardingConfig::default();
         let forwarding_engine = Arc::new(NdnForwardingEngine::new(local_address, forwarding_config));
         
+        // Create transport manager with local address port
+        let transport_config = TransportConfig {
+            local_port: local_address.port(),
+            ..Default::default()
+        };
+        let transport_manager = Arc::new(RwLock::new(TransportManager::new(transport_config)));
+        
         Self {
             forwarding_engine,
             config: Arc::new(RwLock::new(RoutingConfig::default())),
             strategy_table: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(RoutingStats::default())),
             running: Arc::new(RwLock::new(false)),
+            transport_manager,
         }
     }
 
@@ -265,17 +282,42 @@ impl RoutingManager {
 
     /// Send Interest to a specific address
     async fn send_interest_to_addr(&self, interest: &Interest, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Implement actual Interest sending through network transport
-        // For now, this is a placeholder that logs the action
         debug!("Sending Interest {} to address {}", interest.name, addr);
+        
+        // Use transport manager to send the Interest
+        let transport_manager = self.transport_manager.read().await;
+        let bytes_sent = transport_manager.send_interest(interest, addr).await?;
+        
+        debug!("Sent {} bytes for Interest {} to {}", bytes_sent, interest.name, addr);
+        
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.packets_sent += 1;
+            stats.bytes_sent += bytes_sent as u64;
+        }
+        
         Ok(())
     }
 
     /// Send Data to a specific address
     async fn send_data_to_addr(&self, data: &Data, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Implement actual Data sending through network transport
-        // For now, this is a placeholder that logs the action
         debug!("Sending Data {} to address {}", data.name, addr);
+        
+        // Use transport manager to send the Data
+        let transport_manager = self.transport_manager.read().await;
+        let bytes_sent = transport_manager.send_data(data, addr).await?;
+        
+        debug!("Sent {} bytes for Data {} to {}", bytes_sent, data.name, addr);
+        
+        // Update statistics
+        {
+            let mut stats = self.stats.write().await;
+            stats.packets_sent += 1;
+            stats.bytes_sent += bytes_sent as u64;
+            stats.data_sent += 1;
+        }
+        
         Ok(())
     }
 
@@ -314,14 +356,19 @@ impl Service for RoutingManager {
     async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting Routing Manager");
         
+        // Start transport manager
+        {
+            let mut transport_manager = self.transport_manager.write().await;
+            transport_manager.start().await?;
+        }
+        
         // Mark as running
         {
             let mut running = self.running.write().await;
             *running = true;
         }
 
-        // Initialize default FIB entries if needed
-        // TODO: Load FIB entries from configuration
+        // Load FIB entries from configuration will be done by the daemon
         
         info!("Routing Manager started successfully");
         Ok(())
@@ -334,6 +381,12 @@ impl Service for RoutingManager {
         {
             let mut running = self.running.write().await;
             *running = false;
+        }
+        
+        // Stop transport manager
+        {
+            let mut transport_manager = self.transport_manager.write().await;
+            transport_manager.stop().await?;
         }
 
         info!("Routing Manager stopped successfully");

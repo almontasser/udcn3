@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub daemon: DaemonConfig,
     pub network: NetworkConfig,
+    pub routing: RoutingConfigSection,
     pub logging: LoggingConfig,
     #[serde(skip)]
     pub runtime: RuntimeConfig,
@@ -25,6 +26,25 @@ pub struct NetworkConfig {
     pub port: u16,
     pub max_connections: usize,
     pub interface: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfigSection {
+    pub fib_entries: Vec<FibEntry>,
+    pub default_strategy: String,
+    pub enable_interest_aggregation: bool,
+    pub enable_content_store: bool,
+    pub max_next_hops: usize,
+    pub pit_lifetime_ms: u64,
+    pub content_store_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FibEntry {
+    pub prefix: String,
+    pub next_hop: String,
+    pub cost: u32,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +91,7 @@ pub struct ConfigPolicy {
 pub enum ConfigSection {
     Daemon,
     Network,
+    Routing,
     Logging,
     All,
 }
@@ -128,6 +149,14 @@ impl Default for ConfigManager {
             section: ConfigSection::Logging,
             hot_reload_allowed: true,
             validation_required: false,
+            admin_only: false,
+            restart_required: false,
+        });
+        
+        policies.insert(ConfigSection::Routing, ConfigPolicy {
+            section: ConfigSection::Routing,
+            hot_reload_allowed: true,
+            validation_required: true,
             admin_only: false,
             restart_required: false,
         });
@@ -259,6 +288,10 @@ impl ConfigAdmin {
                 toml::to_string_pretty(&config.logging)
                     .map_err(|e| ConfigError::ValidationFailed(format!("Failed to serialize logging config: {}", e)))
             },
+            ConfigSection::Routing => {
+                toml::to_string_pretty(&config.routing)
+                    .map_err(|e| ConfigError::ValidationFailed(format!("Failed to serialize routing config: {}", e)))
+            },
             ConfigSection::All => config.to_toml(),
         }
     }
@@ -299,6 +332,11 @@ impl ConfigAdmin {
                 let logging_config: LoggingConfig = toml::from_str(toml_str)
                     .map_err(|e| ConfigError::ValidationFailed(format!("Failed to parse logging config: {}", e)))?;
                 config.logging = logging_config;
+            },
+            ConfigSection::Routing => {
+                let routing_config: RoutingConfigSection = toml::from_str(toml_str)
+                    .map_err(|e| ConfigError::ValidationFailed(format!("Failed to parse routing config: {}", e)))?;
+                config.routing = routing_config;
             },
             ConfigSection::All => {
                 return self.update_config(toml_str).map(|_| true);
@@ -368,6 +406,22 @@ impl Default for Config {
                 max_connections: 1000,
                 interface: "eth0".to_string(),
             },
+            routing: RoutingConfigSection {
+                fib_entries: vec![
+                    FibEntry {
+                        prefix: "/".to_string(),
+                        next_hop: "127.0.0.1:6363".to_string(),
+                        cost: 1,
+                        enabled: true,
+                    },
+                ],
+                default_strategy: "BestRoute".to_string(),
+                enable_interest_aggregation: true,
+                enable_content_store: true,
+                max_next_hops: 10,
+                pit_lifetime_ms: 4000,
+                content_store_size: 1000,
+            },
             logging: LoggingConfig {
                 level: "info".to_string(),
                 file: None,
@@ -425,6 +479,7 @@ impl Config {
         // Apply new configuration
         self.daemon = new_config.daemon;
         self.network = new_config.network;
+        self.routing = new_config.routing;
         self.logging = new_config.logging;
         self.runtime.last_reload = std::time::SystemTime::now();
         self.runtime.reload_count += 1;
@@ -445,6 +500,13 @@ impl Config {
         if let Some(policy) = manager.policies.get(&ConfigSection::Network) {
             if policy.validation_required {
                 self.validate_network_config()?;
+            }
+        }
+
+        // Validate routing configuration
+        if let Some(policy) = manager.policies.get(&ConfigSection::Routing) {
+            if policy.validation_required {
+                self.validate_routing_config()?;
             }
         }
 
@@ -481,6 +543,7 @@ impl Config {
             Some(backup) => {
                 self.daemon = backup.daemon;
                 self.network = backup.network;
+                self.routing = backup.routing;
                 self.logging = backup.logging;
                 self.runtime.last_reload = std::time::SystemTime::now();
                 Ok(())
@@ -526,6 +589,7 @@ impl Config {
         // Apply changes
         self.daemon = new_config.daemon;
         self.network = new_config.network;
+        self.routing = new_config.routing;
         self.logging = new_config.logging;
         self.runtime.last_reload = std::time::SystemTime::now();
 
@@ -576,6 +640,58 @@ impl Config {
         // Validate interface name
         if self.network.interface.is_empty() {
             return Err(ConfigError::ValidationFailed("Interface name cannot be empty".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Validate routing configuration
+    fn validate_routing_config(&self) -> Result<(), ConfigError> {
+        // Validate default strategy
+        let valid_strategies = ["BestRoute", "Multicast", "Broadcast", "LoadBalancing"];
+        if !valid_strategies.contains(&self.routing.default_strategy.as_str()) {
+            return Err(ConfigError::ValidationFailed(
+                format!("Invalid default strategy: {}. Valid strategies: {:?}", 
+                       self.routing.default_strategy, valid_strategies)
+            ));
+        }
+
+        // Validate max_next_hops
+        if self.routing.max_next_hops == 0 {
+            return Err(ConfigError::ValidationFailed("Max next hops cannot be 0".to_string()));
+        }
+
+        // Validate pit_lifetime_ms
+        if self.routing.pit_lifetime_ms == 0 {
+            return Err(ConfigError::ValidationFailed("PIT lifetime cannot be 0".to_string()));
+        }
+
+        // Validate content_store_size
+        if self.routing.content_store_size == 0 {
+            return Err(ConfigError::ValidationFailed("Content store size cannot be 0".to_string()));
+        }
+
+        // Validate FIB entries
+        for (index, entry) in self.routing.fib_entries.iter().enumerate() {
+            if entry.prefix.is_empty() {
+                return Err(ConfigError::ValidationFailed(
+                    format!("FIB entry {} has empty prefix", index)
+                ));
+            }
+
+            // Validate next_hop format (should be IP:port)
+            if entry.next_hop.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::ValidationFailed(
+                    format!("FIB entry {} has invalid next hop format: {}", index, entry.next_hop)
+                ));
+            }
+
+            // Validate cost
+            if entry.cost == 0 {
+                return Err(ConfigError::ValidationFailed(
+                    format!("FIB entry {} has invalid cost: 0", index)
+                ));
+            }
         }
 
         Ok(())

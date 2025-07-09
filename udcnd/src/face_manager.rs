@@ -134,8 +134,8 @@ pub struct FaceManager {
     configs: Arc<RwLock<HashMap<u32, FaceConfig>>>,
     running: Arc<RwLock<bool>>,
     next_face_id: Arc<RwLock<u32>>,
-    // TODO: Add eBPF manager integration when ready
-    // ebpf_manager: Option<Arc<crate::ebpf::EbpfManager>>,
+    /// eBPF manager for data plane integration
+    ebpf_manager: Option<Arc<crate::ebpf::EbpfManager>>,
 }
 
 impl FaceManager {
@@ -145,8 +145,19 @@ impl FaceManager {
             configs: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(RwLock::new(false)),
             next_face_id: Arc::new(RwLock::new(1)),
-            // ebpf_manager: None,
+            ebpf_manager: None,
         }
+    }
+
+    /// Create a FaceManager with eBPF integration
+    pub fn with_ebpf_manager(mut self, ebpf_manager: Arc<crate::ebpf::EbpfManager>) -> Self {
+        self.ebpf_manager = Some(ebpf_manager);
+        self
+    }
+
+    /// Set the eBPF manager after creation
+    pub fn set_ebpf_manager(&mut self, ebpf_manager: Arc<crate::ebpf::EbpfManager>) {
+        self.ebpf_manager = Some(ebpf_manager);
     }
 
     // TODO: Uncomment when eBPF integration is ready
@@ -170,12 +181,13 @@ impl FaceManager {
 
         let face_info = self.config_to_face_info(&config)?;
         
-        // TODO: Add to eBPF if available
-        // if let Some(ref ebpf_manager) = self.ebpf_manager {
-        //     if let Err(e) = ebpf_manager.add_face(config.face_id, &face_info).await {
-        //         return Err(FaceManagerError::EbpfError(e.to_string()));
-        //     }
-        // }
+        // Add to eBPF if available
+        if let Some(ref ebpf_manager) = self.ebpf_manager {
+            if let Err(e) = ebpf_manager.add_face(config.face_id, &face_info).await {
+                error!("Failed to add face {} to eBPF: {}", config.face_id, e);
+                return Err(FaceManagerError::EbpfError(e.to_string()));
+            }
+        }
 
         faces.insert(config.face_id, face_info);
         self.configs.write().await.insert(config.face_id, config.clone());
@@ -202,12 +214,13 @@ impl FaceManager {
             return Err(FaceManagerError::FaceNotFound(face_id));
         }
 
-        // TODO: Remove from eBPF if available
-        // if let Some(ref ebpf_manager) = self.ebpf_manager {
-        //     if let Err(e) = ebpf_manager.remove_face(face_id).await {
-        //         warn!("Failed to remove face {} from eBPF: {}", face_id, e);
-        //     }
-        // }
+        // Remove from eBPF if available
+        if let Some(ref ebpf_manager) = self.ebpf_manager {
+            if let Err(e) = ebpf_manager.remove_face(face_id).await {
+                warn!("Failed to remove face {} from eBPF: {}", face_id, e);
+                // Continue with removal from control plane even if eBPF removal fails
+            }
+        }
 
         faces.remove(&face_id);
         self.configs.write().await.remove(&face_id);
@@ -264,12 +277,13 @@ impl FaceManager {
                 .unwrap()
                 .as_nanos() as u64;
 
-            // TODO: Update eBPF if available
-            // if let Some(ref ebpf_manager) = self.ebpf_manager {
-            //     if let Err(e) = ebpf_manager.add_face(face_id, face_info).await {
-            //         warn!("Failed to update face {} in eBPF: {}", face_id, e);
-            //     }
-            // }
+            // Update eBPF if available
+            if let Some(ref ebpf_manager) = self.ebpf_manager {
+                if let Err(e) = ebpf_manager.add_face(face_id, face_info).await {
+                    warn!("Failed to update face {} in eBPF: {}", face_id, e);
+                    // Continue with control plane update even if eBPF update fails
+                }
+            }
 
             debug!("Updated face {} state to {}", face_id, state);
             Ok(())
@@ -324,22 +338,20 @@ impl FaceManager {
             // Consider face down if no activity for 30 seconds
             if age > 30_000_000_000 && face_info.state & FACE_STATE_UP != 0 {
                 face_info.state = FACE_STATE_DOWN;
-                updated_faces.push(*face_id);
+                updated_faces.push((*face_id, face_info.clone()));
             }
         }
 
         drop(faces);
 
-        // TODO: Update eBPF for changed faces
-        // if let Some(ref ebpf_manager) = self.ebpf_manager {
-        //     for face_id in updated_faces {
-        //         if let Ok(face_info) = self.get_face(face_id).await {
-        //             if let Err(e) = ebpf_manager.add_face(face_id, &face_info).await {
-        //                 warn!("Failed to update face {} in eBPF during monitoring: {}", face_id, e);
-        //             }
-        //         }
-        //     }
-        // }
+        // Update eBPF for changed faces
+        if let Some(ref ebpf_manager) = self.ebpf_manager {
+            for (face_id, face_info) in updated_faces {
+                if let Err(e) = ebpf_manager.add_face(face_id, &face_info).await {
+                    warn!("Failed to update face {} in eBPF during monitoring: {}", face_id, e);
+                }
+            }
+        }
 
         Ok(())
     }

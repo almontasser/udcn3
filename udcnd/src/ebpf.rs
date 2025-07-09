@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-// use aya::maps::{HashMap, MapData};
-// use aya::programs::{Xdp, XdpFlags};
+use aya::maps::HashMap;
+use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
+use aya_log;
+use libc;
 use log::{debug, info, warn};
 use tokio::sync::RwLock;
 
@@ -29,19 +31,40 @@ impl EbpfManager {
     pub async fn load_program(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Loading eBPF program for interface: {}", self.interface_name);
 
-        // For now, we'll create a placeholder implementation
-        // TODO: Load the actual eBPF program when the build system is ready
-        warn!("load_program: Using placeholder implementation - eBPF program not actually loaded");
-        
-        // TODO: Uncomment when eBPF program is ready
-        // let mut bpf = Ebpf::load(include_bytes_aligned!(
-        //     "../../target/bpfel-unknown-none/debug/udcn-ebpf"
-        // ))?;
-        // let program: &mut Xdp = bpf.program_mut("udcn").unwrap().try_into()?;
-        // program.load()?;
-        // program.attach(&self.interface_name, XdpFlags::default())?;
-        // self.bpf = Some(Arc::new(RwLock::new(bpf)));
+        // Bump the memlock rlimit. This is needed for older kernels that don't use the
+        // new memcg based accounting, see https://lwn.net/Articles/837122/
+        let rlim = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+        if ret != 0 {
+            debug!("remove limit on locked memory failed, ret is: {ret}");
+        }
 
+        // Load the eBPF program from embedded bytecode
+        let mut bpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/udcn"
+        )))?;
+        
+        // Initialize eBPF logger
+        if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
+            // This can happen if you remove all log statements from your eBPF program.
+            warn!("failed to initialize eBPF logger: {e}");
+        }
+
+        // Get and load the XDP program
+        let program: &mut aya::programs::Xdp = bpf.program_mut("udcn").unwrap().try_into()?;
+        program.load()?;
+        
+        // Attach the program to the interface
+        program.attach(&self.interface_name, aya::programs::XdpFlags::default())
+            .map_err(|e| format!("failed to attach the XDP program to {}: {} - try changing XdpFlags::default() to XdpFlags::SKB_MODE", 
+                                self.interface_name, e))?;
+
+        // Store the loaded eBPF program
+        self.bpf = Some(Arc::new(RwLock::new(bpf)));
         self.program_loaded = true;
 
         info!("eBPF program loaded and attached to interface: {}", self.interface_name);
@@ -57,15 +80,17 @@ impl EbpfManager {
 
         info!("Unloading eBPF program from interface: {}", self.interface_name);
 
-        // TODO: Uncomment when eBPF program is ready
-        // if let Some(bpf_arc) = &self.bpf {
-        //     let bpf = bpf_arc.read().await;
-        //     if let Ok(program) = bpf.program("udcn") {
-        //         if let Ok(program) = program.try_into() as Result<&Xdp, _> {
-        //             program.detach(&self.interface_name)?;
-        //         }
-        //     }
-        // }
+        // Detach the program from the interface
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            if let Ok(program) = bpf.program("udcn") {
+                if let Ok(program) = program.try_into() as Result<&Xdp, _> {
+                    // XDP programs detach automatically when dropped, but we can be explicit
+                    // program.detach(&self.interface_name)?;
+                    debug!("XDP program will be detached when dropped");
+                }
+            }
+        }
 
         self.bpf = None;
         self.program_loaded = false;
@@ -110,24 +135,35 @@ impl EbpfManager {
 
     /// Get packet statistics from the eBPF program
     pub async fn get_packet_stats(&self) -> Result<PacketStats, Box<dyn std::error::Error>> {
-        // For now, return a placeholder implementation
-        // In a real implementation, we would need to properly read from the eBPF map
-        // This requires the Pod trait to be implemented for PacketStats
-        warn!("get_packet_stats: Using placeholder implementation");
-        Ok(PacketStats {
-            packets_processed: 0,
-            packets_dropped: 0,
-            packets_passed: 0,
-            packets_redirected: 0,
-            bytes_processed: 0,
-            processing_time_ns: 0,
-            interest_packets: 0,
-            data_packets: 0,
-            nack_packets: 0,
-            control_packets: 0,
-            parse_errors: 0,
-            memory_errors: 0,
-        })
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let stats_map: HashMap<_, u32, PacketStats> = bpf.map("PACKET_STATS")?.try_into()?;
+            
+            // Get statistics from the map (key 0 is typically used for global stats)
+            match stats_map.get(&0, 0) {
+                Ok(stats) => Ok(stats),
+                Err(e) => {
+                    warn!("Failed to get packet statistics from eBPF map: {}", e);
+                    // Return default stats if map read fails
+                    Ok(PacketStats {
+                        packets_processed: 0,
+                        packets_dropped: 0,
+                        packets_passed: 0,
+                        packets_redirected: 0,
+                        bytes_processed: 0,
+                        processing_time_ns: 0,
+                        interest_packets: 0,
+                        data_packets: 0,
+                        nack_packets: 0,
+                        control_packets: 0,
+                        parse_errors: 0,
+                        memory_errors: 0,
+                    })
+                }
+            }
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Get PIT statistics from the eBPF program
@@ -150,20 +186,33 @@ impl EbpfManager {
 
     /// Get Content Store statistics from the eBPF program
     pub async fn get_cs_stats(&self) -> Result<ContentStoreStats, Box<dyn std::error::Error>> {
-        // For now, return a placeholder implementation
-        warn!("get_cs_stats: Using placeholder implementation");
-        Ok(ContentStoreStats {
-            lookups: 0,
-            hits: 0,
-            misses: 0,
-            insertions: 0,
-            evictions: 0,
-            expirations: 0,
-            current_entries: 0,
-            bytes_stored: 0,
-            max_entries_reached: 0,
-            cleanups: 0,
-        })
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let cs_stats_map: HashMap<_, u32, ContentStoreStats> = bpf.map("CS_STATS")?.try_into()?;
+            
+            // Get CS statistics from the map (key 0 is typically used for global stats)
+            match cs_stats_map.get(&0, 0) {
+                Ok(stats) => Ok(stats),
+                Err(e) => {
+                    warn!("Failed to get Content Store statistics from eBPF map: {}", e);
+                    // Return default stats if map read fails
+                    Ok(ContentStoreStats {
+                        lookups: 0,
+                        hits: 0,
+                        misses: 0,
+                        insertions: 0,
+                        evictions: 0,
+                        expirations: 0,
+                        current_entries: 0,
+                        bytes_stored: 0,
+                        max_entries_reached: 0,
+                        cleanups: 0,
+                    })
+                }
+            }
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Update configuration in the eBPF program
@@ -176,39 +225,56 @@ impl EbpfManager {
 
     /// Add a face to the face table
     pub async fn add_face(&self, face_id: u32, face_info: &FaceInfo) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, this is a placeholder
-        warn!("add_face: Using placeholder implementation");
-        debug!("Would add face {} to face table: {:?}", face_id, face_info);
-        Ok(())
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let mut face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            
+            // Insert the face into the eBPF face table
+            face_table.insert(face_id, face_info.clone(), 0)?;
+            
+            info!("Added face {} to eBPF face table: {:?}", face_id, face_info);
+            Ok(())
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Remove a face from the face table
     pub async fn remove_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, this is a placeholder
-        warn!("remove_face: Using placeholder implementation");
-        debug!("Would remove face {} from face table", face_id);
-        Ok(())
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let mut face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            
+            // Remove the face from the eBPF face table
+            face_table.remove(&face_id)?;
+            
+            info!("Removed face {} from eBPF face table", face_id);
+            Ok(())
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Get face information
     pub async fn get_face(&self, face_id: u32) -> Result<FaceInfo, Box<dyn std::error::Error>> {
-        // For now, return a placeholder implementation
-        warn!("get_face: Using placeholder implementation");
-        Ok(FaceInfo {
-            face_id,
-            face_type: FACE_TYPE_ETHERNET,
-            state: FACE_STATE_UP,
-            ifindex: 0,
-            mac_addr: [0; 6],
-            ip_addr: [0; 16],
-            port: 0,
-            last_activity: 0,
-            packets_sent: 0,
-            packets_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            _padding: [0; 6],
-        })
+        if let Some(bpf_arc) = &self.bpf {
+            let bpf = bpf_arc.read().await;
+            let face_table: HashMap<_, u32, FaceInfo> = bpf.map("FACE_TABLE")?.try_into()?;
+            
+            // Get the face from the eBPF face table
+            match face_table.get(&face_id, 0) {
+                Ok(face_info) => {
+                    debug!("Retrieved face {} from eBPF face table: {:?}", face_id, face_info);
+                    Ok(face_info)
+                }
+                Err(e) => {
+                    warn!("Face {} not found in eBPF face table: {}", face_id, e);
+                    Err(format!("Face {} not found", face_id).into())
+                }
+            }
+        } else {
+            Err("eBPF program not loaded".into())
+        }
     }
 
     /// Clear all PIT entries (for debugging/testing)
