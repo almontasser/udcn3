@@ -1,0 +1,32 @@
+graph topology {
+  node [shape=circle];
+  "node_3" [pos="100,100"];
+  "node_11" [pos="0,200"];
+  "node_6" [pos="100,200"];
+  "node_8" [pos="0,200"];
+  "node_7" [pos="-100,200"];
+  "node_5" [pos="0,200"];
+  "node_0" [pos="0,0"];
+  "node_14" [pos="0,300"];
+  "node_1" [pos="-100,100"];
+  "node_2" [pos="0,100"];
+  "node_12" [pos="100,200"];
+  "node_9" [pos="100,200"];
+  "node_4" [pos="-100,200"];
+  "node_10" [pos="-100,200"];
+  "node_13" [pos="-100,300"];
+  "node_10" -- "node_3";
+  "node_11" -- "node_3";
+  "node_0" -- "node_2";
+  "node_12" -- "node_3";
+  "node_2" -- "node_9";
+  "node_2" -- "node_7";
+  "node_14" -- "node_4";
+  "node_13" -- "node_4";
+  "node_1" -- "node_6";
+  "node_1" -- "node_4";
+  "node_2" -- "node_8";
+  "node_0" -- "node_1";
+  "node_1" -- "node_5";
+  "node_0" -- "node_3";
+}

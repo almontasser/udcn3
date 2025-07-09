@@ -1,143 +1,33 @@
 {
-  "timestamp": "2025-07-09T10:35:34.504325222+00:00",
+  "timestamp": "2025-07-09T11:35:56.986811295+00:00",
   "results": {
-    "transport_tcp": {
-      "name": "tcp",
+    "topology_mesh_8_nodes_http_like": {
+      "name": "topology_mesh_8_nodes",
       "duration": {
         "secs": 10,
-        "nanos": 858055
+        "nanos": 1933337
       },
-      "operations": 6406,
-      "throughput": 640.5450377127665,
+      "operations": 6296,
+      "throughput": 628.7784359384998,
       "latency_avg": {
         "secs": 0,
-        "nanos": 1556971
+        "nanos": 20000000
       },
       "latency_min": {
         "secs": 0,
-        "nanos": 395380
+        "nanos": 10000000
       },
       "latency_max": {
         "secs": 0,
-        "nanos": 11857224
+        "nanos": 40000000
       },
-      "success_rate": 99.82828598189198
-    },
-    "transport_udp": {
-      "name": "udp",
-      "duration": {
-        "secs": 10,
-        "nanos": 10448744
-      },
-      "operations": 2520,
-      "throughput": 251.73696648818284,
-      "latency_avg": {
-        "secs": 0,
-        "nanos": 1383199
-      },
-      "latency_min": {
-        "secs": 0,
-        "nanos": 121834
-      },
-      "latency_max": {
-        "secs": 0,
-        "nanos": 19887929
-      },
-      "success_rate": 99.36507936507937
-    },
-    "network_latency": {
-      "name": "latency",
-      "duration": {
-        "secs": 10,
-        "nanos": 2133874
-      },
-      "operations": 999,
-      "throughput": 99.87868714663436,
-      "latency_avg": {
-        "secs": 0,
-        "nanos": 1483609
-      },
-      "latency_min": {
-        "secs": 0,
-        "nanos": 480769
-      },
-      "latency_max": {
-        "secs": 0,
-        "nanos": 14216932
-      },
-      "success_rate": 99.8998998998999
-    },
-    "network_connections": {
-      "name": "connections",
-      "duration": {
-        "secs": 10,
-        "nanos": 150468091
-      },
-      "operations": 1850,
-      "throughput": 182.257604616315,
-      "latency_avg": {
-        "secs": 0,
-        "nanos": 1439741
-      },
-      "latency_min": {
-        "secs": 0,
-        "nanos": 278471
-      },
-      "latency_max": {
-        "secs": 0,
-        "nanos": 7581395
-      },
-      "success_rate": 99.94594594594595
-    },
-    "transport_unix": {
-      "name": "unix",
-      "duration": {
-        "secs": 10,
-        "nanos": 1044827
-      },
-      "operations": 7100,
-      "throughput": 709.9258250330008,
-      "latency_avg": {
-        "secs": 0,
-        "nanos": 1405391
-      },
-      "latency_min": {
-        "secs": 0,
-        "nanos": 203362
-      },
-      "latency_max": {
-        "secs": 0,
-        "nanos": 13083951
-      },
-      "success_rate": 99.90140845070422
-    },
-    "network_throughput": {
-      "name": "throughput",
-      "duration": {
-        "secs": 10,
-        "nanos": 128487
-      },
-      "operations": 6987,
-      "throughput": 698.6910227286563,
-      "latency_avg": {
-        "secs": 0,
-        "nanos": 1428069
-      },
-      "latency_min": {
-        "secs": 0,
-        "nanos": 249077
-      },
-      "latency_max": {
-        "secs": 0,
-        "nanos": 13582000
-      },
-      "success_rate": 99.89981394017461
+      "success_rate": 0.9988881829733164
     }
   },
   "summary": {
-    "total_operations": 25862,
-    "average_throughput": 430.5058572875926,
-    "average_latency": 1.4494966666666667,
-    "total_duration": 60.165082078
+    "total_operations": 6296,
+    "average_throughput": 628.7784359384998,
+    "average_latency": 20.0,
+    "total_duration": 10.001933337
   }
 }

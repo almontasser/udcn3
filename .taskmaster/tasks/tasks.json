@@ -821,7 +821,7 @@
         "dependencies": [
           9
         ],
-        "status": "pending",
+        "status": "done",
         "subtasks": [
           {
             "id": 1,
@@ -852,7 +852,7 @@
               2
             ],
             "details": "Build a framework for simulating various network topologies including hierarchical networks, mesh networks, and custom configurations. Include support for link characteristics, node properties, and dynamic topology changes.",
-            "status": "in-progress",
+            "status": "done",
             "testStrategy": ""
           }
         ]
@@ -1135,7 +1135,7 @@
     ],
     "metadata": {
       "created": "2025-07-07T14:00:07.094Z",
-      "updated": "2025-07-09T10:37:17.034Z",
+      "updated": "2025-07-09T11:37:12.560Z",
       "description": "Tasks for master context"
     }
   }
