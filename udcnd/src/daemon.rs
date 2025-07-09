@@ -9,12 +9,15 @@ use crate::ebpf::EbpfManager;
 use crate::face_manager::{FaceManager, FaceConfig};
 use crate::routing::{RoutingManager, RoutingConfig, RoutingStrategy};
 use crate::service::Service;
+use crate::control_plane::{ControlPlaneManager, ControlPlaneConfig};
+use crate::protocols::NdnOspfHandler;
 
 pub struct Daemon {
     config: Config,
     ebpf_manager: Option<EbpfManager>,
-    face_manager: Option<FaceManager>,
+    face_manager: Option<Arc<FaceManager>>,
     routing_manager: Option<Arc<RoutingManager>>,
+    control_plane_manager: Option<Arc<ControlPlaneManager>>,
     // For now, we'll manage services differently until we need them
     _services: Arc<RwLock<Vec<String>>>,
 }
@@ -26,6 +29,7 @@ impl Daemon {
             ebpf_manager: None,
             face_manager: None,
             routing_manager: None,
+            control_plane_manager: None,
             _services: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -51,7 +55,7 @@ impl Daemon {
         self.ebpf_manager = Some(ebpf_manager);
 
         // Initialize Face Manager with eBPF integration
-        let face_manager = FaceManager::new();
+        let face_manager = Arc::new(FaceManager::new());
         
         // Start the face manager service
         if let Err(e) = face_manager.start().await {
@@ -59,7 +63,7 @@ impl Daemon {
             return Err(e);
         }
         
-        self.face_manager = Some(face_manager);
+        self.face_manager = Some(face_manager.clone());
 
         // Initialize Routing Manager
         let local_address = SocketAddr::from(([127, 0, 0, 1], 6363)); // Default NDN port
@@ -71,7 +75,37 @@ impl Daemon {
             return Err(e);
         }
         
-        self.routing_manager = Some(routing_manager);
+        self.routing_manager = Some(routing_manager.clone());
+
+        // Initialize Control Plane Manager
+        let control_plane_config = ControlPlaneConfig {
+            local_node_id: format!("udcnd-{}", self.config.network.interface),
+            ..Default::default()
+        };
+        
+        let mut control_plane_manager = ControlPlaneManager::new(
+            control_plane_config,
+            face_manager.clone(),
+            routing_manager.clone(),
+        );
+        
+        // Add NDN OSPF protocol handler
+        let ospf_config = crate::protocols::ndn_ospf::OspfConfig::default();
+        let ospf_handler = NdnOspfHandler::new(
+            format!("udcnd-{}", self.config.network.interface),
+            ospf_config,
+        );
+        control_plane_manager.add_protocol_handler(Box::new(ospf_handler));
+        
+        let control_plane_manager = Arc::new(control_plane_manager);
+        
+        // Start the control plane manager service
+        if let Err(e) = control_plane_manager.start().await {
+            error!("Failed to start Control Plane Manager: {}", e);
+            return Err(e);
+        }
+        
+        self.control_plane_manager = Some(control_plane_manager);
 
         info!("All services started successfully");
 
@@ -81,7 +115,15 @@ impl Daemon {
     pub async fn stop(&mut self) {
         info!("Stopping UDCN Daemon services");
 
-        // Stop Routing Manager first
+        // Stop Control Plane Manager first
+        if let Some(ref control_plane_manager) = self.control_plane_manager {
+            if let Err(e) = control_plane_manager.stop().await {
+                error!("Failed to stop Control Plane Manager: {}", e);
+            }
+        }
+        self.control_plane_manager = None;
+
+        // Stop Routing Manager
         if let Some(ref routing_manager) = self.routing_manager {
             if let Err(e) = routing_manager.stop().await {
                 error!("Failed to stop Routing Manager: {}", e);
@@ -367,6 +409,43 @@ impl Daemon {
     pub async fn is_routing_active(&self) -> bool {
         match &self.routing_manager {
             Some(manager) => manager.is_running().await,
+            None => false,
+        }
+    }
+
+    // === CONTROL PLANE OPERATIONS API ===
+
+    /// Get network topology information
+    pub async fn get_network_topology(&self) -> Result<crate::control_plane::NetworkTopology, Box<dyn std::error::Error>> {
+        match &self.control_plane_manager {
+            Some(manager) => Ok(manager.get_topology().await),
+            None => Err("Control plane manager not initialized".into()),
+        }
+    }
+
+    /// Send control message to control plane
+    pub async fn send_control_message(&self, message: crate::control_plane::ControlMessage) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.control_plane_manager {
+            Some(manager) => manager.send_control_message(message).await,
+            None => Err("Control plane manager not initialized".into()),
+        }
+    }
+
+    /// Update neighbor information
+    pub async fn update_neighbor(&self, neighbor: crate::control_plane::NeighborInfo) -> Result<(), Box<dyn std::error::Error>> {
+        match &self.control_plane_manager {
+            Some(manager) => {
+                manager.update_neighbor(neighbor).await;
+                Ok(())
+            },
+            None => Err("Control plane manager not initialized".into()),
+        }
+    }
+
+    /// Check if control plane is running
+    pub async fn is_control_plane_active(&self) -> bool {
+        match &self.control_plane_manager {
+            Some(manager) => manager.is_running(),
             None => false,
         }
     }

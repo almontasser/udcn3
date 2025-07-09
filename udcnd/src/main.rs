@@ -9,6 +9,8 @@ mod daemon;
 mod ebpf;
 mod service;
 mod routing;
+mod control_plane;
+mod protocols;
 
 use config::Config;
 use daemon::Daemon;
