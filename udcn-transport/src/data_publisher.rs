@@ -714,6 +714,8 @@ mod tests {
             offset: (sequence * 100) as u64,
             is_final,
             file_metadata: None,
+            chunk_hash: None,
+            hash_algorithm: None,
         };
 
         FileChunk::new(&base_name, sequence, chunk_data, chunk_info)

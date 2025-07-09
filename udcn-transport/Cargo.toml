@@ -25,6 +25,9 @@ fastrand = "2.0"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+sha2 = "0.10"
+md-5 = "0.10"
+blake3 = "1.5"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }

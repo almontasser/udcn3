@@ -674,6 +674,8 @@ mod tests {
                 offset: 0,
                 is_final: false,
                 file_metadata: Some(metadata),
+                chunk_hash: None,
+                hash_algorithm: None,
             },
         };
 

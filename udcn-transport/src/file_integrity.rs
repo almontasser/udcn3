@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+// Crypto library imports
+use blake3::Hasher as Blake3Hasher;
+use md5::{Md5, Digest as Md5Digest};
+use sha2::{Sha256, Sha512, Digest as Sha2Digest};
+
 use crate::file_chunking::FileMetadata;
 
 /// Configuration for integrity verification
@@ -24,6 +29,14 @@ pub struct IntegrityConfig {
     pub verification_timeout: std::time::Duration,
     /// Maximum file size for verification
     pub max_file_size: u64,
+    /// Enable automatic recovery for corrupted chunks
+    pub enable_recovery: bool,
+    /// Maximum number of recovery attempts per chunk
+    pub max_recovery_attempts: u32,
+    /// Timeout for recovery operations
+    pub recovery_timeout: std::time::Duration,
+    /// Enable parallel chunk verification
+    pub enable_parallel_verification: bool,
 }
 
 impl Default for IntegrityConfig {
@@ -34,6 +47,10 @@ impl Default for IntegrityConfig {
             buffer_size: 64 * 1024, // 64KB
             verification_timeout: std::time::Duration::from_secs(30),
             max_file_size: 100 * 1024 * 1024, // 100MB
+            enable_recovery: true,
+            max_recovery_attempts: 3,
+            recovery_timeout: std::time::Duration::from_secs(10),
+            enable_parallel_verification: true,
         }
     }
 }
@@ -41,6 +58,8 @@ impl Default for IntegrityConfig {
 /// Checksum algorithm types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChecksumAlgorithm {
+    /// MD5 hash (legacy, not recommended for security)
+    Md5,
     /// SHA-256 hash
     Sha256,
     /// SHA-512 hash
@@ -151,6 +170,14 @@ pub enum IntegrityError {
     Timeout,
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
+    #[error("Chunk corruption detected at index {index}")]
+    ChunkCorruption { index: usize },
+    #[error("Multiple chunk corruptions detected: {corrupted_chunks:?}")]
+    MultipleChunkCorruptions { corrupted_chunks: Vec<usize> },
+    #[error("Recovery failed after {attempts} attempts")]
+    RecoveryFailed { attempts: u32 },
+    #[error("Recovery timeout")]
+    RecoveryTimeout,
 }
 
 /// Statistics for integrity verification
@@ -170,6 +197,20 @@ pub struct IntegrityStats {
     pub total_verification_time: std::time::Duration,
     /// Average verification time
     pub average_verification_time: std::time::Duration,
+    /// Total chunks verified
+    pub total_chunks_verified: u64,
+    /// Chunks that passed verification
+    pub chunks_passed: u64,
+    /// Chunks that failed verification
+    pub chunks_failed: u64,
+    /// Corrupted chunks detected
+    pub corrupted_chunks_detected: u64,
+    /// Successful chunk recoveries
+    pub successful_recoveries: u64,
+    /// Failed recovery attempts
+    pub failed_recoveries: u64,
+    /// Total recovery time
+    pub total_recovery_time: std::time::Duration,
 }
 
 impl IntegrityStats {
@@ -362,16 +403,67 @@ impl FileIntegrityEngine {
         let expected_hash = metadata.file_hash.as_ref()
             .ok_or_else(|| IntegrityError::UnsupportedAlgorithm("No checksum in metadata".to_string()))?;
         
-        let computed_hash = self.compute_checksum(file_path, ChecksumAlgorithm::Sha256).await?;
+        // Use the configured default algorithm or auto-detect from hash length
+        let algorithm = self.detect_algorithm_from_hash(expected_hash);
+        let computed_hash = self.compute_checksum(file_path, algorithm).await?;
         
         let matches = expected_hash == &computed_hash;
         
         Ok(ChecksumResult {
-            algorithm: ChecksumAlgorithm::Sha256,
+            algorithm,
             expected: expected_hash.clone(),
             computed: computed_hash,
             matches,
         })
+    }
+    
+    /// Detect checksum algorithm from hash length
+    fn detect_algorithm_from_hash(&self, hash: &[u8]) -> ChecksumAlgorithm {
+        match hash.len() {
+            16 => ChecksumAlgorithm::Md5,
+            32 => ChecksumAlgorithm::Sha256, // Note: Blake3 also produces 32-byte hashes, defaulting to SHA256
+            64 => ChecksumAlgorithm::Sha512,
+            4 => ChecksumAlgorithm::Crc32,
+            _ => ChecksumAlgorithm::Sha256, // Default fallback
+        }
+    }
+    
+    /// Compute checksum for a chunk of data
+    pub async fn compute_chunk_checksum(
+        &self,
+        data: &[u8],
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<Vec<u8>, IntegrityError> {
+        let data_owned = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            match algorithm {
+                ChecksumAlgorithm::Md5 => {
+                    let mut hasher = Md5::new();
+                    hasher.update(&data_owned);
+                    Ok(hasher.finalize().to_vec())
+                }
+                ChecksumAlgorithm::Sha256 => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&data_owned);
+                    Ok(hasher.finalize().to_vec())
+                }
+                ChecksumAlgorithm::Sha512 => {
+                    let mut hasher = Sha512::new();
+                    hasher.update(&data_owned);
+                    Ok(hasher.finalize().to_vec())
+                }
+                ChecksumAlgorithm::Blake3 => {
+                    let mut hasher = Blake3Hasher::new();
+                    hasher.update(&data_owned);
+                    Ok(hasher.finalize().as_bytes().to_vec())
+                }
+                ChecksumAlgorithm::Crc32 => {
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&data_owned);
+                    Ok(hasher.finalize().to_be_bytes().to_vec())
+                }
+            }
+        }).await.unwrap()
     }
     
     /// Verify file signature
@@ -400,24 +492,71 @@ impl FileIntegrityEngine {
         let mut buffer = vec![0u8; self.config.buffer_size];
         
         match algorithm {
-            ChecksumAlgorithm::Sha256 => {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                
-                let mut hasher = DefaultHasher::new();
+            ChecksumAlgorithm::Md5 => {
+                let mut hasher = Md5::new();
                 
                 loop {
                     let bytes_read = reader.read(&mut buffer)?;
                     if bytes_read == 0 {
                         break;
                     }
-                    buffer[..bytes_read].hash(&mut hasher);
+                    hasher.update(&buffer[..bytes_read]);
                 }
                 
-                let hash = hasher.finish();
-                Ok(hash.to_be_bytes().to_vec())
+                Ok(hasher.finalize().to_vec())
             }
-            _ => Err(IntegrityError::UnsupportedAlgorithm(format!("{:?}", algorithm))),
+            ChecksumAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..bytes_read]);
+                }
+                
+                Ok(hasher.finalize().to_vec())
+            }
+            ChecksumAlgorithm::Sha512 => {
+                let mut hasher = Sha512::new();
+                
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..bytes_read]);
+                }
+                
+                Ok(hasher.finalize().to_vec())
+            }
+            ChecksumAlgorithm::Blake3 => {
+                let mut hasher = Blake3Hasher::new();
+                
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..bytes_read]);
+                }
+                
+                Ok(hasher.finalize().as_bytes().to_vec())
+            }
+            ChecksumAlgorithm::Crc32 => {
+                let mut hasher = crc32fast::Hasher::new();
+                
+                loop {
+                    let bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..bytes_read]);
+                }
+                
+                Ok(hasher.finalize().to_be_bytes().to_vec())
+            }
         }
     }
     
@@ -429,6 +568,132 @@ impl FileIntegrityEngine {
     /// Get active verifications
     pub fn get_active_verifications(&self) -> HashMap<PathBuf, IntegrityResult> {
         self.active_verifications.read().unwrap().clone()
+    }
+    
+    /// Verify chunk integrity
+    pub async fn verify_chunk_integrity(
+        &self,
+        chunk_data: &[u8],
+        expected_hash: &[u8],
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<bool, IntegrityError> {
+        let computed_hash = self.compute_chunk_checksum(chunk_data, algorithm).await?;
+        Ok(computed_hash == expected_hash)
+    }
+    
+    /// Verify all chunks in sequence
+    pub async fn verify_chunks_sequence(
+        &self,
+        chunks: &[(&[u8], &[u8])], // (chunk_data, expected_hash)
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<Vec<bool>, IntegrityError> {
+        let mut results = Vec::new();
+        
+        for (chunk_data, expected_hash) in chunks {
+            let is_valid = self.verify_chunk_integrity(chunk_data, expected_hash, algorithm).await?;
+            results.push(is_valid);
+        }
+        
+        Ok(results)
+    }
+    
+    /// Detect corrupted chunks and return their indices
+    pub async fn detect_corrupted_chunks(
+        &self,
+        chunks: &[(&[u8], &[u8])], // (chunk_data, expected_hash)
+        algorithm: ChecksumAlgorithm,
+    ) -> Result<Vec<usize>, IntegrityError> {
+        let mut corrupted_indices = Vec::new();
+        
+        for (index, (chunk_data, expected_hash)) in chunks.iter().enumerate() {
+            let is_valid = self.verify_chunk_integrity(chunk_data, expected_hash, algorithm).await?;
+            if !is_valid {
+                corrupted_indices.push(index);
+            }
+        }
+        
+        Ok(corrupted_indices)
+    }
+    
+    /// Recover corrupted chunks with retry logic
+    pub async fn recover_corrupted_chunks(
+        &self,
+        corrupted_indices: &[usize],
+        recovery_callback: impl Fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, IntegrityError>> + Send>> + Send + Sync,
+    ) -> Result<Vec<(usize, Vec<u8>)>, IntegrityError> {
+        let mut recovered_chunks = Vec::new();
+        let mut stats = self.stats.write().unwrap();
+        
+        for &index in corrupted_indices {
+            let start_time = std::time::Instant::now();
+            let mut attempts = 0;
+            let mut recovered = false;
+            
+            while attempts < self.config.max_recovery_attempts && !recovered {
+                attempts += 1;
+                
+                match recovery_callback(index).await {
+                    Ok(chunk_data) => {
+                        recovered_chunks.push((index, chunk_data));
+                        stats.successful_recoveries += 1;
+                        recovered = true;
+                    }
+                    Err(_) => {
+                        stats.failed_recoveries += 1;
+                        if attempts >= self.config.max_recovery_attempts {
+                            return Err(IntegrityError::RecoveryFailed { attempts });
+                        }
+                    }
+                }
+                
+                // Check for timeout
+                if start_time.elapsed() > self.config.recovery_timeout {
+                    return Err(IntegrityError::RecoveryTimeout);
+                }
+            }
+            
+            stats.total_recovery_time += start_time.elapsed();
+        }
+        
+        Ok(recovered_chunks)
+    }
+    
+    /// Verify chunks with automatic recovery
+    pub async fn verify_and_recover_chunks(
+        &self,
+        chunks: &[(&[u8], &[u8])], // (chunk_data, expected_hash)
+        algorithm: ChecksumAlgorithm,
+        recovery_callback: impl Fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, IntegrityError>> + Send>> + Send + Sync,
+    ) -> Result<Vec<bool>, IntegrityError> {
+        // First pass: detect corrupted chunks
+        let corrupted_indices = self.detect_corrupted_chunks(chunks, algorithm).await?;
+        
+        if corrupted_indices.is_empty() {
+            // All chunks are valid
+            return Ok(vec![true; chunks.len()]);
+        }
+        
+        // Update statistics
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.corrupted_chunks_detected += corrupted_indices.len() as u64;
+        }
+        
+        // Attempt recovery if enabled
+        if self.config.enable_recovery && !corrupted_indices.is_empty() {
+            let _recovered_chunks = self.recover_corrupted_chunks(&corrupted_indices, recovery_callback).await?;
+            // Note: In a real implementation, you would replace the corrupted chunks with recovered ones
+            // and re-verify. For now, we'll just return the original results.
+        }
+        
+        // Return verification results
+        let mut results = Vec::new();
+        for (index, (chunk_data, expected_hash)) in chunks.iter().enumerate() {
+            let is_valid = !corrupted_indices.contains(&index);
+            results.push(is_valid);
+        }
+        
+        Ok(results)
     }
 }
 
@@ -509,5 +774,181 @@ mod tests {
         let result = engine.verify_file(file_path, &metadata).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), IntegrityError::FileTooLarge { .. }));
+    }
+    
+    #[tokio::test]
+    async fn test_md5_checksum_computation() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let result = engine.compute_chunk_checksum(test_data, ChecksumAlgorithm::Md5).await;
+        
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        // MD5 hash should be 16 bytes
+        assert_eq!(hash.len(), 16);
+    }
+    
+    #[tokio::test]
+    async fn test_sha256_checksum_computation() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let result = engine.compute_chunk_checksum(test_data, ChecksumAlgorithm::Sha256).await;
+        
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        // SHA256 hash should be 32 bytes
+        assert_eq!(hash.len(), 32);
+    }
+    
+    #[tokio::test]
+    async fn test_blake3_checksum_computation() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let result = engine.compute_chunk_checksum(test_data, ChecksumAlgorithm::Blake3).await;
+        
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        // Blake3 hash should be 32 bytes
+        assert_eq!(hash.len(), 32);
+    }
+    
+    #[tokio::test]
+    async fn test_crc32_checksum_computation() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let result = engine.compute_chunk_checksum(test_data, ChecksumAlgorithm::Crc32).await;
+        
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        // CRC32 hash should be 4 bytes
+        assert_eq!(hash.len(), 4);
+    }
+    
+    #[tokio::test]
+    async fn test_chunk_integrity_verification() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let expected_hash = engine.compute_chunk_checksum(test_data, ChecksumAlgorithm::Sha256).await.unwrap();
+        
+        let result = engine.verify_chunk_integrity(test_data, &expected_hash, ChecksumAlgorithm::Sha256).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+    
+    #[tokio::test]
+    async fn test_chunk_integrity_verification_failure() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let test_data = b"Hello, World!";
+        let wrong_hash = vec![0; 32]; // Wrong hash
+        
+        let result = engine.verify_chunk_integrity(test_data, &wrong_hash, ChecksumAlgorithm::Sha256).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should return false for mismatch
+    }
+    
+    #[tokio::test]
+    async fn test_corrupted_chunks_detection() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let chunk1 = b"chunk1";
+        let chunk2 = b"chunk2";
+        let chunk3 = b"chunk3";
+        
+        let hash1 = engine.compute_chunk_checksum(chunk1, ChecksumAlgorithm::Sha256).await.unwrap();
+        let hash2 = engine.compute_chunk_checksum(chunk2, ChecksumAlgorithm::Sha256).await.unwrap();
+        let wrong_hash = vec![0; 32]; // Wrong hash for chunk3
+        
+        let chunks = vec![
+            (&chunk1[..], &hash1[..]),
+            (&chunk2[..], &hash2[..]),
+            (&chunk3[..], &wrong_hash[..]),
+        ];
+        
+        let result = engine.detect_corrupted_chunks(&chunks, ChecksumAlgorithm::Sha256).await;
+        assert!(result.is_ok());
+        
+        let corrupted = result.unwrap();
+        assert_eq!(corrupted.len(), 1);
+        assert_eq!(corrupted[0], 2); // Third chunk (index 2) should be corrupted
+    }
+    
+    #[tokio::test]
+    async fn test_algorithm_detection_from_hash() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        // Test MD5 (16 bytes)
+        let md5_hash = vec![0; 16];
+        assert_eq!(engine.detect_algorithm_from_hash(&md5_hash), ChecksumAlgorithm::Md5);
+        
+        // Test SHA256 (32 bytes)
+        let sha256_hash = vec![0; 32];
+        assert_eq!(engine.detect_algorithm_from_hash(&sha256_hash), ChecksumAlgorithm::Sha256);
+        
+        // Test SHA512 (64 bytes)
+        let sha512_hash = vec![0; 64];
+        assert_eq!(engine.detect_algorithm_from_hash(&sha512_hash), ChecksumAlgorithm::Sha512);
+        
+        // Test CRC32 (4 bytes)
+        let crc32_hash = vec![0; 4];
+        assert_eq!(engine.detect_algorithm_from_hash(&crc32_hash), ChecksumAlgorithm::Crc32);
+        
+        // Test unknown (defaults to SHA256)
+        let unknown_hash = vec![0; 20];
+        assert_eq!(engine.detect_algorithm_from_hash(&unknown_hash), ChecksumAlgorithm::Sha256);
+    }
+    
+    #[tokio::test]
+    async fn test_integrity_stats_update() {
+        let config = IntegrityConfig::default();
+        let engine = FileIntegrityEngine::new(config);
+        
+        let mut stats = IntegrityStats::default();
+        
+        let result = IntegrityResult {
+            file_path: PathBuf::from("test.txt"),
+            status: IntegrityStatus::Verified,
+            checksum_result: None,
+            signature_result: None,
+            started_at: Instant::now(),
+            completed_at: Some(Instant::now()),
+            error_message: None,
+        };
+        
+        stats.update(&result);
+        
+        assert_eq!(stats.total_verified, 1);
+        assert_eq!(stats.verified_passed, 1);
+        assert_eq!(stats.verified_failed, 0);
+    }
+    
+    #[tokio::test]
+    async fn test_recovery_configuration() {
+        let config = IntegrityConfig {
+            enable_recovery: true,
+            max_recovery_attempts: 3,
+            recovery_timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        
+        let engine = FileIntegrityEngine::new(config);
+        
+        // Test that recovery is enabled
+        assert!(engine.config.enable_recovery);
+        assert_eq!(engine.config.max_recovery_attempts, 3);
+        assert_eq!(engine.config.recovery_timeout, std::time::Duration::from_secs(5));
     }
 }

@@ -6,6 +6,8 @@ use udcn_core::packets::{Name, Data, MetaInfo, ContentType};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::file_integrity::ChecksumAlgorithm;
+
 /// Configuration for file chunking operations
 #[derive(Debug, Clone)]
 pub struct ChunkingConfig {
@@ -25,6 +27,10 @@ pub struct ChunkingConfig {
     pub max_memory_usage: usize,
     /// Read buffer size for streaming large files
     pub stream_buffer_size: usize,
+    /// Enable chunk-level integrity verification
+    pub enable_chunk_integrity: bool,
+    /// Algorithm to use for chunk integrity
+    pub chunk_hash_algorithm: ChecksumAlgorithm,
 }
 
 impl Default for ChunkingConfig {
@@ -38,6 +44,8 @@ impl Default for ChunkingConfig {
             large_file_mode: false,
             max_memory_usage: 256 * 1024 * 1024, // 256MB default limit
             stream_buffer_size: 1024 * 1024, // 1MB streaming buffer
+            enable_chunk_integrity: false, // Disabled by default for performance
+            chunk_hash_algorithm: ChecksumAlgorithm::Sha256,
         }
     }
 }
@@ -54,6 +62,8 @@ impl ChunkingConfig {
             large_file_mode: false,
             max_memory_usage: 128 * 1024 * 1024, // 128MB for QUIC
             stream_buffer_size: 512 * 1024, // 512KB streaming buffer
+            enable_chunk_integrity: false,
+            chunk_hash_algorithm: ChecksumAlgorithm::Sha256,
         }
     }
 
@@ -68,6 +78,8 @@ impl ChunkingConfig {
             large_file_mode: false,
             max_memory_usage: 64 * 1024 * 1024, // 64MB for small files
             stream_buffer_size: 256 * 1024, // 256KB streaming buffer
+            enable_chunk_integrity: false,
+            chunk_hash_algorithm: ChecksumAlgorithm::Sha256,
         }
     }
 
@@ -82,6 +94,8 @@ impl ChunkingConfig {
             large_file_mode: true,
             max_memory_usage: 512 * 1024 * 1024, // 512MB for large files
             stream_buffer_size: 2 * 1024 * 1024, // 2MB streaming buffer
+            enable_chunk_integrity: false,
+            chunk_hash_algorithm: ChecksumAlgorithm::Sha256,
         }
     }
 
@@ -96,6 +110,8 @@ impl ChunkingConfig {
             large_file_mode: true,
             max_memory_usage: 1024 * 1024 * 1024, // 1GB memory limit
             stream_buffer_size: 4 * 1024 * 1024, // 4MB streaming buffer
+            enable_chunk_integrity: false,
+            chunk_hash_algorithm: ChecksumAlgorithm::Sha256,
         }
     }
 
@@ -208,6 +224,10 @@ pub struct ChunkInfo {
     pub is_final: bool,
     /// File metadata (included in first chunk)
     pub file_metadata: Option<FileMetadata>,
+    /// Chunk integrity hash (optional)
+    pub chunk_hash: Option<Vec<u8>>,
+    /// Algorithm used for chunk hash
+    pub hash_algorithm: Option<ChecksumAlgorithm>,
 }
 
 /// NDN Data packet for a file chunk
@@ -599,6 +619,8 @@ impl FileChunker {
             } else {
                 None
             },
+            chunk_hash: None,
+            hash_algorithm: None,
         };
 
         debug!(
@@ -663,6 +685,8 @@ impl FileChunker {
             } else {
                 None
             },
+            chunk_hash: None,
+            hash_algorithm: None,
         };
 
         debug!(
@@ -1062,6 +1086,8 @@ impl Iterator for FileChunkIterator {
                 } else {
                     None
                 },
+                chunk_hash: None,
+                hash_algorithm: None,
             };
 
             let chunk_data_len = chunk_data.len();

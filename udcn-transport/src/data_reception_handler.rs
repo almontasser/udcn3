@@ -295,6 +295,8 @@ impl DataReceptionHandler {
             size: packet.content.len(),
             is_final: false, // Will be determined by higher-level logic
             file_metadata: None,
+            chunk_hash: None,
+            hash_algorithm: None,
         })
     }
 

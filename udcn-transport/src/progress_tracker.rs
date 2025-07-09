@@ -106,6 +106,53 @@ pub enum ProgressEvent {
         bytes_sent: u64,
         timestamp: u64,
     },
+    /// Chunk integrity verification started
+    IntegrityVerificationStarted {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        timestamp: u64,
+    },
+    /// Chunk integrity verification passed
+    IntegrityVerificationPassed {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        timestamp: u64,
+    },
+    /// Chunk integrity verification failed
+    IntegrityVerificationFailed {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        error: String,
+        timestamp: u64,
+    },
+    /// Chunk corruption detected
+    ChunkCorrupted {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        timestamp: u64,
+    },
+    /// Chunk recovery started
+    RecoveryStarted {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        attempt: u32,
+        timestamp: u64,
+    },
+    /// Chunk recovery succeeded
+    RecoverySucceeded {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        attempt: u32,
+        timestamp: u64,
+    },
+    /// Chunk recovery failed
+    RecoveryFailed {
+        session_id: TransferSessionId,
+        chunk_id: u32,
+        attempt: u32,
+        error: String,
+        timestamp: u64,
+    },
 }
 
 impl ProgressEvent {
@@ -227,6 +274,14 @@ pub struct FileTransferProgress {
     pub last_checkpoint_time: Instant,
     /// Checkpoint save interval in seconds
     pub checkpoint_interval: u64,
+    /// Integrity verification status
+    pub integrity_verified: bool,
+    /// Number of chunks verified for integrity
+    pub chunks_verified: u32,
+    /// Number of corrupted chunks detected
+    pub corrupted_chunks: u32,
+    /// Number of chunks recovered
+    pub recovered_chunks: u32,
 }
 
 /// Checkpoint data for resuming interrupted transfers
@@ -374,6 +429,10 @@ impl FileTransferProgress {
             checkpoint_path: None,
             last_checkpoint_time: now,
             checkpoint_interval: 30, // Default 30 seconds
+            integrity_verified: false,
+            chunks_verified: 0,
+            corrupted_chunks: 0,
+            recovered_chunks: 0,
         }
     }
 
