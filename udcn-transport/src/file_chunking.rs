@@ -19,6 +19,12 @@ pub struct ChunkingConfig {
     pub content_type: ContentType,
     /// Maximum number of chunks to create (-1 for unlimited)
     pub max_chunks: i64,
+    /// Enable large file handling mode (>1GB files)
+    pub large_file_mode: bool,
+    /// Maximum memory usage for large files (in bytes)
+    pub max_memory_usage: usize,
+    /// Read buffer size for streaming large files
+    pub stream_buffer_size: usize,
 }
 
 impl Default for ChunkingConfig {
@@ -29,6 +35,9 @@ impl Default for ChunkingConfig {
             include_metadata: true,
             content_type: ContentType::Blob,
             max_chunks: -1, // unlimited
+            large_file_mode: false,
+            max_memory_usage: 256 * 1024 * 1024, // 256MB default limit
+            stream_buffer_size: 1024 * 1024, // 1MB streaming buffer
         }
     }
 }
@@ -42,6 +51,9 @@ impl ChunkingConfig {
             include_metadata: true,
             content_type: ContentType::Blob,
             max_chunks: -1,
+            large_file_mode: false,
+            max_memory_usage: 128 * 1024 * 1024, // 128MB for QUIC
+            stream_buffer_size: 512 * 1024, // 512KB streaming buffer
         }
     }
 
@@ -53,6 +65,9 @@ impl ChunkingConfig {
             include_metadata: true,
             content_type: ContentType::Blob,
             max_chunks: -1,
+            large_file_mode: false,
+            max_memory_usage: 64 * 1024 * 1024, // 64MB for small files
+            stream_buffer_size: 256 * 1024, // 256KB streaming buffer
         }
     }
 
@@ -64,7 +79,61 @@ impl ChunkingConfig {
             include_metadata: true,
             content_type: ContentType::Blob,
             max_chunks: -1,
+            large_file_mode: true,
+            max_memory_usage: 512 * 1024 * 1024, // 512MB for large files
+            stream_buffer_size: 2 * 1024 * 1024, // 2MB streaming buffer
         }
+    }
+
+    /// Create config specifically for very large files (>1GB)
+    pub fn for_very_large_files() -> Self {
+        Self {
+            chunk_size: 1024 * 1024, // 1MB chunks for very large files
+            buffer_size: 2 * 1024 * 1024, // 2MB buffer
+            include_metadata: true,
+            content_type: ContentType::Blob,
+            max_chunks: -1,
+            large_file_mode: true,
+            max_memory_usage: 1024 * 1024 * 1024, // 1GB memory limit
+            stream_buffer_size: 4 * 1024 * 1024, // 4MB streaming buffer
+        }
+    }
+
+    /// Automatically configure based on file size
+    pub fn auto_configure(file_size: u64) -> Self {
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * MB;
+        
+        if file_size < 10 * MB {
+            Self::for_small_files()
+        } else if file_size < 100 * MB {
+            Self::for_large_files()
+        } else if file_size < GB {
+            let mut config = Self::for_large_files();
+            config.chunk_size = 256 * 1024; // 256KB chunks
+            config.max_memory_usage = 768 * MB as usize; // 768MB
+            config
+        } else {
+            Self::for_very_large_files()
+        }
+    }
+
+    /// Validate configuration for large file mode
+    pub fn validate_large_file_config(&self) -> Result<(), ChunkingError> {
+        if self.large_file_mode {
+            if self.stream_buffer_size < self.chunk_size {
+                return Err(ChunkingError::InvalidConfiguration {
+                    message: "Stream buffer size must be >= chunk size for large file mode".to_string(),
+                });
+            }
+            
+            if self.max_memory_usage < 2 * self.stream_buffer_size {
+                return Err(ChunkingError::InvalidConfiguration {
+                    message: "Max memory usage too low for large file mode streaming".to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +280,172 @@ pub enum ChunkingError {
     MetadataError(String),
     #[error("Chunk limit exceeded: {count} (max: {max})")]
     ChunkLimitExceeded { count: usize, max: usize },
+    #[error("Configuration error: {message}")]
+    InvalidConfiguration { message: String },
+    #[error("Memory limit exceeded: {used} bytes (max: {limit})")]
+    MemoryLimitExceeded { used: usize, limit: usize },
+}
+
+/// Streaming file reader for large files with memory management
+pub struct LargeFileReader {
+    file: File,
+    config: ChunkingConfig,
+    read_buffer: Vec<u8>,
+    current_position: u64,
+    file_size: u64,
+    memory_tracker: MemoryTracker,
+}
+
+/// Memory usage tracker for large file operations
+#[derive(Debug, Clone)]
+pub struct MemoryTracker {
+    current_usage: usize,
+    max_usage: usize,
+    peak_usage: usize,
+}
+
+impl MemoryTracker {
+    pub fn new(max_usage: usize) -> Self {
+        Self {
+            current_usage: 0,
+            max_usage,
+            peak_usage: 0,
+        }
+    }
+
+    pub fn allocate(&mut self, size: usize) -> Result<(), ChunkingError> {
+        let new_usage = self.current_usage + size;
+        if new_usage > self.max_usage {
+            return Err(ChunkingError::MemoryLimitExceeded {
+                used: new_usage,
+                limit: self.max_usage,
+            });
+        }
+        
+        self.current_usage = new_usage;
+        if self.current_usage > self.peak_usage {
+            self.peak_usage = self.current_usage;
+        }
+        
+        Ok(())
+    }
+
+    pub fn deallocate(&mut self, size: usize) {
+        self.current_usage = self.current_usage.saturating_sub(size);
+    }
+
+    pub fn current_usage(&self) -> usize {
+        self.current_usage
+    }
+
+    pub fn peak_usage(&self) -> usize {
+        self.peak_usage
+    }
+
+    pub fn available_memory(&self) -> usize {
+        self.max_usage.saturating_sub(self.current_usage)
+    }
+}
+
+impl LargeFileReader {
+    pub fn new<P: AsRef<Path>>(path: P, config: ChunkingConfig) -> Result<Self, ChunkingError> {
+        config.validate_large_file_config()?;
+        
+        let file = File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len();
+        
+        let memory_tracker = MemoryTracker::new(config.max_memory_usage);
+        let mut reader = Self {
+            file,
+            config: config.clone(),
+            read_buffer: Vec::new(),
+            current_position: 0,
+            file_size,
+            memory_tracker,
+        };
+        
+        // Pre-allocate buffer for streaming
+        reader.memory_tracker.allocate(config.stream_buffer_size)?;
+        reader.read_buffer = vec![0u8; config.stream_buffer_size];
+        
+        debug!(
+            "Created large file reader: {} bytes, buffer size: {} bytes, memory limit: {} MB",
+            file_size, 
+            config.stream_buffer_size,
+            config.max_memory_usage / (1024 * 1024)
+        );
+        
+        Ok(reader)
+    }
+
+    /// Read a chunk from the file using streaming approach
+    pub fn read_chunk(&mut self, sequence: usize, chunk_size: usize) -> Result<Vec<u8>, ChunkingError> {
+        // Calculate chunk position
+        let chunk_offset = (sequence * self.config.chunk_size) as u64;
+        let remaining_bytes = self.file_size.saturating_sub(chunk_offset);
+        let actual_chunk_size = chunk_size.min(remaining_bytes as usize);
+        
+        if actual_chunk_size == 0 {
+            return Ok(Vec::new());
+        }
+        
+        // Check memory before allocation
+        self.memory_tracker.allocate(actual_chunk_size)?;
+        
+        // Seek to chunk position if needed
+        if self.current_position != chunk_offset {
+            self.file.seek(SeekFrom::Start(chunk_offset))?;
+            self.current_position = chunk_offset;
+        }
+        
+        let mut chunk_data = Vec::with_capacity(actual_chunk_size);
+        let mut bytes_read = 0;
+        
+        // Read chunk in smaller buffers to manage memory
+        while bytes_read < actual_chunk_size {
+            let bytes_to_read = (actual_chunk_size - bytes_read).min(self.config.stream_buffer_size);
+            
+            // Read into our buffer
+            let read_count = self.file.read(&mut self.read_buffer[..bytes_to_read])?;
+            if read_count == 0 {
+                break; // EOF
+            }
+            
+            // Append to chunk data
+            chunk_data.extend_from_slice(&self.read_buffer[..read_count]);
+            bytes_read += read_count;
+            self.current_position += read_count as u64;
+        }
+        
+        // Release memory allocation tracking
+        self.memory_tracker.deallocate(actual_chunk_size);
+        
+        debug!(
+            "Read chunk {}: {} bytes at offset {}, memory usage: {} MB",
+            sequence,
+            chunk_data.len(),
+            chunk_offset,
+            self.memory_tracker.current_usage() / (1024 * 1024)
+        );
+        
+        Ok(chunk_data)
+    }
+
+    /// Get memory usage statistics
+    pub fn memory_stats(&self) -> (usize, usize, usize) {
+        (
+            self.memory_tracker.current_usage(),
+            self.memory_tracker.peak_usage(),
+            self.memory_tracker.available_memory(),
+        )
+    }
+
+    /// Reset to beginning of file
+    pub fn reset(&mut self) -> Result<(), ChunkingError> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.current_position = 0;
+        Ok(())
+    }
 }
 
 /// Streaming file chunker for efficient memory usage
@@ -218,6 +453,7 @@ pub struct FileChunker {
     config: ChunkingConfig,
     file_metadata: Option<FileMetadata>,
     progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    large_file_reader: Option<LargeFileReader>,
 }
 
 impl FileChunker {
@@ -227,6 +463,7 @@ impl FileChunker {
             config,
             file_metadata: None,
             progress_callback: None,
+            large_file_reader: None,
         }
     }
 
@@ -274,9 +511,18 @@ impl FileChunker {
             });
         }
 
+        // Initialize large file reader if needed
+        if self.config.large_file_mode || metadata.file_size > 1024 * 1024 * 1024 {
+            info!("Initializing large file reader for {} byte file", metadata.file_size);
+            self.large_file_reader = Some(LargeFileReader::new(path, self.config.clone())?);
+        }
+
         info!(
-            "Prepared file {:?} for chunking: {} bytes, {} chunks",
-            path, metadata.file_size, metadata.total_chunks
+            "Prepared file {:?} for chunking: {} bytes, {} chunks{}",
+            path, 
+            metadata.file_size, 
+            metadata.total_chunks,
+            if self.large_file_reader.is_some() { " (large file mode)" } else { "" }
         );
 
         self.file_metadata = Some(metadata);
@@ -366,6 +612,79 @@ impl FileChunker {
         Ok(FileChunk::new(base_name, sequence, chunk_data, chunk_info))
     }
 
+    /// Create a chunk with automatic large file handling
+    pub fn create_chunk_optimized(
+        &mut self,
+        base_name: &Name,
+        sequence: usize,
+    ) -> Result<FileChunk, ChunkingError> {
+        let metadata = self.file_metadata.as_ref()
+            .ok_or_else(|| ChunkingError::MetadataError("File not prepared".to_string()))?;
+
+        if sequence >= metadata.total_chunks {
+            return Err(ChunkingError::ChunkOutOfBounds {
+                sequence,
+                max: metadata.total_chunks - 1,
+            });
+        }
+
+        let offset = (sequence * self.config.chunk_size) as u64;
+        let is_final = sequence == metadata.total_chunks - 1;
+        
+        // Calculate actual chunk size (last chunk may be smaller)
+        let remaining_bytes = metadata.file_size - offset;
+        let chunk_size = if is_final {
+            remaining_bytes as usize
+        } else {
+            self.config.chunk_size
+        };
+
+        // Use large file reader if available, otherwise fall back to regular read
+        let chunk_data = if let Some(ref mut reader) = self.large_file_reader {
+            reader.read_chunk(sequence, chunk_size)?
+        } else {
+            // Fallback to regular file reading for compatibility
+            let mut file = File::open(&metadata.file_path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut data = vec![0u8; chunk_size];
+            file.read_exact(&mut data)?;
+            data
+        };
+
+        let chunk_info = ChunkInfo {
+            sequence,
+            size: chunk_data.len(),
+            offset,
+            is_final,
+            file_metadata: if sequence == 0 && self.config.include_metadata {
+                Some(metadata.clone())
+            } else {
+                None
+            },
+        };
+
+        debug!(
+            "Created optimized chunk {}/{}: {} bytes at offset {}{}",
+            sequence + 1, 
+            metadata.total_chunks, 
+            chunk_data.len(), 
+            offset,
+            if self.large_file_reader.is_some() { " (streaming)" } else { " (regular)" }
+        );
+
+        // Report progress if callback is set
+        if let Some(callback) = &self.progress_callback {
+            callback(sequence + 1, metadata.total_chunks);
+        }
+
+        Ok(FileChunk::new(base_name, sequence, chunk_data, chunk_info))
+    }
+
+    /// Get memory usage statistics for large file operations
+    pub fn memory_stats(&self) -> Option<(usize, usize, usize)> {
+        self.large_file_reader.as_ref().map(|reader| reader.memory_stats())
+    }
+
     /// Create all chunks for a file as an iterator
     pub fn chunk_file<P: AsRef<Path>>(
         &mut self,
@@ -374,14 +693,24 @@ impl FileChunker {
     ) -> Result<FileChunkIterator, ChunkingError> {
         self.validate_config()?;
         let metadata = self.prepare_file(path.as_ref())?.clone();
-        let file = File::open(path.as_ref())?;
-
-        Ok(FileChunkIterator::new(
-            file,
-            base_name.clone(),
-            metadata,
-            self.config.clone(),
-        ))
+        
+        // Use large file reader if available, otherwise regular file
+        if let Some(reader) = self.large_file_reader.take() {
+            Ok(FileChunkIterator::new_with_large_file_reader(
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                reader,
+            ))
+        } else {
+            let file = File::open(path.as_ref())?;
+            Ok(FileChunkIterator::new(
+                file,
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+            ))
+        }
     }
 
     /// Create all chunks for a file as an iterator with progress callback
@@ -396,14 +725,24 @@ impl FileChunker {
     {
         self.validate_config()?;
         let metadata = self.prepare_file(path.as_ref())?.clone();
-        let file = File::open(path.as_ref())?;
-
-        Ok(FileChunkIterator::new(
-            file,
-            base_name.clone(),
-            metadata,
-            self.config.clone(),
-        ).with_progress_callback(progress_callback))
+        
+        // Use large file reader if available, otherwise regular file
+        if let Some(reader) = self.large_file_reader.take() {
+            Ok(FileChunkIterator::new_with_large_file_reader(
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+                reader,
+            ).with_progress_callback(progress_callback))
+        } else {
+            let file = File::open(path.as_ref())?;
+            Ok(FileChunkIterator::new(
+                file,
+                base_name.clone(),
+                metadata,
+                self.config.clone(),
+            ).with_progress_callback(progress_callback))
+        }
     }
 
     /// Estimate optimal chunk size based on file size and transport
@@ -428,13 +767,14 @@ impl FileChunker {
 
 /// Iterator for streaming file chunks
 pub struct FileChunkIterator {
-    file: File,
+    file: Option<File>,
     base_name: Name,
     metadata: FileMetadata,
     config: ChunkingConfig,
     current_sequence: usize,
     current_offset: u64,
     progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    large_file_reader: Option<LargeFileReader>,
 }
 
 impl FileChunkIterator {
@@ -448,13 +788,32 @@ impl FileChunkIterator {
         let _ = file.seek(SeekFrom::Start(0));
         
         Self {
-            file,
+            file: Some(file),
             base_name,
             metadata,
             config,
             current_sequence: 0,
             current_offset: 0,
             progress_callback: None,
+            large_file_reader: None,
+        }
+    }
+
+    fn new_with_large_file_reader(
+        base_name: Name,
+        metadata: FileMetadata,
+        config: ChunkingConfig,
+        large_file_reader: LargeFileReader,
+    ) -> Self {
+        Self {
+            file: None,
+            base_name,
+            metadata,
+            config,
+            current_sequence: 0,
+            current_offset: 0,
+            progress_callback: None,
+            large_file_reader: Some(large_file_reader),
         }
     }
 
@@ -488,7 +847,11 @@ impl FileChunkIterator {
 
         self.current_sequence = sequence;
         self.current_offset = (sequence * self.config.chunk_size) as u64;
-        self.file.seek(SeekFrom::Start(self.current_offset))?;
+        
+        if let Some(ref mut file) = self.file {
+            file.seek(SeekFrom::Start(self.current_offset))?;
+        }
+        // Note: LargeFileReader handles seeking internally
         
         Ok(())
     }
@@ -513,16 +876,25 @@ impl Iterator for FileChunkIterator {
             self.config.chunk_size
         };
 
-        // Read chunk data
-        let mut chunk_data = vec![0u8; chunk_size];
-        match self.file.read_exact(&mut chunk_data) {
-            Ok(()) => {},
-            Err(e) => return Some(Err(ChunkingError::Io(e))),
-        }
+        // Read chunk data using appropriate method
+        let chunk_data = if let Some(ref mut reader) = self.large_file_reader {
+            match reader.read_chunk(sequence, chunk_size) {
+                Ok(data) => data,
+                Err(e) => return Some(Err(e)),
+            }
+        } else if let Some(ref mut file) = self.file {
+            let mut data = vec![0u8; chunk_size];
+            match file.read_exact(&mut data) {
+                Ok(()) => data,
+                Err(e) => return Some(Err(ChunkingError::Io(e))),
+            }
+        } else {
+            return Some(Err(ChunkingError::MetadataError("No file or reader available".to_string())));
+        };
 
         let chunk_info = ChunkInfo {
             sequence,
-            size: chunk_size,
+            size: chunk_data.len(),
             offset: self.current_offset,
             is_final,
             file_metadata: if sequence == 0 && self.config.include_metadata {
@@ -532,6 +904,7 @@ impl Iterator for FileChunkIterator {
             },
         };
 
+        let chunk_data_len = chunk_data.len();
         let chunk = FileChunk::new(
             &self.base_name,
             sequence,
@@ -541,11 +914,14 @@ impl Iterator for FileChunkIterator {
 
         // Update state for next iteration
         self.current_sequence += 1;
-        self.current_offset += chunk_size as u64;
+        self.current_offset += chunk_data_len as u64;
 
         debug!(
-            "Generated chunk {}/{}: {} bytes",
-            sequence + 1, self.metadata.total_chunks, chunk_size
+            "Generated chunk {}/{}: {} bytes{}",
+            sequence + 1, 
+            self.metadata.total_chunks, 
+            chunk_data_len,
+            if self.large_file_reader.is_some() { " (streaming)" } else { "" }
         );
 
         // Report progress if callback is set
