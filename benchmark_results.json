@@ -1,0 +1,33 @@
+{
+  "timestamp": "2025-07-09T10:22:02.420880376+00:00",
+  "results": {
+    "network_throughput": {
+      "name": "throughput",
+      "duration": {
+        "secs": 3,
+        "nanos": 1691603
+      },
+      "operations": 2119,
+      "throughput": 705.9352792546024,
+      "latency_avg": {
+        "secs": 0,
+        "nanos": 1413935
+      },
+      "latency_min": {
+        "secs": 0,
+        "nanos": 193544
+      },
+      "latency_max": {
+        "secs": 0,
+        "nanos": 7556196
+      },
+      "success_rate": 99.95280792826804
+    }
+  },
+  "summary": {
+    "total_operations": 2119,
+    "average_throughput": 705.9352792546024,
+    "average_latency": 1.4139350000000002,
+    "total_duration": 3.001691603
+  }
+}

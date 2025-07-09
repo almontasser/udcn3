@@ -24,6 +24,8 @@ chrono = { workspace = true, features = ["clock"] }
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }
 udcn-transport = { path = "../udcn-transport" }
+fastrand = "2.0"
+rand = "0.8"
 
 [[bench]]
 name = "network_bench"
