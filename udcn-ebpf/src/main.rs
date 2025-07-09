@@ -2451,7 +2451,4 @@ const NDN_TLV_DATA: u8 = 0x06;
 const NDN_TLV_NAME: u8 = 0x07;
 const NDN_TLV_NAME_COMPONENT: u8 = 0x08;
 
-/// Version information
-#[link_section = "version"]
-#[no_mangle]
-static VERSION: [u8; 8] = *b"0.1.0\0\0\0";
+// Version section removed - was causing kernel version mismatch errors in containers

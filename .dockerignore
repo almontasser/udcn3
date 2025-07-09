@@ -1,5 +1,12 @@
 # Rust build artifacts
 target/
+# But allow debug binaries for Docker build
+!target/debug/udcn
+!target/debug/udcnd
+!target/debug/udcn-cli
+!target/debug/udcn-bench
+# Allow eBPF program
+!target/bpfel-unknown-none/debug/udcn
 Cargo.lock
 
 # IDE files

@@ -1,29 +1,44 @@
 version: '3.8'
 
 services:
-  # Main UDCN daemon service
-  udcnd:
+  # Node 1 - Primary UDCN daemon
+  udcn-node1:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: udcnd
-    privileged: true  # Required for eBPF operations
-    network_mode: host  # Required for network manipulation
-    volumes:
-      - /sys/kernel/debug:/sys/kernel/debug:ro
-      - /lib/modules:/lib/modules:ro
-      - /usr/src:/usr/src:ro
-      - udcn_data:/var/lib/udcn
-      - udcn_logs:/var/log/udcn
-      - ./config:/opt/udcn/config:ro
+    container_name: udcn-node1
+    hostname: node1
+    privileged: true  # Required for eBPF
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     environment:
       - RUST_LOG=info
-      - UDCN_CONFIG_PATH=/opt/udcn/config
-      - UDCN_DATA_PATH=/var/lib/udcn
-      - UDCN_LOG_PATH=/var/log/udcn
-    restart: unless-stopped
-    depends_on:
-      - udcn-db
+      - UDCN_NODE_ID=1
+      - UDCN_LISTEN_PORT=8080
+      - UDCN_PEERS=udcn-node2:8081,udcn-node3:8082
+      - UDCN_DISCOVERY_ENABLED=true
+      - UDCN_SERVICE_NAME=udcn-node1
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/opt/udcn/config:ro
+      - node1_data:/var/lib/udcn
+      - node1_logs:/var/log/udcn
+      - /sys/fs/bpf:/sys/fs/bpf:rw  # Mount BPF filesystem
+      - /lib/modules:/lib/modules:ro  # Mount kernel modules
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.10
+        aliases:
+          - node1
+          - udcn-primary
+    command: ["udcnd", "--config", "/opt/udcn/config/node1.conf"]
     healthcheck:
       test: ["CMD", "udcn-cli", "status"]
       interval: 30s
@@ -31,126 +46,206 @@ services:
       retries: 3
       start_period: 10s
 
-  # Development environment with tools
-  udcn-dev:
+  # Node 2 - Secondary UDCN daemon
+  udcn-node2:
     build:
       context: .
       dockerfile: Dockerfile
-      target: builder
-    container_name: udcn-dev
-    privileged: true
-    network_mode: host
-    volumes:
-      - .:/app:cached
-      - /sys/kernel/debug:/sys/kernel/debug:ro
-      - /lib/modules:/lib/modules:ro
-      - /usr/src:/usr/src:ro
-      - rust_cache:/usr/local/cargo/registry
-      - target_cache:/app/target
+    container_name: udcn-node2
+    hostname: node2
+    privileged: true  # Required for eBPF
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     environment:
-      - RUST_LOG=debug
-      - CARGO_TARGET_DIR=/app/target
-    working_dir: /app
-    command: bash
-    stdin_open: true
-    tty: true
-    profiles:
-      - dev
-
-  # Database service (for persistent storage)
-  udcn-db:
-    image: postgres:15-alpine
-    container_name: udcn-db
-    environment:
-      - POSTGRES_DB=udcn
-      - POSTGRES_USER=udcn
-      - POSTGRES_PASSWORD=udcn_password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - RUST_LOG=info
+      - UDCN_NODE_ID=2
+      - UDCN_LISTEN_PORT=8081
+      - UDCN_PEERS=udcn-node1:8080,udcn-node3:8082
+      - UDCN_DISCOVERY_ENABLED=true
+      - UDCN_SERVICE_NAME=udcn-node2
     ports:
-      - "5432:5432"
-    restart: unless-stopped
+      - "8081:8081"
+    volumes:
+      - ./config:/opt/udcn/config:ro
+      - node2_data:/var/lib/udcn
+      - node2_logs:/var/log/udcn
+      - /sys/fs/bpf:/sys/fs/bpf:rw  # Mount BPF filesystem
+      - /lib/modules:/lib/modules:ro  # Mount kernel modules
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.11
+        aliases:
+          - node2
+          - udcn-secondary
+    command: ["udcnd", "--config", "/opt/udcn/config/node2.conf"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U udcn"]
+      test: ["CMD", "udcn-cli", "status"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 10s
 
-  # Monitoring and metrics
-  udcn-metrics:
+  # Node 3 - Third UDCN daemon
+  udcn-node3:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: udcn-metrics
-    command: ["udcn-bench", "monitor"]
-    depends_on:
-      - udcnd
-    volumes:
-      - udcn_logs:/var/log/udcn:ro
+    container_name: udcn-node3
+    hostname: node3
+    privileged: true  # Required for eBPF
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - BPF
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     environment:
       - RUST_LOG=info
-      - METRICS_INTERVAL=60
-    restart: unless-stopped
-    profiles:
-      - monitoring
+      - UDCN_NODE_ID=3
+      - UDCN_LISTEN_PORT=8082
+      - UDCN_PEERS=udcn-node1:8080,udcn-node2:8081
+      - UDCN_DISCOVERY_ENABLED=true
+      - UDCN_SERVICE_NAME=udcn-node3
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./config:/opt/udcn/config:ro
+      - node3_data:/var/lib/udcn
+      - node3_logs:/var/log/udcn
+      - /sys/fs/bpf:/sys/fs/bpf:rw  # Mount BPF filesystem
+      - /lib/modules:/lib/modules:ro  # Mount kernel modules
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.12
+        aliases:
+          - node3
+          - udcn-tertiary
+    command: ["udcnd", "--config", "/opt/udcn/config/node3.conf"]
+    healthcheck:
+      test: ["CMD", "udcn-cli", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
-  # Testing environment
-  udcn-test:
+  # CLI tool for testing
+  udcn-cli-test:
     build:
       context: .
       dockerfile: Dockerfile
-      target: builder
-    container_name: udcn-test
-    privileged: true
-    network_mode: host
+    container_name: udcn-cli-test
+    hostname: cli-test
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.20
     volumes:
-      - .:/app:cached
-      - /sys/kernel/debug:/sys/kernel/debug:ro
-      - /lib/modules:/lib/modules:ro
-      - /usr/src:/usr/src:ro
-      - rust_cache:/usr/local/cargo/registry
-      - target_cache:/app/target
-    environment:
-      - RUST_LOG=debug
-      - CARGO_TARGET_DIR=/app/target
-    working_dir: /app
-    command: ["cargo", "test", "--workspace"]
-    profiles:
-      - test
-
-  # Load balancer/reverse proxy
-  udcn-proxy:
-    image: nginx:alpine
-    container_name: udcn-proxy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./config/ssl:/etc/nginx/ssl:ro
+      - ./config:/opt/udcn/config:ro
+      - ./test-data:/opt/udcn/test-data:ro
+    command: ["tail", "-f", "/dev/null"]  # Keep container running
     depends_on:
-      - udcnd
+      - udcn-node1
+      - udcn-node2
+      - udcn-node3
+    profiles:
+      - testing
+
+  # Load balancer for UDCN nodes
+  udcn-loadbalancer:
+    image: nginx:alpine
+    container_name: udcn-loadbalancer
+    hostname: loadbalancer
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.2
+        aliases:
+          - lb
+          - udcn-lb
+    ports:
+      - "8000:80"
+    volumes:
+      - ./config/nginx/udcn-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - udcn-node1
+      - udcn-node2
+      - udcn-node3
     restart: unless-stopped
     profiles:
-      - proxy
+      - loadbalancer
+
+  # Service discovery and health monitoring
+  udcn-discovery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: udcn-discovery
+    hostname: discovery
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.5
+    environment:
+      - RUST_LOG=info
+      - UDCN_DISCOVERY_PORT=8090
+      - UDCN_HEALTH_CHECK_INTERVAL=30
+    ports:
+      - "8090:8090"
+    command: ["udcn-cli", "discovery", "--port", "8090"]
+    depends_on:
+      - udcn-node1
+      - udcn-node2
+      - udcn-node3
+    volumes:
+      - ./config:/opt/udcn/config:ro
+    profiles:
+      - discovery
+
+  # Benchmarking tool
+  udcn-bench-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: udcn-bench-test
+    hostname: bench-test
+    networks:
+      udcn_network:
+        ipv4_address: 172.20.0.21
+    volumes:
+      - ./config:/opt/udcn/config:ro
+      - ./benchmark-results:/opt/udcn/results
+    command: ["udcn-bench", "--config", "/opt/udcn/config/bench.conf"]
+    depends_on:
+      - udcn-node1
+      - udcn-node2
+      - udcn-node3
+    profiles:
+      - benchmarking
 
 volumes:
-  udcn_data:
+  node1_data:
     driver: local
-  udcn_logs:
+  node1_logs:
     driver: local
-  postgres_data:
+  node2_data:
     driver: local
-  rust_cache:
+  node2_logs:
     driver: local
-  target_cache:
+  node3_data:
+    driver: local
+  node3_logs:
     driver: local
 
 networks:
-  default:
+  udcn_network:
     driver: bridge
     ipam:
       driver: default
       config:
         - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
