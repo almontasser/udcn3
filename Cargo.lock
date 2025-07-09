@@ -2191,6 +2191,7 @@ dependencies = [
  "aya",
  "aya-log",
  "bincode",
+ "crc32fast",
  "env_logger 0.10.2",
  "fastrand",
  "libc",

@@ -21,6 +21,9 @@ pub mod data_reception_handler;
 pub mod file_reassembly;
 pub mod file_integrity;
 pub mod pipeline_coordinator;
+pub mod packet_fragmentation;
+pub mod packet_reassembly;
+pub mod fragmented_transport;
 
 pub use tcp::*;
 pub use udp::*;
@@ -55,6 +58,15 @@ pub use file_reassembly::{FileReassemblyEngine, ReassemblyConfig, ReassemblyStat
 
 // File integrity exports
 pub use file_integrity::{FileIntegrityEngine, IntegrityConfig, IntegrityStatus, IntegrityResult, ChecksumResult, SignatureResult, ChecksumAlgorithm, SignatureAlgorithm, IntegrityError, IntegrityStats};
+
+// Packet fragmentation exports
+pub use packet_fragmentation::{PacketFragmenter, FragmentationConfig, Fragment, FragmentHeader, FragmentationError, DEFAULT_MTU, MIN_FRAGMENT_SIZE};
+
+// Packet reassembly exports
+pub use packet_reassembly::{PacketReassembler, ReassemblyConfig as PacketReassemblyConfig, ReassemblyStats as PacketReassemblyStats, ReassemblyError};
+
+// Fragmented transport exports
+pub use fragmented_transport::{FragmentedTransport, FragmentedTransportError};
 
 pub trait Transport {
     fn send(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
