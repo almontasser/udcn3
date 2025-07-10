@@ -104,50 +104,51 @@ impl EbpfManager {
         self.program_loaded
     }
 
-    /// Get access to a specific eBPF map with default key type
-    pub async fn get_map<T>(&self, name: &str) -> Result<HashMap<&aya::maps::MapData, u32, T>, Box<dyn std::error::Error>>
-    where
-        T: 'static + Send + Sync + Clone,
-    {
-        debug!("Getting eBPF map: {}", name);
-        if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map(name)
-                .ok_or_else(|| format!("Map '{}' not found", name))?;
-            let hash_map: HashMap<&aya::maps::MapData, u32, T> = map.try_into()
-                .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
-            Ok(hash_map)
-        } else {
-            Err("eBPF program not loaded".into())
-        }
-    }
+    // TODO: These methods need to be restructured to avoid lifetime issues
+    // /// Get access to a specific eBPF map with default key type
+    // pub async fn get_map<T>(&self, name: &str) -> Result<HashMap<&mut aya::maps::MapData, u32, T>, Box<dyn std::error::Error>>
+    // where
+    //     T: 'static + Send + Sync + Clone + aya::Pod,
+    // {
+    //     debug!("Getting eBPF map: {}", name);
+    //     if let Some(bpf_arc) = &self.bpf {
+    //         let mut bpf = bpf_arc.write().await;
+    //         let map = bpf.map_mut(name)
+    //             .ok_or_else(|| format!("Map '{}' not found", name))?;
+    //         let hash_map: HashMap<&mut aya::maps::MapData, u32, T> = HashMap::try_from(map)
+    //             .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
+    //         Ok(hash_map)
+    //     } else {
+    //         Err("eBPF program not loaded".into())
+    //     }
+    // }
 
-    /// Get access to a specific eBPF map with custom key type
-    pub async fn get_map_with_key<K, T>(&self, name: &str) -> Result<HashMap<&aya::maps::MapData, K, T>, Box<dyn std::error::Error>>
-    where
-        K: 'static + Send + Sync + Clone,
-        T: 'static + Send + Sync + Clone,
-    {
-        debug!("Getting eBPF map with custom key: {}", name);
-        if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map(name)
-                .ok_or_else(|| format!("Map '{}' not found", name))?;
-            let hash_map: HashMap<&aya::maps::MapData, K, T> = map.try_into()
-                .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
-            Ok(hash_map)
-        } else {
-            Err("eBPF program not loaded".into())
-        }
-    }
+    // /// Get access to a specific eBPF map with custom key type
+    // pub async fn get_map_with_key<K, T>(&self, name: &str) -> Result<HashMap<&mut aya::maps::MapData, K, T>, Box<dyn std::error::Error>>
+    // where
+    //     K: 'static + Send + Sync + Clone + aya::Pod,
+    //     T: 'static + Send + Sync + Clone + aya::Pod,
+    // {
+    //     debug!("Getting eBPF map with custom key: {}", name);
+    //     if let Some(bpf_arc) = &self.bpf {
+    //         let mut bpf = bpf_arc.write().await;
+    //         let map = bpf.map_mut(name)
+    //             .ok_or_else(|| format!("Map '{}' not found", name))?;
+    //         let hash_map: HashMap<&mut aya::maps::MapData, K, T> = HashMap::try_from(map)
+    //             .map_err(|e| format!("Failed to convert map '{}' to HashMap: {}", name, e))?;
+    //         Ok(hash_map)
+    //     } else {
+    //         Err("eBPF program not loaded".into())
+    //     }
+    // }
 
     /// Get packet statistics from the eBPF program
     pub async fn get_packet_stats(&self) -> Result<PacketStats, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map("PACKET_STATS")
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("PACKET_STATS")
                 .ok_or("PACKET_STATS map not found")?;
-            let stats_map: HashMap<&aya::maps::MapData, u32, PacketStats> = map.try_into()?;
+            let stats_map: HashMap<&mut aya::maps::MapData, u32, PacketStats> = HashMap::try_from(map)?;
             
             // Get statistics from the map (key 0 is typically used for global stats)
             match stats_map.get(&0, 0) {
@@ -179,10 +180,10 @@ impl EbpfManager {
     /// Get PIT statistics from the eBPF program
     pub async fn get_pit_stats(&self) -> Result<PitStats, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map("PIT_STATS")
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("PIT_STATS")
                 .ok_or("PIT_STATS map not found")?;
-            let pit_stats_map: HashMap<&aya::maps::MapData, u32, PitStats> = map.try_into()?;
+            let pit_stats_map: HashMap<&mut aya::maps::MapData, u32, PitStats> = HashMap::try_from(map)?;
             
             // Get PIT statistics from the map (key 0 is typically used for global stats)
             match pit_stats_map.get(&0, 0) {
@@ -215,10 +216,10 @@ impl EbpfManager {
     /// Get Content Store statistics from the eBPF program
     pub async fn get_cs_stats(&self) -> Result<ContentStoreStats, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map("CS_STATS")
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("CS_STATS")
                 .ok_or("CS_STATS map not found")?;
-            let cs_stats_map: HashMap<&aya::maps::MapData, u32, ContentStoreStats> = map.try_into()?;
+            let cs_stats_map: HashMap<&mut aya::maps::MapData, u32, ContentStoreStats> = HashMap::try_from(map)?;
             
             // Get CS statistics from the map (key 0 is typically used for global stats)
             match cs_stats_map.get(&0, 0) {
@@ -251,7 +252,7 @@ impl EbpfManager {
             let mut bpf = bpf_arc.write().await;
             let map = bpf.map_mut("CONFIG_MAP")
                 .ok_or("CONFIG_MAP map not found")?;
-            let mut config_map: HashMap<&mut aya::maps::MapData, u32, UdcnConfig> = map.try_into()?;
+            let mut config_map: HashMap<&mut aya::maps::MapData, u32, UdcnConfig> = HashMap::try_from(map)?;
             
             // Update the configuration in the eBPF map (key 0 is typically used for global config)
             config_map.insert(0, config.clone(), 0)?;
@@ -269,7 +270,7 @@ impl EbpfManager {
             let mut bpf = bpf_arc.write().await;
             let map = bpf.map_mut("FACE_TABLE")
                 .ok_or("FACE_TABLE map not found")?;
-            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
+            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = HashMap::try_from(map)?;
             
             // Insert the face into the eBPF face table
             face_table.insert(face_id, face_info.clone(), 0)?;
@@ -287,7 +288,7 @@ impl EbpfManager {
             let mut bpf = bpf_arc.write().await;
             let map = bpf.map_mut("FACE_TABLE")
                 .ok_or("FACE_TABLE map not found")?;
-            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
+            let mut face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = HashMap::try_from(map)?;
             
             // Remove the face from the eBPF face table
             face_table.remove(&face_id)?;
@@ -302,10 +303,10 @@ impl EbpfManager {
     /// Get face information
     pub async fn get_face(&self, face_id: u32) -> Result<FaceInfo, Box<dyn std::error::Error>> {
         if let Some(bpf_arc) = &self.bpf {
-            let bpf = bpf_arc.read().await;
-            let map = bpf.map("FACE_TABLE")
+            let mut bpf = bpf_arc.write().await;
+            let map = bpf.map_mut("FACE_TABLE")
                 .ok_or("FACE_TABLE map not found")?;
-            let face_table: HashMap<&aya::maps::MapData, u32, FaceInfo> = map.try_into()?;
+            let face_table: HashMap<&mut aya::maps::MapData, u32, FaceInfo> = HashMap::try_from(map)?;
             
             // Get the face from the eBPF face table
             match face_table.get(&face_id, 0) {
@@ -329,7 +330,7 @@ impl EbpfManager {
             let mut bpf = bpf_arc.write().await;
             let map = bpf.map_mut("PIT_TABLE")
                 .ok_or("PIT_TABLE map not found")?;
-            let mut pit_table: HashMap<&mut aya::maps::MapData, u32, PitEntry> = map.try_into()?;
+            let mut pit_table: HashMap<&mut aya::maps::MapData, u32, PitEntry> = HashMap::try_from(map)?;
             
             // Clear all PIT entries by iterating through and removing each one
             let mut keys_to_remove = Vec::new();
@@ -358,7 +359,7 @@ impl EbpfManager {
             let mut bpf = bpf_arc.write().await;
             let map = bpf.map_mut("CONTENT_STORE")
                 .ok_or("CONTENT_STORE map not found")?;
-            let mut cs_table: HashMap<&mut aya::maps::MapData, u32, ContentStoreEntry> = map.try_into()?;
+            let mut cs_table: HashMap<&mut aya::maps::MapData, u32, ContentStoreEntry> = HashMap::try_from(map)?;
             
             // Clear all Content Store entries by iterating through and removing each one
             let mut keys_to_remove = Vec::new();

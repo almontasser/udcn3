@@ -2,7 +2,7 @@ use clap::ArgMatches;
 use log::{info, warn, error};
 use std::path::Path;
 use std::net::SocketAddr;
-use crate::utils::{format_bytes, FileChunker, ProgressTracker};
+use crate::utils::format_bytes;
 use crate::daemon_client::DaemonClient;
 use crate::node_manager::NodeManager;
 use crate::file_transfer::SimpleFileTransfer;
@@ -199,22 +199,19 @@ pub async fn handle_send_command(matches: &ArgMatches) -> Result<(), Box<dyn std
         }
         Err(e) => {
             error!("File transfer failed: {}", e);
-            // Fall back to simulation mode for now
-            warn!("Falling back to simulation mode");
-            
-            let chunker = FileChunker::new(chunk_size);
-            let chunks = chunker.chunk_file(path)?;
-            
-            if show_progress {
-                let mut progress = ProgressTracker::new(chunks.len());
-                for (i, _chunk) in chunks.iter().enumerate() {
-                    progress.update(i + 1, Some(format!("Chunk {}/{}", i + 1, chunks.len())));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await; // Simulate work
-                }
-                progress.finish("File sent successfully (simulation mode)");
+            // Try to provide more specific error information
+            if e.to_string().contains("connection refused") {
+                eprintln!("Error: Could not connect to target address {}", target_addr);
+                eprintln!("Make sure the receiver is running and listening on the correct port");
+            } else if e.to_string().contains("timeout") {
+                eprintln!("Error: Transfer timed out");
+                eprintln!("Try increasing the timeout or check network connectivity");
+            } else if e.to_string().contains("No such file") {
+                eprintln!("Error: File not found: {}", path.display());
             } else {
-                println!("Processed {} chunks (simulation mode)", chunks.len());
+                eprintln!("Error: File transfer failed: {}", e);
             }
+            return Err(e);
         }
     }
 
@@ -256,19 +253,22 @@ pub async fn handle_receive_command(matches: &ArgMatches) -> Result<(), Box<dyn 
         }
         Err(e) => {
             error!("File receive failed: {}", e);
-            // Fall back to simulation mode for now
-            warn!("Falling back to simulation mode");
-            
-            if show_progress {
-                let mut progress = ProgressTracker::new(100); // Simulate unknown total
-                for i in 1..=100 {
-                    progress.update(i, Some(format!("Receiving chunk {}", i)));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
-                progress.finish("File received successfully (simulation mode)");
+            // Try to provide more specific error information
+            if e.to_string().contains("connection refused") {
+                eprintln!("Error: Could not connect to source address {}", source_addr);
+                eprintln!("Make sure the sender is running and accessible");
+            } else if e.to_string().contains("timeout") {
+                eprintln!("Error: Receive timed out after {} seconds", timeout);
+                eprintln!("Try increasing the timeout or check network connectivity");
+            } else if e.to_string().contains("No such file") {
+                eprintln!("Error: Output path invalid: {}", output_path);
+            } else if e.to_string().contains("metadata") {
+                eprintln!("Error: Failed to receive file metadata from sender");
+                eprintln!("Check that the sender has the requested file: {}", ndn_name);
             } else {
-                println!("File receive simulation completed");
+                eprintln!("Error: File receive failed: {}", e);
             }
+            return Err(e);
         }
     }
 

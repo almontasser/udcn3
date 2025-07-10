@@ -16,5 +16,9 @@ serde = { workspace = true }
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
+ed25519-dalek = "2.1"
+x509-parser = "0.15"
+ring = "0.17"
+rustls-pemfile = "1.0"
 
 udcn-common = { path = "../udcn-common" }

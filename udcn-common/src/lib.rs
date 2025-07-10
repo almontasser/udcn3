@@ -189,6 +189,9 @@ impl UdcnConfig {
     }
 }
 
+#[cfg(feature = "user")]
+unsafe impl Pod for UdcnConfig {}
+
 /// Flow table entry for connection tracking
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

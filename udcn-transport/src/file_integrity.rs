@@ -13,6 +13,10 @@ use tokio::sync::mpsc;
 use blake3::Hasher as Blake3Hasher;
 use md5::{Md5, Digest as Md5Digest};
 use sha2::{Sha256, Sha512, Digest as Sha2Digest};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use ring::signature;
+use x509_parser::prelude::*;
+use rustls_pemfile::certs;
 
 use crate::file_chunking::FileMetadata;
 
@@ -178,6 +182,16 @@ pub enum IntegrityError {
     RecoveryFailed { attempts: u32 },
     #[error("Recovery timeout")]
     RecoveryTimeout,
+    #[error("Certificate validation failed: {0}")]
+    CertificateValidationFailed(String),
+    #[error("Invalid certificate format: {0}")]
+    InvalidCertificateFormat(String),
+    #[error("Certificate chain validation failed: {0}")]
+    CertificateChainValidationFailed(String),
+    #[error("Key retrieval failed: {0}")]
+    KeyRetrievalFailed(String),
+    #[error("Signature verification failed: {0}")]
+    SignatureVerificationFailed(String),
 }
 
 /// Statistics for integrity verification
@@ -469,16 +483,74 @@ impl FileIntegrityEngine {
     /// Verify file signature
     async fn verify_signature(
         &self,
-        _file_path: &PathBuf,
-        _metadata: &FileMetadata,
+        file_path: &PathBuf,
+        metadata: &FileMetadata,
     ) -> Result<SignatureResult, IntegrityError> {
-        // Placeholder implementation for signature verification
-        // This would need to be implemented based on the specific signature scheme used
-        Ok(SignatureResult {
-            algorithm: SignatureAlgorithm::Ed25519,
-            valid: true, // Placeholder - always return valid for now
-            signer: None,
-        })
+        // Check if signature verification is disabled
+        if !self.config.enable_signature {
+            return Ok(SignatureResult {
+                algorithm: SignatureAlgorithm::Ed25519,
+                valid: true, // Skip verification if disabled
+                signer: None,
+            });
+        }
+
+        // Read file content for signature verification
+        let file_content = std::fs::read(file_path)?;
+        
+        // Check if we have signature metadata
+        if let Some(signature_data) = metadata.file_hash.as_ref() {
+            // Default to Ed25519 for now - this should be configurable
+            let algorithm = SignatureAlgorithm::Ed25519;
+            
+            // Verify using the configured algorithm
+            let is_valid = match algorithm {
+                SignatureAlgorithm::Ed25519 => {
+                    self.verify_ed25519_signature(&file_content, signature_data).await
+                }
+                SignatureAlgorithm::RsaSha256 => {
+                    self.verify_rsa_signature(&file_content, signature_data).await
+                }
+                SignatureAlgorithm::EcdsaSha256 => {
+                    self.verify_ecdsa_signature(&file_content, signature_data).await
+                }
+            };
+            
+            Ok(SignatureResult {
+                algorithm,
+                valid: is_valid,
+                signer: None, // Would need to extract from signature metadata
+            })
+        } else {
+            // No signature metadata available
+            Ok(SignatureResult {
+                algorithm: SignatureAlgorithm::Ed25519,
+                valid: false, // No signature to verify
+                signer: None,
+            })
+        }
+    }
+    
+    /// Verify Ed25519 signature
+    async fn verify_ed25519_signature(&self, _data: &[u8], _signature: &[u8]) -> bool {
+        // Real Ed25519 signature verification would go here
+        // For now, return false to indicate that signature verification is not fully implemented
+        // This is better than always returning true (the placeholder)
+        false
+    }
+    
+    /// Verify RSA signature
+    async fn verify_rsa_signature(&self, _data: &[u8], _signature: &[u8]) -> bool {
+        // Real RSA signature verification would go here
+        // For now, return false to indicate that signature verification is not fully implemented
+        false
+    }
+    
+    /// Verify ECDSA signature
+    async fn verify_ecdsa_signature(&self, _data: &[u8], _signature: &[u8]) -> bool {
+        // Real ECDSA signature verification would go here
+        // For now, return false to indicate that signature verification is not fully implemented
+        false
     }
     
     /// Compute file checksum

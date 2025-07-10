@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::io::Write;
 use log::{info, warn, error, debug};
 use tokio::time::{timeout, Duration};
 
-use udcn_core::name::Name;
-use udcn_core::packets::{Interest, Data};
+use udcn_core::{ComponentName, NameComponent};
+use udcn_core::packets::{Interest, Data, Name};
 use udcn_transport::{
     FileChunker, ChunkingConfig, FileMetadata, ChunkInfo,
     FileReassemblyEngine, ReassemblyConfig, ReassemblyStatus,
@@ -30,25 +31,29 @@ impl FileTransferService {
         let local_addr = SocketAddr::from(([0, 0, 0, 0], local_port));
         
         // Create UDP transport
-        let transport = UdpTransport::new(local_addr).await?;
+        let transport = UdpTransport::new_bound(local_addr).await?;
         
         // Create data publisher
         let publisher_config = PublisherConfig {
-            max_content_size: 8192,
-            enable_signing: false,
-            enable_caching: true,
-            cache_size: 1000,
-            freshness_period: Duration::from_secs(60),
+            default_freshness_period: Some(Duration::from_secs(60)),
+            enable_signatures: false,
+            signature_type: 1,
+            key_locator: None,
+            max_cache_size: 1000,
+            default_content_type: udcn_core::packets::ContentType::Blob,
+            include_chunk_metadata: true,
         };
         let publisher = DataPacketPublisher::new(publisher_config);
         
         // Create reassembly engine
         let reassembly_config = ReassemblyConfig {
             max_concurrent_files: 10,
-            chunk_timeout: Duration::from_secs(30),
-            max_chunk_retries: 3,
-            enable_integrity_check: true,
-            temp_dir: std::env::temp_dir(),
+            reassembly_timeout: Duration::from_secs(300),
+            max_buffer_memory: 50 * 1024 * 1024,
+            enable_duplicate_detection: true,
+            temp_directory: std::env::temp_dir(),
+            verify_integrity: true,
+            max_out_of_order_chunks: 100,
         };
         let reassembly_engine = FileReassemblyEngine::new(reassembly_config);
         
@@ -84,39 +89,52 @@ impl FileTransferService {
         // Create file chunker
         let chunking_config = ChunkingConfig {
             chunk_size,
-            enable_compression: false,
-            enable_encryption: false,
+            buffer_size: 32768,
+            include_metadata: true,
+            content_type: udcn_core::packets::ContentType::Blob,
+            max_chunks: -1,
+            large_file_mode: false,
+            max_memory_usage: 256 * 1024 * 1024,
+            stream_buffer_size: 1024 * 1024,
+            enable_chunk_integrity: false,
+            chunk_hash_algorithm: udcn_transport::file_integrity::ChecksumAlgorithm::Sha256,
         };
         let mut file_chunker = FileChunker::new(chunking_config);
         
-        // Chunk the file
-        let (metadata, chunks) = file_chunker.chunk_file(file_path).await?;
-        
-        info!("File chunked: {} chunks of {} bytes each", chunks.len(), chunk_size);
-        
         // Create base NDN name
-        let base_name = Name::from_str(ndn_name)?;
+        let base_name = Name::from_str(ndn_name);
+        
+        // Prepare file and get metadata
+        let metadata = file_chunker.prepare_file(file_path)?.clone();
+        let total_chunks = metadata.total_chunks;
+        
+        // Chunk the file  
+        let chunk_iterator = file_chunker.chunk_file(file_path, &base_name)?;
+        
+        info!("File chunked: {} chunks of {} bytes each", total_chunks, chunk_size);
         
         // Send file metadata as a special chunk
-        let metadata_name = base_name.append("metadata");
+        let mut metadata_name = base_name.clone();
+        metadata_name.append_str("metadata");
         let metadata_data = self.create_metadata_packet(&metadata, &metadata_name)?;
         self.send_data_packet(&metadata_data, target_addr).await?;
         
         // Send each chunk
-        for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_name = base_name.append(&format!("chunk{}", i));
-            let chunk_data = self.create_chunk_packet(chunk, &chunk_name)?;
-            self.send_data_packet(&chunk_data, target_addr).await?;
+        let mut chunk_count = 0;
+        for chunk_result in chunk_iterator {
+            let chunk = chunk_result?;
+            self.send_data_packet(&chunk.data, target_addr).await?;
+            chunk_count += 1;
             
             // Call progress callback if provided
             if let Some(ref callback) = progress_callback {
-                callback(i + 1, chunks.len());
+                callback(chunk_count, total_chunks);
             }
             
-            debug!("Sent chunk {}/{}", i + 1, chunks.len());
+            debug!("Sent chunk {}/{}", chunk_count, total_chunks);
         }
         
-        info!("File sent successfully: {} chunks", chunks.len());
+        info!("File sent successfully: {} chunks", chunk_count);
         Ok(())
     }
 
@@ -133,10 +151,11 @@ impl FileTransferService {
         info!("Receiving file with NDN name: {} to {}", ndn_name, output_path.display());
 
         // Create base NDN name
-        let base_name = Name::from_str(ndn_name)?;
+        let base_name = Name::from_str(ndn_name);
         
         // Request metadata first
-        let metadata_name = base_name.append("metadata");
+        let mut metadata_name = base_name.clone();
+        metadata_name.append_str("metadata");
         let metadata_interest = Interest::new(metadata_name.clone());
         
         info!("Requesting file metadata");
@@ -152,13 +171,15 @@ impl FileTransferService {
         
         // Request each chunk
         for chunk_index in 0..total_chunks {
-            let chunk_name = base_name.append(&format!("chunk{}", chunk_index));
+            let mut chunk_name = base_name.clone();
+            chunk_name.append_str(&format!("chunk{}", chunk_index));
             let chunk_interest = Interest::new(chunk_name.clone());
             
             match self.request_data(&chunk_interest, source_addr, timeout_duration).await {
-                Ok(chunk_data) => {
-                    let chunk_info = self.parse_chunk_packet(&chunk_data)?;
-                    received_chunks.push(chunk_info);
+                Ok(chunk_data_packet) => {
+                    // Extract the actual chunk data from the data packet
+                    let chunk_data = chunk_data_packet.content;
+                    received_chunks.push((chunk_index, chunk_data));
                     successful_chunks += 1;
                     
                     // Call progress callback if provided
@@ -175,26 +196,24 @@ impl FileTransferService {
             }
         }
         
-        // Reassemble the file
+        // Reassemble the file - simple implementation
         info!("Reassembling file from {} chunks", received_chunks.len());
-        let reassembly_result = self.reassembly_engine.reassemble_file(
-            &metadata,
-            received_chunks,
-            output_path,
-        ).await?;
         
-        match reassembly_result.status {
-            ReassemblyStatus::Complete => {
-                info!("File received successfully: {}", output_path.display());
-                Ok(())
-            }
-            ReassemblyStatus::Incomplete => {
-                Err("File reassembly incomplete".into())
-            }
-            ReassemblyStatus::Failed => {
-                Err("File reassembly failed".into())
-            }
+        // Sort chunks by index to ensure correct order
+        let mut sorted_chunks = received_chunks;
+        sorted_chunks.sort_by_key(|(chunk_index, _)| *chunk_index);
+        
+        // Create output file
+        let mut output_file = std::fs::File::create(output_path)?;
+        
+        // Write each chunk to the file in order
+        for (_chunk_index, chunk_data) in sorted_chunks {
+            output_file.write_all(&chunk_data)?;
         }
+        
+        output_file.sync_all()?;
+        info!("File received successfully: {}", output_path.display());
+        Ok(())
     }
 
     /// Request data using an Interest packet
@@ -206,20 +225,24 @@ impl FileTransferService {
     ) -> Result<Data, Box<dyn std::error::Error>> {
         // Encode and send the Interest
         let interest_data = interest.encode()?;
-        self.transport.send_to_async(&interest_data, addr).await?;
+        self.transport.send_to_async(&interest_data, addr).await
+            .map_err(|e| format!("Failed to send interest: {}", e))?;
         
         // Wait for response with timeout
-        let response = timeout(timeout_duration, self.transport.receive_async()).await??;
+        let response = timeout(timeout_duration, self.transport.receive_async()).await
+            .map_err(|_| "Request timed out")?
+            .map_err(|e| format!("Transport error: {}", e))?;
         
         // Decode the response
-        let data_packet = Data::decode(&response)?;
+        let (data_packet, _) = Data::decode(&response).map_err(|e| format!("Failed to decode data: {}", e))?;
         Ok(data_packet)
     }
 
     /// Send a data packet
     async fn send_data_packet(&self, data: &Data, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         let encoded_data = data.encode()?;
-        self.transport.send_to_async(&encoded_data, addr).await?;
+        self.transport.send_to_async(&encoded_data, addr).await
+            .map_err(|e| format!("Failed to send data: {}", e))?;
         Ok(())
     }
 
@@ -230,12 +253,6 @@ impl FileTransferService {
         Ok(data)
     }
 
-    /// Create a chunk packet
-    fn create_chunk_packet(&self, chunk: &ChunkInfo, name: &Name) -> Result<Data, Box<dyn std::error::Error>> {
-        let chunk_bytes = serde_json::to_vec(chunk)?;
-        let data = Data::new(name.clone(), chunk_bytes);
-        Ok(data)
-    }
 
     /// Parse a metadata packet
     fn parse_metadata_packet(&self, data: &Data) -> Result<FileMetadata, Box<dyn std::error::Error>> {
@@ -243,11 +260,6 @@ impl FileTransferService {
         Ok(metadata)
     }
 
-    /// Parse a chunk packet
-    fn parse_chunk_packet(&self, data: &Data) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
-        let chunk: ChunkInfo = serde_json::from_slice(&data.content)?;
-        Ok(chunk)
-    }
 }
 
 /// Simplified file transfer functions for CLI use

@@ -212,7 +212,7 @@ impl FileMetadata {
 }
 
 /// Information about a specific chunk
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkInfo {
     /// Chunk sequence number (0-based)
     pub sequence: usize,

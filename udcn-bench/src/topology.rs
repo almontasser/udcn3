@@ -1,11 +1,17 @@
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
+    sync::Arc,
+    net::{IpAddr, SocketAddr},
 };
 
-use log::info;
+use log::{info, warn, debug};
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::{
+    time::sleep,
+    net::{TcpStream, UdpSocket},
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 
 use crate::{
     benchmarks::PerformanceMonitor,
@@ -13,9 +19,46 @@ use crate::{
 };
 
 // Import transport types and NDN packet types
-use udcn_transport::{TcpTransport, UdpTransport};
+use udcn_transport::{TcpTransport, UdpTransport, Transport, AsyncTransport};
 use udcn_core::{Interest, Data, Packet};
 use udcn_core::packets::Name;
+
+/// Network interface configuration for a node
+#[derive(Debug, Clone)]
+pub struct NetworkInterface {
+    pub interface_type: InterfaceType,
+    pub address: String,
+    pub port: u16,
+    pub is_active: bool,
+}
+
+impl NetworkInterface {
+    pub fn new(interface_type: InterfaceType, address: String, port: u16) -> Self {
+        Self {
+            interface_type,
+            address,
+            port,
+            is_active: false,
+        }
+    }
+}
+
+/// Types of network interfaces
+#[derive(Debug, Clone)]
+pub enum InterfaceType {
+    Tcp,
+    Udp,
+    Unix,
+    Quic,
+}
+
+/// Trait for network connections in the topology
+pub trait NetworkConnection: Send + Sync + std::fmt::Debug {
+    fn connect(&self) -> Result<(), Box<dyn std::error::Error>>;
+    fn disconnect(&self) -> Result<(), Box<dyn std::error::Error>>;
+    fn is_connected(&self) -> bool;
+    fn get_interface_type(&self) -> InterfaceType;
+}
 
 /// Represents different network topology types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +126,7 @@ impl TopologyNode {
     }
 }
 
-/// Network topology simulation framework
+/// Real network topology testing framework
 #[derive(Debug)]
 pub struct TopologySimulator {
     nodes: HashMap<NodeId, TopologyNode>,
@@ -91,6 +134,10 @@ pub struct TopologySimulator {
     traffic_generator: TrafficGenerator,
     performance_monitor: PerformanceMonitor,
     routing_table: HashMap<NodeId, HashMap<NodeId, Vec<NodeId>>>, // source -> dest -> path
+    /// Real network interfaces for testing
+    network_interfaces: HashMap<NodeId, NetworkInterface>,
+    /// Active network connections
+    active_connections: HashMap<NodeId, Arc<dyn NetworkConnection>>,
 }
 
 /// Results from topology simulation
@@ -127,6 +174,8 @@ impl TopologySimulator {
             traffic_generator: TrafficGenerator::new(),
             performance_monitor: PerformanceMonitor::new(1000, Duration::from_secs(1)),
             routing_table: HashMap::new(),
+            network_interfaces: HashMap::new(),
+            active_connections: HashMap::new(),
         }
     }
 

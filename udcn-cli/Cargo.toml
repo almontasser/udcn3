@@ -14,6 +14,9 @@ log = { workspace = true }
 env_logger = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 clap = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+async-trait = "0.1"
 
 udcn-common = { path = "../udcn-common" }
 udcn-core = { path = "../udcn-core" }

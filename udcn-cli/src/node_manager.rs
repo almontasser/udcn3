@@ -200,21 +200,39 @@ impl NodeManager {
         Ok(is_online)
     }
 
-    /// Discover nodes on the network
+    /// Discover nodes on the network using multicast and broadcast
     pub async fn discover_nodes(&mut self) -> Result<Vec<NodeInfo>, Box<dyn std::error::Error>> {
-        info!("Starting network discovery for nodes");
+        info!("Starting real network discovery for UDCN nodes");
         
-        // TODO: Implement actual network discovery
-        // For now, return empty list and explain the limitation
-        warn!("Network discovery not yet implemented");
+        let mut discovered_nodes = Vec::new();
         
-        // Mock discovery - in a real implementation, this would:
-        // 1. Scan common UDP/TCP ports for UDCN nodes
-        // 2. Use multicast discovery
-        // 3. Check known neighbor lists
-        // 4. Use NDN name discovery
+        // Multicast discovery
+        if let Ok(multicast_nodes) = self.discover_multicast_nodes().await {
+            discovered_nodes.extend(multicast_nodes);
+        }
         
-        Ok(Vec::new())
+        // Broadcast discovery
+        if let Ok(broadcast_nodes) = self.discover_broadcast_nodes().await {
+            discovered_nodes.extend(broadcast_nodes);
+        }
+        
+        // Port scanning discovery
+        if let Ok(scanned_nodes) = self.discover_port_scan().await {
+            discovered_nodes.extend(scanned_nodes);
+        }
+        
+        // Update registry with discovered nodes
+        for node in &discovered_nodes {
+            if !self.registry.nodes.contains_key(&node.id) {
+                self.registry.nodes.insert(node.id.clone(), node.clone());
+            }
+        }
+        
+        // Save updated registry
+        self.save_registry()?;
+        
+        info!("Network discovery completed. Found {} nodes", discovered_nodes.len());
+        Ok(discovered_nodes)
     }
 
     /// Get network status summary
@@ -259,6 +277,239 @@ impl NetworkStatus {
             self.offline_nodes,
             self.unknown_nodes
         )
+    }
+}
+
+impl NodeManager {
+    /// Discover nodes using multicast
+    async fn discover_multicast_nodes(&self) -> Result<Vec<NodeInfo>, Box<dyn std::error::Error>> {
+        info!("Starting multicast discovery for UDCN nodes");
+        
+        let mut discovered_nodes = Vec::new();
+        
+        // Use IPv6 multicast for NDN discovery
+        let multicast_addr = "ff02::1:2"; // NDN multicast address
+        let multicast_port = 6363; // NDN default port
+        
+        // Create multicast socket
+        let socket = match tokio::net::UdpSocket::bind("[::]:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create multicast socket: {}", e);
+                return Ok(discovered_nodes);
+            }
+        };
+        
+        // Send multicast discovery message
+        let discovery_msg = b"UDCN-DISCOVERY-REQUEST";
+        let multicast_target = format!("{}:{}", multicast_addr, multicast_port);
+        
+        match socket.send_to(discovery_msg, &multicast_target).await {
+            Ok(_) => {
+                info!("Sent multicast discovery message to {}", multicast_target);
+                
+                // Listen for responses with timeout
+                let mut buffer = [0u8; 1024];
+                let timeout = tokio::time::Duration::from_secs(5);
+                
+                let deadline = tokio::time::Instant::now() + timeout;
+                
+                while tokio::time::Instant::now() < deadline {
+                    match tokio::time::timeout(
+                        deadline - tokio::time::Instant::now(),
+                        socket.recv_from(&mut buffer)
+                    ).await {
+                        Ok(Ok((len, src_addr))) => {
+                            let response = String::from_utf8_lossy(&buffer[..len]);
+                            if response.starts_with("UDCN-DISCOVERY-RESPONSE") {
+                                let node_id = format!("node-{}", src_addr);
+                                let node_info = NodeInfo {
+                                    id: node_id,
+                                    address: src_addr,
+                                    status: NodeStatus::Online,
+                                    last_seen: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                    capabilities: vec!["ndn".to_string(), "multicast".to_string()],
+                                    metadata: HashMap::new(),
+                                };
+                                discovered_nodes.push(node_info);
+                                info!("Discovered node via multicast: {}", src_addr);
+                            }
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => break, // Timeout
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to send multicast discovery message: {}", e);
+            }
+        }
+        
+        Ok(discovered_nodes)
+    }
+    
+    /// Discover nodes using broadcast
+    async fn discover_broadcast_nodes(&self) -> Result<Vec<NodeInfo>, Box<dyn std::error::Error>> {
+        info!("Starting broadcast discovery for UDCN nodes");
+        
+        let mut discovered_nodes = Vec::new();
+        
+        // Use IPv4 broadcast
+        let broadcast_addr = "255.255.255.255";
+        let broadcast_port = 6363;
+        
+        // Create broadcast socket
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create broadcast socket: {}", e);
+                return Ok(discovered_nodes);
+            }
+        };
+        
+        // Enable broadcast
+        if let Err(e) = socket.set_broadcast(true) {
+            warn!("Failed to enable broadcast: {}", e);
+            return Ok(discovered_nodes);
+        }
+        
+        // Send broadcast discovery message
+        let discovery_msg = b"UDCN-DISCOVERY-REQUEST";
+        let broadcast_target = format!("{}:{}", broadcast_addr, broadcast_port);
+        
+        match socket.send_to(discovery_msg, &broadcast_target).await {
+            Ok(_) => {
+                info!("Sent broadcast discovery message to {}", broadcast_target);
+                
+                // Listen for responses with timeout
+                let mut buffer = [0u8; 1024];
+                let timeout = tokio::time::Duration::from_secs(5);
+                
+                let deadline = tokio::time::Instant::now() + timeout;
+                
+                while tokio::time::Instant::now() < deadline {
+                    match tokio::time::timeout(
+                        deadline - tokio::time::Instant::now(),
+                        socket.recv_from(&mut buffer)
+                    ).await {
+                        Ok(Ok((len, src_addr))) => {
+                            let response = String::from_utf8_lossy(&buffer[..len]);
+                            if response.starts_with("UDCN-DISCOVERY-RESPONSE") {
+                                let node_id = format!("node-{}", src_addr);
+                                let node_info = NodeInfo {
+                                    id: node_id,
+                                    address: src_addr,
+                                    status: NodeStatus::Online,
+                                    last_seen: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                    capabilities: vec!["ndn".to_string(), "broadcast".to_string()],
+                                    metadata: HashMap::new(),
+                                };
+                                discovered_nodes.push(node_info);
+                                info!("Discovered node via broadcast: {}", src_addr);
+                            }
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => break, // Timeout
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to send broadcast discovery message: {}", e);
+            }
+        }
+        
+        Ok(discovered_nodes)
+    }
+    
+    /// Discover nodes using port scanning
+    async fn discover_port_scan(&self) -> Result<Vec<NodeInfo>, Box<dyn std::error::Error>> {
+        info!("Starting port scan discovery for UDCN nodes");
+        
+        let mut discovered_nodes = Vec::new();
+        
+        // Get local network ranges to scan
+        let network_ranges = self.get_local_network_ranges().await?;
+        
+        for network_range in network_ranges {
+            info!("Scanning network range: {}", network_range);
+            
+            // Scan common UDCN ports
+            let ports = vec![6363, 6364, 9695]; // NDN default ports
+            
+            for port in ports {
+                // Parse network range and scan hosts
+                if let Ok(discovered_in_range) = self.scan_network_range(&network_range, port).await {
+                    discovered_nodes.extend(discovered_in_range);
+                }
+            }
+        }
+        
+        Ok(discovered_nodes)
+    }
+    
+    /// Get local network ranges for scanning
+    async fn get_local_network_ranges(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut ranges = Vec::new();
+        
+        // Common local network ranges
+        ranges.push("192.168.1.0/24".to_string());
+        ranges.push("192.168.0.0/24".to_string());
+        ranges.push("10.0.0.0/24".to_string());
+        ranges.push("172.16.0.0/24".to_string());
+        
+        // TODO: In a real implementation, this would:
+        // 1. Get actual network interfaces
+        // 2. Parse their IP addresses and subnets
+        // 3. Generate appropriate scan ranges
+        
+        Ok(ranges)
+    }
+    
+    /// Scan a network range for UDCN nodes
+    async fn scan_network_range(&self, network_range: &str, port: u16) -> Result<Vec<NodeInfo>, Box<dyn std::error::Error>> {
+        let mut discovered_nodes = Vec::new();
+        
+        // Parse network range (simplified - just scan .1 to .254)
+        let base_ip = network_range.split('/').next().unwrap();
+        let ip_parts: Vec<&str> = base_ip.split('.').collect();
+        
+        if ip_parts.len() == 4 {
+            let base = format!("{}.{}.{}", ip_parts[0], ip_parts[1], ip_parts[2]);
+            
+            // Scan host range (limited to avoid flooding)
+            let scan_range = std::cmp::min(50, 254); // Limit scan range
+            
+            for host in 1..=scan_range {
+                let target_ip = format!("{}.{}", base, host);
+                let target_addr = format!("{}:{}", target_ip, port);
+                
+                // Try to connect to check if UDCN service is running
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(100),
+                    tokio::net::TcpStream::connect(&target_addr)
+                ).await {
+                    Ok(Ok(_)) => {
+                        // Connection successful, likely a UDCN node
+                        let node_id = format!("node-{}", target_addr);
+                        let node_info = NodeInfo {
+                            id: node_id,
+                            address: target_addr.parse().unwrap(),
+                            status: NodeStatus::Online,
+                            last_seen: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                            capabilities: vec!["ndn".to_string(), "tcp".to_string()],
+                            metadata: HashMap::new(),
+                        };
+                        discovered_nodes.push(node_info);
+                        info!("Discovered node via port scan: {}", target_addr);
+                    }
+                    _ => {
+                        // Connection failed or timeout, skip
+                    }
+                }
+            }
+        }
+        
+        Ok(discovered_nodes)
     }
 }
 
