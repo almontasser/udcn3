@@ -73,7 +73,7 @@ impl Transport for UdpTransport {
         rt.block_on(async {
             let socket_guard = self.socket.lock().await;
             if let Some(ref socket) = &*socket_guard {
-                let mut buffer = vec![0; 1024];
+                let mut buffer = vec![0; 65536]; // 64KB buffer to handle any NDN packet
                 let (bytes_read, _) = socket.recv_from(&mut buffer).await?;
                 buffer.truncate(bytes_read);
                 Ok(buffer)
@@ -122,7 +122,7 @@ impl AsyncTransport for UdpTransport {
     async fn receive_async(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let socket_guard = self.socket.lock().await;
         if let Some(ref socket) = &*socket_guard {
-            let mut buffer = vec![0; 1024];
+            let mut buffer = vec![0; 65536]; // 64KB buffer to handle any NDN packet
             match socket.recv_from(&mut buffer).await {
                 Ok((bytes_read, _)) => {
                     buffer.truncate(bytes_read);
@@ -172,7 +172,7 @@ impl AsyncTransport for UdpTransport {
     async fn receive_timeout_async(&self, timeout: std::time::Duration) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let socket_guard = self.socket.lock().await;
         if let Some(ref socket) = &*socket_guard {
-            let mut buffer = vec![0; 1024];
+            let mut buffer = vec![0; 65536]; // 64KB buffer to handle any NDN packet
             match tokio::time::timeout(timeout, socket.recv_from(&mut buffer)).await {
                 Ok(Ok((bytes_read, _))) => {
                     buffer.truncate(bytes_read);

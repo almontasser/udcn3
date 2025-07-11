@@ -92,8 +92,8 @@ async fn main() {
                     Arg::new("chunk-size")
                         .long("chunk-size")
                         .value_name("SIZE")
-                        .help("Chunk size in bytes (default: 8192)")
-                        .default_value("8192"),
+                        .help("Chunk size in bytes (default: 1200)")
+                        .default_value("1200"),
                 )
                 .arg(
                     Arg::new("progress")

@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use udcn_core::packets::{Interest, Data};
-use udcn_transport::Transport;
+use udcn_transport::{
+    Transport, PacketFragmenter, PacketReassembler, 
+    FragmentationConfig, PacketReassemblyConfig,
+    Fragment, FragmentHeader
+};
 
 /// Transport protocol types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,12 +74,19 @@ pub struct TransportManager {
     running: Arc<RwLock<bool>>,
     packet_sender: Option<mpsc::Sender<IncomingPacket>>,
     packet_receiver: Option<mpsc::Receiver<IncomingPacket>>,
+    fragmenter: Arc<Mutex<PacketFragmenter>>,
+    reassemblers: Arc<RwLock<HashMap<SocketAddr, PacketReassembler>>>,
 }
 
 impl TransportManager {
     /// Create a new transport manager
     pub fn new(config: TransportConfig) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        
+        // Create fragmenter with MTU-safe configuration
+        let fragmentation_config = FragmentationConfig::with_mtu(1400); // Safe for most networks
+        let fragmenter = PacketFragmenter::new(fragmentation_config);
+        
         Self {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -83,6 +94,8 @@ impl TransportManager {
             running: Arc::new(RwLock::new(false)),
             packet_sender: Some(tx),
             packet_receiver: Some(rx),
+            fragmenter: Arc::new(Mutex::new(fragmenter)),
+            reassemblers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -106,9 +119,10 @@ impl TransportManager {
         let socket = self.local_socket.as_ref().unwrap().clone();
         let running = self.running.clone();
         let sender = self.packet_sender.as_ref().unwrap().clone();
+        let reassemblers = self.reassemblers.clone();
         
         tokio::spawn(async move {
-            Self::packet_reception_loop(socket, running, sender).await;
+            Self::packet_reception_loop(socket, running, sender, reassemblers).await;
         });
 
         info!("Transport Manager started on {}", local_addr);
@@ -176,8 +190,30 @@ impl TransportManager {
     /// Send raw packet data to a specific address
     async fn send_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref socket) = self.local_socket {
-            let bytes_sent = socket.send_to(data, addr).await?;
-            Ok(bytes_sent)
+            // Check if packet needs fragmentation
+            if data.len() > 1400 {
+                // Fragment the packet
+                let mut fragmenter = self.fragmenter.lock().await;
+                let fragments = fragmenter.fragment_packet(data)
+                    .map_err(|e| format!("Failed to fragment packet: {}", e))?;
+                
+                let mut total_bytes = 0;
+                info!("Fragmenting large packet ({} bytes) into {} fragments", data.len(), fragments.len());
+                
+                // Send each fragment
+                for (i, fragment) in fragments.iter().enumerate() {
+                    let fragment_bytes = fragment.to_bytes();
+                    let bytes_sent = socket.send_to(&fragment_bytes, addr).await?;
+                    total_bytes += bytes_sent;
+                    info!("Sent fragment {}/{} ({} bytes)", i + 1, fragments.len(), bytes_sent);
+                }
+                
+                Ok(total_bytes)
+            } else {
+                // Small packet, send directly
+                let bytes_sent = socket.send_to(data, addr).await?;
+                Ok(bytes_sent)
+            }
         } else {
             Err("No local socket available".into())
         }
@@ -250,6 +286,21 @@ impl TransportManager {
             .expect("Transport manager must be started before getting socket")
             .clone()
     }
+    
+    /// Clean up expired reassembly buffers
+    pub async fn cleanup_reassemblers(&self) {
+        let mut reassemblers = self.reassemblers.write().await;
+        reassemblers.retain(|addr, reassembler| {
+            reassembler.cleanup_expired_entries();
+            // Remove reassemblers with no active entries
+            if reassembler.stats().active_reassemblies == 0 {
+                debug!("Removing inactive reassembler for {}", addr);
+                false
+            } else {
+                true
+            }
+        });
+    }
 
     /// Check if transport manager is running
     pub async fn is_running(&self) -> bool {
@@ -276,6 +327,7 @@ impl TransportManager {
         socket: Arc<UdpSocket>,
         running: Arc<RwLock<bool>>,
         sender: mpsc::Sender<IncomingPacket>,
+        reassemblers: Arc<RwLock<HashMap<SocketAddr, PacketReassembler>>>,
     ) {
         let mut buffer = vec![0u8; 65536]; // 64KB buffer
         info!("Packet reception loop started");
@@ -287,27 +339,30 @@ impl TransportManager {
                     let packet_data = &buffer[..len];
                     info!("Received packet: {} bytes from {}", len, src_addr);
                     
-                    // Try to decode as Interest first
+                    // Check if this is a fragment - for now, skip fragment handling
+                    // TODO: Implement proper fragment header detection
+                    
+                    // Try normal decoding
                     if let Ok((interest, _)) = Interest::decode(packet_data) {
-                        info!("Received Interest for {} from {}", interest.name, src_addr);
-                        if let Err(e) = sender.send(IncomingPacket::Interest(interest, src_addr)).await {
-                            error!("Failed to send Interest to handler: {}", e);
-                        }
+                            info!("Received Interest for {} from {}", interest.name, src_addr);
+                            if let Err(e) = sender.send(IncomingPacket::Interest(interest, src_addr)).await {
+                                error!("Failed to send Interest to handler: {}", e);
+                            }
                     }
                     // Try to decode as Data packet
                     else if let Ok((data, _)) = Data::decode(packet_data) {
-                        info!("Received Data for {} from {}", data.name, src_addr);
-                        if let Err(e) = sender.send(IncomingPacket::Data(data, src_addr)).await {
-                            error!("Failed to send Data to handler: {}", e);
-                        }
+                            info!("Received Data for {} from {}", data.name, src_addr);
+                            if let Err(e) = sender.send(IncomingPacket::Data(data, src_addr)).await {
+                                error!("Failed to send Data to handler: {}", e);
+                            }
                     }
                     else {
-                        warn!("Received unknown packet type from {} (first 8 bytes: {:?})", 
-                            src_addr, 
-                            &packet_data[..packet_data.len().min(8)]);
-                        if let Err(e) = sender.send(IncomingPacket::Unknown(packet_data.to_vec(), src_addr)).await {
-                            error!("Failed to send unknown packet to handler: {}", e);
-                        }
+                            warn!("Received unknown packet type from {} (first 8 bytes: {:?})", 
+                                src_addr, 
+                                &packet_data[..packet_data.len().min(8)]);
+                            if let Err(e) = sender.send(IncomingPacket::Unknown(packet_data.to_vec(), src_addr)).await {
+                                error!("Failed to send unknown packet to handler: {}", e);
+                            }
                     }
                 }
                 Ok(Err(e)) => {

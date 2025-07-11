@@ -139,7 +139,11 @@ echo "Small test" > small.txt
 ### Large File
 ```bash
 dd if=/dev/urandom of=large.txt bs=1M count=10
+# Use default chunk size (1200 bytes) which is MTU-safe
 ./target/debug/udcn-cli send --file large.txt --name "/files/large" --target 10.0.100.1:8080
+
+# Or explicitly specify chunk size for larger chunks
+./target/debug/udcn-cli send --file large.txt --name "/files/large" --chunk-size 1200 --target 10.0.100.1:8080
 ```
 
 ## Cleanup
@@ -211,7 +215,8 @@ Check content store statistics in the logs after multiple transfers to see cache
 
 ### Test with Custom Chunk Size
 ```bash
-./target/debug/udcn-cli send --file test.txt --name "/test/chunked" --chunk-size 4096 --target 10.0.100.1:8080
+# Note: Keep chunk size <= 1400 bytes to avoid MTU issues
+./target/debug/udcn-cli send --file test.txt --name "/test/chunked" --chunk-size 1024 --target 10.0.100.1:8080
 ```
 
 ### Test Progress Monitoring
