@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::io::Write;
 use log::{info, warn, error, debug};
 use tokio::time::{timeout, Duration};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use udcn_core::{ComponentName, NameComponent};
 use udcn_core::packets::{Interest, Data, Name};
@@ -281,9 +282,20 @@ impl SimpleFileTransfer {
         
         // Set up progress callback
         let progress_callback = if show_progress {
-            Some(Box::new(|current: usize, total: usize| {
-                let percentage = (current as f64 / total as f64) * 100.0;
-                println!("Progress: {}/{} chunks ({:.1}%)", current, total, percentage);
+            let pb = ProgressBar::new(0);
+            pb.set_style(ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} chunks ({percent}%) {msg}"
+            ).unwrap());
+            let pb_clone = pb.clone();
+            Some(Box::new(move |current: usize, total: usize| {
+                if pb_clone.length().unwrap_or(0) != total as u64 {
+                    pb_clone.set_length(total as u64);
+                    pb_clone.set_message("Sending");
+                }
+                pb_clone.set_position(current as u64);
+                if current == total {
+                    pb_clone.finish_with_message("Sent");
+                }
             }) as Box<dyn Fn(usize, usize) + Send + Sync>)
         } else {
             None
@@ -316,9 +328,20 @@ impl SimpleFileTransfer {
         
         // Set up progress callback
         let progress_callback = if show_progress {
-            Some(Box::new(|current: usize, total: usize| {
-                let percentage = (current as f64 / total as f64) * 100.0;
-                println!("Progress: {}/{} chunks ({:.1}%)", current, total, percentage);
+            let pb = ProgressBar::new(0);
+            pb.set_style(ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} chunks ({percent}%) {msg}"
+            ).unwrap());
+            let pb_clone = pb.clone();
+            Some(Box::new(move |current: usize, total: usize| {
+                if pb_clone.length().unwrap_or(0) != total as u64 {
+                    pb_clone.set_length(total as u64);
+                    pb_clone.set_message("Receiving");
+                }
+                pb_clone.set_position(current as u64);
+                if current == total {
+                    pb_clone.finish_with_message("Received");
+                }
             }) as Box<dyn Fn(usize, usize) + Send + Sync>)
         } else {
             None
