@@ -2,6 +2,7 @@ use std::path::Path;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::io::Write;
+use std::sync::Arc;
 use log::{info, warn, error, debug};
 use tokio::time::{timeout, Duration};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -170,141 +171,113 @@ impl FileTransferService {
         let mut received_chunks = Vec::new();
         let mut successful_chunks = 0;
         
-        // Use streaming approach with single receiver and request pipelining
-        let window_size = 16; // Large pipeline window
-        let chunk_timeout = Duration::from_secs(2); // Shorter timeout for faster flow
+        // Use QUIC's reliable delivery - much simpler approach
+        let chunk_timeout = Duration::from_secs(30); // QUIC handles retransmissions
         let mut failed_chunks = Vec::new();
         
-        // Channels for coordination
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(window_size * 3);
-        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(window_size * 2);
+        // Request chunks concurrently with QUIC reliability
+        let mut handles = Vec::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); // Control concurrency
         
-        // Single receiver task - eliminates UDP socket contention
-        let transport_receiver = self.transport.clone();
-        let receiver_result_tx = result_tx.clone();
-        tokio::spawn(async move {
-            let mut pending_requests = std::collections::HashMap::new();
+        for chunk_index in 0..total_chunks {
+            let permit = semaphore.clone();
+            let transport_clone = self.transport.clone();
+            let base_name_clone = base_name.clone();
+            let chunk_timeout_clone = chunk_timeout;
             
-            loop {
-                tokio::select! {
-                    // Handle incoming requests
-                    request = request_rx.recv() => {
-                        match request {
-                            Some((chunk_index, interest_data)) => {
-                                // Send Interest immediately
-                                if let Err(e) = transport_receiver.send_to_async(&interest_data, source_addr).await {
-                                    let _ = receiver_result_tx.send((chunk_index, Err(format!("Send failed: {}", e)))).await;
-                                } else {
-                                    // Track this request
-                                    pending_requests.insert(chunk_index, std::time::Instant::now());
-                                }
-                            }
-                            None => break, // Channel closed
-                        }
-                    }
+            let handle = tokio::spawn(async move {
+                let _permit = permit.acquire().await.unwrap();
+                
+                let mut chunk_name = base_name_clone;
+                chunk_name.append_str(&format!("segment/{}", chunk_index));
+                let chunk_interest = Interest::new(chunk_name);
+                
+                // Retry mechanism with exponential backoff
+                let max_retries = 5;
+                let mut last_error = String::new();
+                
+                for retry in 0..max_retries {
+                    // Send interest using UDP
+                    let interest_data = match chunk_interest.encode() {
+                        Ok(data) => data,
+                        Err(e) => return Err((chunk_index, format!("Encode error: {}", e)))
+                    };
                     
-                    // Handle incoming responses  
-                    response = transport_receiver.receive_async() => {
-                        match response {
-                            Ok(response) => {
-                                // Find NDN Data packet
-                                let decode_data = if response.len() > 0 && response[0] == 0x06 {
-                                    &response
-                                } else if response.len() > 16 {
-                                    let mut found_offset = None;
-                                    for offset in 1..std::cmp::min(32, response.len() - 8) {
-                                        if offset < response.len() && response[offset] == 0x06 {
-                                            found_offset = Some(offset);
-                                            break;
-                                        }
-                                    }
-                                    if let Some(offset) = found_offset {
-                                        &response[offset..]
-                                    } else {
+                    match transport_clone.send_to_async(&interest_data, source_addr).await {
+                        Ok(_) => {
+                            // Wait for response with timeout
+                            let timeout_duration = chunk_timeout_clone + Duration::from_secs(retry as u64 * 2);
+                            match timeout(timeout_duration, transport_clone.receive_async()).await {
+                                Ok(Ok(response)) => {
+                                    // Find NDN Data packet with frame detection
+                                    let decode_data = if response.len() > 0 && response[0] == 0x06 {
                                         &response
-                                    }
-                                } else {
-                                    &response
-                                };
-                                
-                                // Decode and match to pending request
-                                match Data::decode(decode_data) {
-                                    Ok((data_packet, _)) => {
-                                        // Extract chunk index from name
-                                        if let Some(last_component) = data_packet.name.components.last() {
-                                            if let Ok(index_str) = std::str::from_utf8(last_component) {
-                                                if let Ok(chunk_index) = index_str.parse::<usize>() {
-                                                    pending_requests.remove(&chunk_index);
-                                                    let _ = receiver_result_tx.send((chunk_index, Ok(data_packet.content))).await;
-                                                }
+                                    } else if response.len() > 16 {
+                                        let mut found_offset = None;
+                                        for offset in 1..std::cmp::min(32, response.len() - 8) {
+                                            if offset < response.len() && response[offset] == 0x06 {
+                                                found_offset = Some(offset);
+                                                break;
                                             }
                                         }
-                                    }
-                                    Err(_) => {
-                                        // Ignore decode errors for continuous flow
+                                        if let Some(offset) = found_offset {
+                                            &response[offset..]
+                                        } else {
+                                            &response
+                                        }
+                                    } else {
+                                        &response
+                                    };
+                                    
+                                    // Decode and verify chunk
+                                    match Data::decode(decode_data) {
+                                        Ok((data_packet, _)) => {
+                                            // Verify this is the correct chunk
+                                            if let Some(last_component) = data_packet.name.components.last() {
+                                                if let Ok(index_str) = std::str::from_utf8(last_component) {
+                                                    if let Ok(response_index) = index_str.parse::<usize>() {
+                                                        if response_index == chunk_index {
+                                                            return Ok((chunk_index, data_packet.content));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            last_error = "Chunk index mismatch".to_string();
+                                        }
+                                        Err(e) => {
+                                            last_error = format!("Failed to decode data: {}", e);
+                                        }
                                     }
                                 }
+                                Ok(Err(e)) => {
+                                    last_error = format!("Transport error: {}", e);
+                                }
+                                Err(_) => {
+                                    last_error = format!("Request timed out (retry {})", retry + 1);
+                                }
                             }
-                            Err(_) => {
-                                // Continue on transport errors
-                                tokio::time::sleep(Duration::from_millis(1)).await;
-                            }
+                        }
+                        Err(e) => {
+                            last_error = format!("Failed to send interest: {}", e);
                         }
                     }
                     
-                    // Timeout handling
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        let now = std::time::Instant::now();
-                        let mut timed_out = Vec::new();
-                        
-                        for (&chunk_index, &request_time) in &pending_requests {
-                            if now.duration_since(request_time) > chunk_timeout {
-                                timed_out.push(chunk_index);
-                            }
-                        }
-                        
-                        for chunk_index in timed_out {
-                            pending_requests.remove(&chunk_index);
-                            let _ = receiver_result_tx.send((chunk_index, Err("Request timed out".to_string()))).await;
-                        }
+                    // Add delay before retry
+                    if retry < max_retries - 1 {
+                        tokio::time::sleep(Duration::from_millis(100 * (retry + 1) as u64)).await;
                     }
                 }
-            }
-        });
-        
-        // Request sender task - maintains pipeline flow
-        let request_sender = request_tx.clone();
-        let base_name_clone = base_name.clone();
-        tokio::spawn(async move {
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(window_size));
+                
+                Err((chunk_index, format!("Max retries exceeded: {}", last_error)))
+            });
             
-            for chunk_index in 0..total_chunks {
-                let _permit = semaphore.acquire().await.unwrap();
-                
-                let mut chunk_name = base_name_clone.clone();
-                chunk_name.append_str(&format!("segment/{}", chunk_index));
-                let chunk_interest = Interest::new(chunk_name.clone());
-                
-                match chunk_interest.encode() {
-                    Ok(interest_data) => {
-                        if request_sender.send((chunk_index, interest_data)).await.is_err() {
-                            break; // Channel closed
-                        }
-                    }
-                    Err(e) => {
-                        let _ = result_tx.send((chunk_index, Err(format!("Encode error: {}", e)))).await;
-                    }
-                }
-                
-                // Small delay to control flow rate
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        });
+            handles.push(handle);
+        }
         
-        // Collect results continuously
-        while successful_chunks + failed_chunks.len() < total_chunks {
-            match result_rx.recv().await {
-                Some((chunk_index, Ok(chunk_data))) => {
+        // Collect results with progress tracking
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((chunk_index, chunk_data))) => {
                     received_chunks.push((chunk_index, chunk_data));
                     successful_chunks += 1;
                     
@@ -315,29 +288,26 @@ impl FileTransferService {
                     
                     debug!("Received chunk {}/{}", successful_chunks, total_chunks);
                 }
-                Some((chunk_index, Err(e))) => {
-                    warn!("Failed to receive chunk {}: {}", chunk_index, e);
+                Ok(Err((chunk_index, error))) => {
+                    warn!("Failed to receive chunk {}: {}", chunk_index, error);
                     failed_chunks.push(chunk_index);
                 }
-                None => break,
+                Err(e) => {
+                    error!("Task failed: {}", e);
+                    failed_chunks.push(0); // Generic error
+                }
             }
         }
         
-        // Report on failed chunks
+        // Report on failed chunks - require 100% completion
         if !failed_chunks.is_empty() {
-            warn!("Failed to receive {} chunks: {:?}", failed_chunks.len(), failed_chunks);
-            warn!("Successfully received {}/{} chunks ({:.1}%)", 
-                  successful_chunks, total_chunks, 
-                  (successful_chunks as f64 / total_chunks as f64) * 100.0);
+            error!("Failed to receive {} chunks: {:?}", failed_chunks.len(), failed_chunks);
+            error!("Successfully received {}/{} chunks ({:.1}%)", 
+                   successful_chunks, total_chunks, 
+                   (successful_chunks as f64 / total_chunks as f64) * 100.0);
             
-            // If we got most chunks, continue with partial file
-            if successful_chunks > total_chunks * 3 / 4 { // At least 75% success
-                warn!("Continuing with partial file ({:.1}% complete)", 
-                      (successful_chunks as f64 / total_chunks as f64) * 100.0);
-            } else {
-                return Err(format!("Too many failed chunks: {}/{} failed", 
-                                 failed_chunks.len(), total_chunks).into());
-            }
+            return Err(format!("File transfer incomplete: {}/{} chunks failed", 
+                             failed_chunks.len(), total_chunks).into());
         }
         
         // Reassemble the file - simple implementation
