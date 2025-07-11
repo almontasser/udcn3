@@ -412,13 +412,13 @@ impl FaceManager {
 
 #[async_trait]
 impl Service for FaceManager {
-    async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Face Manager service");
         *self.running.write().await = true;
         Ok(())
     }
 
-    async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopping Face Manager service");
         *self.running.write().await = false;
         

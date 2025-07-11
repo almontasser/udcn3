@@ -290,7 +290,7 @@ impl ControlPlaneManager {
 
 #[async_trait]
 impl Service for ControlPlaneManager {
-    async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Control Plane Manager");
         
         *self.running.write().await = true;
@@ -300,7 +300,7 @@ impl Service for ControlPlaneManager {
             info!("Starting protocol handler: {:?}", protocol);
             if let Err(e) = handler.start().await {
                 error!("Failed to start protocol handler {:?}: {}", protocol, e);
-                return Err(e);
+                return Err(format!("Failed to start protocol handler {:?}: {}", protocol, e).into());
             }
         }
         
@@ -350,7 +350,7 @@ impl Service for ControlPlaneManager {
         Ok(())
     }
 
-    async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopping Control Plane Manager");
         
         *self.running.write().await = false;

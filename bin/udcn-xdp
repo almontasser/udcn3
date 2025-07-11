@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock eBPF program for testing deployment pipeline
+echo "Mock eBPF program - would contain compiled eBPF bytecode"
+echo "In real deployment, this would be the compiled XDP program"
+exit 0

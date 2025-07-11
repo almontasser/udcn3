@@ -16,7 +16,7 @@ pub const MAX_PAYLOAD_SIZE: usize = 65536;
 pub const MAP_KEY_SIZE: usize = 32;
 
 /// Maximum PIT entries
-pub const MAX_PIT_ENTRIES: usize = 8192;
+pub const MAX_PIT_ENTRIES: usize = 512;
 
 /// PIT entry timeout in nanoseconds (10 seconds)
 pub const PIT_ENTRY_TIMEOUT_NS: u64 = 10_000_000_000;
@@ -443,8 +443,8 @@ pub const FACE_STATE_UP: u8 = 0x01;
 pub const FACE_STATE_DOWN: u8 = 0x02;
 pub const FACE_STATE_CONGESTED: u8 = 0x04;
 
-/// Maximum Content Store entries
-pub const MAX_CS_ENTRIES: usize = 4096;
+/// Maximum Content Store entries (reduced for eBPF memory limits)
+pub const MAX_CS_ENTRIES: usize = 64;
 
 /// Content Store entry timeout in nanoseconds (1 hour)
 pub const CS_ENTRY_TIMEOUT_NS: u64 = 3_600_000_000_000;

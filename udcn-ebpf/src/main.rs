@@ -326,7 +326,7 @@ static CS_LRU_STATE: HashMap<u32, LruState> = HashMap::with_max_entries(1, 0);
 // eBPF map for storing actual content data (using per-CPU array for performance)
 // Key is (name_hash << 16) | chunk_index, value is content chunk
 #[map(name = "CS_DATA_CHUNKS")]
-static CS_DATA_CHUNKS: HashMap<u64, [u8; 1024]> = HashMap::with_max_entries((MAX_CS_ENTRIES * 64) as u32, 0);
+static CS_DATA_CHUNKS: HashMap<u64, [u8; 1024]> = HashMap::with_max_entries((MAX_CS_ENTRIES * 8) as u32, 0);
 
 // eBPF map for Content Store cleanup state
 #[map(name = "CS_CLEANUP_STATE")]

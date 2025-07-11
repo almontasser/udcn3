@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 use udcn_core::packets::{Interest, Data};
@@ -22,6 +23,7 @@ pub enum TransportProtocol {
 pub struct TransportConfig {
     pub protocol: TransportProtocol,
     pub local_port: u16,
+    pub bind_address: String,
     pub buffer_size: usize,
     pub connection_timeout_ms: u64,
     pub keep_alive_interval_ms: u64,
@@ -32,6 +34,7 @@ impl Default for TransportConfig {
         Self {
             protocol: TransportProtocol::Udp,
             local_port: 6363, // Default NDN port
+            bind_address: "0.0.0.0".to_string(),
             buffer_size: 65536,
             connection_timeout_ms: 30000,
             keep_alive_interval_ms: 10000,
@@ -51,43 +54,70 @@ struct TransportConnection {
     packets_received: u64,
 }
 
+/// Incoming packet type
+#[derive(Debug)]
+pub enum IncomingPacket {
+    Interest(Interest, SocketAddr),
+    Data(Data, SocketAddr),
+    Unknown(Vec<u8>, SocketAddr),
+}
+
 /// Transport Manager for NDN packet transmission
 pub struct TransportManager {
     config: TransportConfig,
     connections: Arc<RwLock<HashMap<SocketAddr, TransportConnection>>>,
-    local_socket: Option<Arc<UdpSocket>>,
+    pub local_socket: Option<Arc<UdpSocket>>,
     running: Arc<RwLock<bool>>,
+    packet_sender: Option<mpsc::Sender<IncomingPacket>>,
+    packet_receiver: Option<mpsc::Receiver<IncomingPacket>>,
 }
 
 impl TransportManager {
     /// Create a new transport manager
     pub fn new(config: TransportConfig) -> Self {
+        let (tx, rx) = mpsc::channel(1000);
         Self {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
             local_socket: None,
             running: Arc::new(RwLock::new(false)),
+            packet_sender: Some(tx),
+            packet_receiver: Some(rx),
         }
     }
 
     /// Initialize the transport manager
-    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Transport Manager");
 
+        // Parse bind address and create socket address
+        let bind_ip: std::net::IpAddr = self.config.bind_address.parse()
+            .map_err(|e| format!("Invalid bind address '{}': {}", self.config.bind_address, e))?;
+        let local_addr = SocketAddr::new(bind_ip, self.config.local_port);
+        
         // Create local UDP socket for sending packets
-        let local_addr = SocketAddr::from(([0, 0, 0, 0], self.config.local_port));
         let socket = UdpSocket::bind(local_addr).await?;
         self.local_socket = Some(Arc::new(socket));
 
         // Mark as running
         *self.running.write().await = true;
 
+        // Start packet reception loop
+        let socket = self.local_socket.as_ref().unwrap().clone();
+        let running = self.running.clone();
+        let sender = self.packet_sender.as_ref().unwrap().clone();
+        
+        tokio::spawn(async move {
+            Self::packet_reception_loop(socket, running, sender).await;
+        });
+
         info!("Transport Manager started on {}", local_addr);
+        info!("Packet reception loop spawned");
         Ok(())
     }
 
     /// Stop the transport manager
-    pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopping Transport Manager");
 
         // Mark as not running
@@ -102,7 +132,7 @@ impl TransportManager {
     }
 
     /// Send an Interest packet to a specific address
-    pub async fn send_interest(&self, interest: &Interest, addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error>> {
+    pub async fn send_interest(&self, interest: &Interest, addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if !*self.running.read().await {
             return Err("Transport Manager not running".into());
         }
@@ -123,7 +153,7 @@ impl TransportManager {
     }
 
     /// Send a Data packet to a specific address
-    pub async fn send_data(&self, data: &Data, addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error>> {
+    pub async fn send_data(&self, data: &Data, addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if !*self.running.read().await {
             return Err("Transport Manager not running".into());
         }
@@ -144,7 +174,7 @@ impl TransportManager {
     }
 
     /// Send raw packet data to a specific address
-    async fn send_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error>> {
+    async fn send_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref socket) = self.local_socket {
             let bytes_sent = socket.send_to(data, addr).await?;
             Ok(bytes_sent)
@@ -214,6 +244,13 @@ impl TransportManager {
         });
     }
 
+    /// Get the local socket for shared use
+    pub fn get_socket(&self) -> Arc<UdpSocket> {
+        self.local_socket.as_ref()
+            .expect("Transport manager must be started before getting socket")
+            .clone()
+    }
+
     /// Check if transport manager is running
     pub async fn is_running(&self) -> bool {
         *self.running.read().await
@@ -227,6 +264,63 @@ impl TransportManager {
     /// Update transport configuration
     pub fn update_config(&mut self, config: TransportConfig) {
         self.config = config;
+    }
+
+    /// Take the packet receiver (can only be called once)
+    pub fn take_packet_receiver(&mut self) -> Option<mpsc::Receiver<IncomingPacket>> {
+        self.packet_receiver.take()
+    }
+
+    /// Packet reception loop
+    async fn packet_reception_loop(
+        socket: Arc<UdpSocket>,
+        running: Arc<RwLock<bool>>,
+        sender: mpsc::Sender<IncomingPacket>,
+    ) {
+        let mut buffer = vec![0u8; 65536]; // 64KB buffer
+        info!("Packet reception loop started");
+        
+        while *running.read().await {
+            // Receive packet with timeout
+            match timeout(Duration::from_millis(1000), socket.recv_from(&mut buffer)).await {
+                Ok(Ok((len, src_addr))) => {
+                    let packet_data = &buffer[..len];
+                    info!("Received packet: {} bytes from {}", len, src_addr);
+                    
+                    // Try to decode as Interest first
+                    if let Ok((interest, _)) = Interest::decode(packet_data) {
+                        info!("Received Interest for {} from {}", interest.name, src_addr);
+                        if let Err(e) = sender.send(IncomingPacket::Interest(interest, src_addr)).await {
+                            error!("Failed to send Interest to handler: {}", e);
+                        }
+                    }
+                    // Try to decode as Data packet
+                    else if let Ok((data, _)) = Data::decode(packet_data) {
+                        info!("Received Data for {} from {}", data.name, src_addr);
+                        if let Err(e) = sender.send(IncomingPacket::Data(data, src_addr)).await {
+                            error!("Failed to send Data to handler: {}", e);
+                        }
+                    }
+                    else {
+                        warn!("Received unknown packet type from {} (first 8 bytes: {:?})", 
+                            src_addr, 
+                            &packet_data[..packet_data.len().min(8)]);
+                        if let Err(e) = sender.send(IncomingPacket::Unknown(packet_data.to_vec(), src_addr)).await {
+                            error!("Failed to send unknown packet to handler: {}", e);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("Socket receive error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    // Timeout - this is normal, just continue
+                }
+            }
+        }
+        
+        info!("Packet reception loop stopped");
     }
 }
 

@@ -172,7 +172,7 @@ impl FileTransferService {
         // Request each chunk
         for chunk_index in 0..total_chunks {
             let mut chunk_name = base_name.clone();
-            chunk_name.append_str(&format!("chunk{}", chunk_index));
+            chunk_name.append_str(&format!("segment/{}", chunk_index));
             let chunk_interest = Interest::new(chunk_name.clone());
             
             match self.request_data(&chunk_interest, source_addr, timeout_duration).await {

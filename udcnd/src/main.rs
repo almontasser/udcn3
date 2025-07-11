@@ -11,6 +11,9 @@ mod service;
 mod routing;
 mod control_plane;
 mod protocols;
+mod face_manager;
+mod transport_manager;
+mod packet_handler;
 
 use config::Config;
 use daemon::Daemon;
@@ -68,6 +71,3 @@ async fn main() {
     info!("Shutting down UDCN Daemon");
     daemon.stop().await;
 }
-
-mod face_manager;
-mod transport_manager;

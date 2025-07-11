@@ -1,0 +1,10 @@
+#!/bin/bash
+# Mock daemon for testing deployment pipeline
+echo "μDCN Daemon Mock - version 0.1.0"
+echo "Interface: $1"
+echo "eBPF Program: $2"
+echo "In real deployment, this would start the NDN daemon"
+while true; do
+    echo "$(date): Mock daemon running..."
+    sleep 5
+done

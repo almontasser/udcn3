@@ -11,6 +11,8 @@ use crate::routing::{RoutingManager, RoutingConfig, RoutingStrategy};
 use crate::service::Service;
 use crate::control_plane::{ControlPlaneManager, ControlPlaneConfig};
 use crate::protocols::NdnOspfHandler;
+use crate::transport_manager::{TransportManager, TransportConfig, TransportProtocol};
+use crate::packet_handler::PacketHandler;
 
 pub struct Daemon {
     config: Config,
@@ -18,6 +20,8 @@ pub struct Daemon {
     face_manager: Option<Arc<FaceManager>>,
     routing_manager: Option<Arc<RoutingManager>>,
     control_plane_manager: Option<Arc<ControlPlaneManager>>,
+    transport_manager: Option<Arc<TransportManager>>,
+    packet_handler: Option<Arc<PacketHandler>>,
     // For now, we'll manage services differently until we need them
     _services: Arc<RwLock<Vec<String>>>,
 }
@@ -30,11 +34,13 @@ impl Daemon {
             face_manager: None,
             routing_manager: None,
             control_plane_manager: None,
+            transport_manager: None,
+            packet_handler: None,
             _services: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting UDCN Daemon services");
 
         // Initialize core services
@@ -49,7 +55,7 @@ impl Daemon {
         info!("Loading eBPF program for interface: {}", self.config.network.interface);
         if let Err(e) = ebpf_manager.load_program().await {
             error!("Failed to load eBPF program: {}", e);
-            return Err(e);
+            return Err(format!("Failed to load eBPF program: {}", e).into());
         }
 
         let ebpf_manager = Arc::new(ebpf_manager);
@@ -67,7 +73,9 @@ impl Daemon {
         self.face_manager = Some(face_manager.clone());
 
         // Initialize Routing Manager
-        let local_address = SocketAddr::from(([127, 0, 0, 1], 6363)); // Default NDN port
+        let bind_address = self.config.network.bind_address.parse::<std::net::IpAddr>()
+            .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        let local_address = SocketAddr::new(bind_address, self.config.network.port);
         let routing_manager = Arc::new(RoutingManager::new(local_address));
         
         // Start the routing manager service
@@ -83,6 +91,28 @@ impl Daemon {
         }
         
         self.routing_manager = Some(routing_manager.clone());
+
+        // Initialize Packet Handler with the transport manager from routing manager
+        info!("Initializing Packet Handler...");
+        let transport_manager = routing_manager.get_transport_manager();
+        
+        // Get the packet receiver from transport manager
+        let packet_receiver = {
+            let mut tm = transport_manager.write().await;
+            tm.take_packet_receiver()
+                .ok_or_else(|| "Failed to get packet receiver from transport manager".to_string())?
+        };
+        
+        let mut packet_handler = PacketHandler::new(transport_manager.clone());
+        packet_handler.set_packet_receiver(packet_receiver);
+        
+        // Start the packet handler service
+        if let Err(e) = packet_handler.start().await {
+            error!("Failed to start Packet Handler: {}", e);
+            return Err(e);
+        }
+        
+        self.packet_handler = Some(Arc::new(packet_handler));
 
         // Initialize Control Plane Manager
         let control_plane_config = ControlPlaneConfig {
@@ -130,6 +160,28 @@ impl Daemon {
         }
         self.control_plane_manager = None;
 
+        // Stop Packet Handler
+        if let Some(ref packet_handler) = self.packet_handler {
+            if let Err(e) = packet_handler.stop().await {
+                error!("Failed to stop Packet Handler: {}", e);
+            }
+        }
+        self.packet_handler = None;
+
+        // TODO: Transport Manager is stopped by Routing Manager
+        // if let Some(transport_manager) = self.transport_manager.take() {
+        //     match Arc::try_unwrap(transport_manager) {
+        //         Ok(mut manager) => {
+        //             if let Err(e) = manager.stop().await {
+        //                 error!("Failed to stop Transport Manager: {}", e);
+        //             }
+        //         }
+        //         Err(_) => {
+        //             error!("Failed to get exclusive access to Transport Manager for stopping");
+        //         }
+        //     }
+        // }
+
         // Stop Routing Manager
         if let Some(ref routing_manager) = self.routing_manager {
             if let Err(e) = routing_manager.stop().await {
@@ -165,7 +217,7 @@ impl Daemon {
         info!("All services stopped");
     }
 
-    pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Reloading configuration");
         
         // Create a configuration manager for policy enforcement
@@ -256,7 +308,7 @@ impl Daemon {
     }
 
     /// Update configuration section at runtime
-    pub async fn update_config_section(&mut self, section: crate::config::ConfigSection, toml_str: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn update_config_section(&mut self, section: crate::config::ConfigSection, toml_str: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let admin = self.get_config_admin();
         
         match admin.update_section(section.clone(), toml_str) {
@@ -272,13 +324,15 @@ impl Daemon {
                             let routing_config = crate::routing::RoutingConfig {
                                 ..Default::default()
                             };
-                            routing_manager.update_config(routing_config).await?;
+                            routing_manager.update_config(routing_config).await
+                                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("Failed to update routing config: {}", e).into() })?;
                         }
                     },
                     crate::config::ConfigSection::Routing => {
                         // Apply routing configuration changes
                         if let Some(ref routing_manager) = self.routing_manager {
-                            self.load_fib_entries(routing_manager).await?;
+                            self.load_fib_entries(routing_manager).await
+                                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("Failed to load FIB entries: {}", e).into() })?;
                         }
                     },
                     crate::config::ConfigSection::Logging => {
@@ -295,8 +349,10 @@ impl Daemon {
                             let routing_config = crate::routing::RoutingConfig {
                                 ..Default::default()
                             };
-                            routing_manager.update_config(routing_config).await?;
-                            self.load_fib_entries(routing_manager).await?;
+                            routing_manager.update_config(routing_config).await
+                                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("Failed to update routing config: {}", e).into() })?;
+                            self.load_fib_entries(routing_manager).await
+                                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("Failed to load FIB entries: {}", e).into() })?;
                         }
                     }
                 }
@@ -312,77 +368,77 @@ impl Daemon {
     }
 
     /// Get current configuration as TOML string
-    pub fn get_config_toml(&self) -> Result<String, Box<dyn std::error::Error>> {
+    pub fn get_config_toml(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let admin = self.get_config_admin();
         admin.get_config().map_err(|e| e.into())
     }
 
     /// Validate current configuration
-    pub fn validate_config(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn validate_config(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let admin = self.get_config_admin();
         admin.validate().map_err(|e| e.into())
     }
 
     /// Get packet statistics from the eBPF program
-    pub async fn get_packet_stats(&self) -> Result<udcn_common::PacketStats, Box<dyn std::error::Error>> {
+    pub async fn get_packet_stats(&self) -> Result<udcn_common::PacketStats, Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.get_packet_stats().await,
+            Some(manager) => manager.get_packet_stats().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Get PIT statistics from the eBPF program
-    pub async fn get_pit_stats(&self) -> Result<udcn_common::PitStats, Box<dyn std::error::Error>> {
+    pub async fn get_pit_stats(&self) -> Result<udcn_common::PitStats, Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.get_pit_stats().await,
+            Some(manager) => manager.get_pit_stats().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Get Content Store statistics from the eBPF program
-    pub async fn get_cs_stats(&self) -> Result<udcn_common::ContentStoreStats, Box<dyn std::error::Error>> {
+    pub async fn get_cs_stats(&self) -> Result<udcn_common::ContentStoreStats, Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.get_cs_stats().await,
+            Some(manager) => manager.get_cs_stats().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Update eBPF configuration
-    pub async fn update_ebpf_config(&self, config: &udcn_common::UdcnConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_ebpf_config(&self, config: &udcn_common::UdcnConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.update_config(config).await,
+            Some(manager) => manager.update_config(config).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Add a face to the eBPF face table
-    pub async fn add_face(&self, face_id: u32, face_info: &udcn_common::FaceInfo) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn add_face(&self, face_id: u32, face_info: &udcn_common::FaceInfo) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.add_face(face_id, face_info).await,
+            Some(manager) => manager.add_face(face_id, face_info).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Remove a face from the eBPF face table
-    pub async fn remove_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.remove_face(face_id).await,
+            Some(manager) => manager.remove_face(face_id).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Get face information
-    pub async fn get_face(&self, face_id: u32) -> Result<udcn_common::FaceInfo, Box<dyn std::error::Error>> {
+    pub async fn get_face(&self, face_id: u32) -> Result<udcn_common::FaceInfo, Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.get_face(face_id).await,
+            Some(manager) => manager.get_face(face_id).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
 
     /// Get health status of the daemon and eBPF components
-    pub async fn get_health_status(&self) -> Result<crate::ebpf::EbpfHealthStatus, Box<dyn std::error::Error>> {
+    pub async fn get_health_status(&self) -> Result<crate::ebpf::EbpfHealthStatus, Box<dyn std::error::Error + Send + Sync>> {
         match &self.ebpf_manager {
-            Some(manager) => manager.get_health_status().await,
+            Some(manager) => manager.get_health_status().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("eBPF manager not initialized".into()),
         }
     }
@@ -390,7 +446,7 @@ impl Daemon {
     // === ENHANCED FACE MANAGEMENT API ===
 
     /// Create a new face with automatic ID generation
-    pub async fn create_face(&self, config: FaceConfig) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_face(&self, config: FaceConfig) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.create_face_auto_id(config).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -398,7 +454,7 @@ impl Daemon {
     }
 
     /// Create a face with specific ID
-    pub async fn create_face_with_id(&self, config: FaceConfig) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_face_with_id(&self, config: FaceConfig) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.create_face(config).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -406,7 +462,7 @@ impl Daemon {
     }
 
     /// Delete a face
-    pub async fn delete_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn delete_face(&self, face_id: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.delete_face(face_id).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -414,7 +470,7 @@ impl Daemon {
     }
 
     /// Get face configuration
-    pub async fn get_face_config(&self, face_id: u32) -> Result<FaceConfig, Box<dyn std::error::Error>> {
+    pub async fn get_face_config(&self, face_id: u32) -> Result<FaceConfig, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.get_face_config(face_id).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -422,7 +478,7 @@ impl Daemon {
     }
 
     /// List all faces
-    pub async fn list_faces(&self) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error>> {
+    pub async fn list_faces(&self) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.list_faces().await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -430,7 +486,7 @@ impl Daemon {
     }
 
     /// Update face state
-    pub async fn update_face_state(&self, face_id: u32, state: u8) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_face_state(&self, face_id: u32, state: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.update_face_state(face_id, state).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -438,7 +494,7 @@ impl Daemon {
     }
 
     /// Get faces by type
-    pub async fn get_faces_by_type(&self, face_type: u8) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error>> {
+    pub async fn get_faces_by_type(&self, face_type: u8) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.get_faces_by_type(face_type).await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -446,7 +502,7 @@ impl Daemon {
     }
 
     /// Get active faces
-    pub async fn get_active_faces(&self) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error>> {
+    pub async fn get_active_faces(&self) -> Result<Vec<udcn_common::FaceInfo>, Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.get_active_faces().await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -454,7 +510,7 @@ impl Daemon {
     }
 
     /// Monitor face health
-    pub async fn monitor_faces(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn monitor_faces(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.face_manager {
             Some(manager) => manager.monitor_faces().await.map_err(|e| e.into()),
             None => Err("Face manager not initialized".into()),
@@ -462,25 +518,25 @@ impl Daemon {
     }
 
     /// Create an Ethernet face
-    pub async fn create_ethernet_face(&self, interface_name: String, mac_address: [u8; 6]) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_ethernet_face(&self, interface_name: String, mac_address: [u8; 6]) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let config = FaceConfig::new_ethernet(0, interface_name, mac_address);
         self.create_face(config).await
     }
 
     /// Create a UDP face
-    pub async fn create_udp_face(&self, ip_address: std::net::IpAddr, port: u16) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_udp_face(&self, ip_address: std::net::IpAddr, port: u16) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let config = FaceConfig::new_udp(0, ip_address, port);
         self.create_face(config).await
     }
 
     /// Create a TCP face
-    pub async fn create_tcp_face(&self, ip_address: std::net::IpAddr, port: u16) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_tcp_face(&self, ip_address: std::net::IpAddr, port: u16) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let config = FaceConfig::new_tcp(0, ip_address, port);
         self.create_face(config).await
     }
 
     /// Create an IP face
-    pub async fn create_ip_face(&self, ip_address: std::net::IpAddr) -> Result<u32, Box<dyn std::error::Error>> {
+    pub async fn create_ip_face(&self, ip_address: std::net::IpAddr) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let config = FaceConfig::new_ip(0, ip_address);
         self.create_face(config).await
     }
@@ -493,7 +549,7 @@ impl Daemon {
     // === ROUTING OPERATIONS API ===
 
     /// Process incoming Interest packet
-    pub async fn process_interest(&self, interest: udcn_core::packets::Interest, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn process_interest(&self, interest: udcn_core::packets::Interest, incoming_face: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.process_interest(interest, incoming_face).await,
             None => Err("Routing manager not initialized".into()),
@@ -501,7 +557,7 @@ impl Daemon {
     }
 
     /// Process incoming Data packet
-    pub async fn process_data(&self, data: udcn_core::packets::Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn process_data(&self, data: udcn_core::packets::Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.process_data(data, incoming_face).await,
             None => Err("Routing manager not initialized".into()),
@@ -509,7 +565,7 @@ impl Daemon {
     }
 
     /// Add a FIB entry
-    pub async fn add_fib_entry(&self, prefix: &str, next_hop: std::net::SocketAddr, cost: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn add_fib_entry(&self, prefix: &str, next_hop: std::net::SocketAddr, cost: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.add_fib_entry(prefix, next_hop, cost).await,
             None => Err("Routing manager not initialized".into()),
@@ -517,7 +573,7 @@ impl Daemon {
     }
 
     /// Remove a FIB entry
-    pub async fn remove_fib_entry(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove_fib_entry(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.remove_fib_entry(prefix).await,
             None => Err("Routing manager not initialized".into()),
@@ -525,7 +581,7 @@ impl Daemon {
     }
 
     /// Set routing strategy for a name prefix
-    pub async fn set_routing_strategy(&self, prefix: String, strategy: RoutingStrategy) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn set_routing_strategy(&self, prefix: String, strategy: RoutingStrategy) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.set_strategy(prefix, strategy).await,
             None => Err("Routing manager not initialized".into()),
@@ -533,7 +589,7 @@ impl Daemon {
     }
 
     /// Get routing strategy for a name prefix
-    pub async fn get_routing_strategy(&self, prefix: &str) -> Result<RoutingStrategy, Box<dyn std::error::Error>> {
+    pub async fn get_routing_strategy(&self, prefix: &str) -> Result<RoutingStrategy, Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => Ok(manager.get_strategy(prefix).await),
             None => Err("Routing manager not initialized".into()),
@@ -541,7 +597,7 @@ impl Daemon {
     }
 
     /// Get routing statistics
-    pub async fn get_routing_stats(&self) -> Result<crate::routing::RoutingStats, Box<dyn std::error::Error>> {
+    pub async fn get_routing_stats(&self) -> Result<crate::routing::RoutingStats, Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => Ok(manager.get_stats().await),
             None => Err("Routing manager not initialized".into()),
@@ -549,7 +605,7 @@ impl Daemon {
     }
 
     /// Reset routing statistics
-    pub async fn reset_routing_stats(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn reset_routing_stats(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => { manager.reset_stats().await; Ok(()) },
             None => Err("Routing manager not initialized".into()),
@@ -557,7 +613,7 @@ impl Daemon {
     }
 
     /// Update routing configuration
-    pub async fn update_routing_config(&self, config: RoutingConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_routing_config(&self, config: RoutingConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => manager.update_config(config).await,
             None => Err("Routing manager not initialized".into()),
@@ -565,7 +621,7 @@ impl Daemon {
     }
 
     /// Get current routing configuration
-    pub async fn get_routing_config(&self) -> Result<RoutingConfig, Box<dyn std::error::Error>> {
+    pub async fn get_routing_config(&self) -> Result<RoutingConfig, Box<dyn std::error::Error + Send + Sync>> {
         match &self.routing_manager {
             Some(manager) => Ok(manager.get_config().await),
             None => Err("Routing manager not initialized".into()),
@@ -583,7 +639,7 @@ impl Daemon {
     // === CONTROL PLANE OPERATIONS API ===
 
     /// Get network topology information
-    pub async fn get_network_topology(&self) -> Result<crate::control_plane::NetworkTopology, Box<dyn std::error::Error>> {
+    pub async fn get_network_topology(&self) -> Result<crate::control_plane::NetworkTopology, Box<dyn std::error::Error + Send + Sync>> {
         match &self.control_plane_manager {
             Some(manager) => Ok(manager.get_topology().await),
             None => Err("Control plane manager not initialized".into()),
@@ -591,15 +647,15 @@ impl Daemon {
     }
 
     /// Send control message to control plane
-    pub async fn send_control_message(&self, message: crate::control_plane::ControlMessage) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn send_control_message(&self, message: crate::control_plane::ControlMessage) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.control_plane_manager {
-            Some(manager) => manager.send_control_message(message).await,
+            Some(manager) => manager.send_control_message(message).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() }),
             None => Err("Control plane manager not initialized".into()),
         }
     }
 
     /// Update neighbor information
-    pub async fn update_neighbor(&self, neighbor: crate::control_plane::NeighborInfo) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_neighbor(&self, neighbor: crate::control_plane::NeighborInfo) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match &self.control_plane_manager {
             Some(manager) => {
                 manager.update_neighbor(neighbor).await;
@@ -618,7 +674,7 @@ impl Daemon {
     }
 
     /// Load FIB entries from configuration
-    async fn load_fib_entries(&self, routing_manager: &RoutingManager) -> Result<(), Box<dyn std::error::Error>> {
+    async fn load_fib_entries(&self, routing_manager: &RoutingManager) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Loading FIB entries from configuration");
         
         // Convert default strategy string to RoutingStrategy enum

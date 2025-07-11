@@ -103,9 +103,10 @@ impl RoutingManager {
         let forwarding_config = ForwardingConfig::default();
         let forwarding_engine = Arc::new(NdnForwardingEngine::new(local_address, forwarding_config));
         
-        // Create transport manager with local address port
+        // Create transport manager with local address and port
         let transport_config = TransportConfig {
             local_port: local_address.port(),
+            bind_address: local_address.ip().to_string(),
             ..Default::default()
         };
         let transport_manager = Arc::new(RwLock::new(TransportManager::new(transport_config)));
@@ -155,7 +156,7 @@ impl RoutingManager {
     }
 
     /// Process incoming Interest packet
-    pub async fn process_interest(&self, interest: Interest, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn process_interest(&self, interest: Interest, incoming_face: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Processing Interest: {} from face {}", interest.name, incoming_face);
         
         // Update statistics
@@ -218,7 +219,7 @@ impl RoutingManager {
     }
 
     /// Process incoming Data packet
-    pub async fn process_data(&self, data: Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn process_data(&self, data: Data, incoming_face: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Processing Data: {} from face {}", data.name, incoming_face);
 
         // Convert face ID to SocketAddr using face mapping
@@ -266,21 +267,21 @@ impl RoutingManager {
     }
 
     /// Add a FIB entry
-    pub async fn add_fib_entry(&self, prefix: &str, next_hop: SocketAddr, cost: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn add_fib_entry(&self, prefix: &str, next_hop: SocketAddr, cost: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Adding FIB entry: {} -> {} (cost: {})", prefix, next_hop, cost);
         self.forwarding_engine.add_route(prefix.to_string(), vec![next_hop]).await?;
         Ok(())
     }
 
     /// Remove a FIB entry
-    pub async fn remove_fib_entry(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove_fib_entry(&self, prefix: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Removing FIB entry: {}", prefix);
         self.forwarding_engine.remove_route(prefix).await?;
         Ok(())
     }
 
     /// Set routing strategy for a name prefix
-    pub async fn set_strategy(&self, prefix: String, strategy: RoutingStrategy) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn set_strategy(&self, prefix: String, strategy: RoutingStrategy) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Setting routing strategy for {}: {:?}", prefix, strategy);
         let mut strategy_table = self.strategy_table.write().await;
         strategy_table.insert(prefix, strategy);
@@ -317,7 +318,7 @@ impl RoutingManager {
     }
 
     /// Send Interest to a specific address
-    async fn send_interest_to_addr(&self, interest: &Interest, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    async fn send_interest_to_addr(&self, interest: &Interest, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending Interest {} to address {}", interest.name, addr);
         
         // Use transport manager to send the Interest
@@ -337,7 +338,7 @@ impl RoutingManager {
     }
 
     /// Send Data to a specific address
-    async fn send_data_to_addr(&self, data: &Data, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    async fn send_data_to_addr(&self, data: &Data, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending Data {} to address {}", data.name, addr);
         
         // Use transport manager to send the Data
@@ -358,7 +359,7 @@ impl RoutingManager {
     }
 
     /// Update routing configuration
-    pub async fn update_config(&self, config: RoutingConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_config(&self, config: RoutingConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Updating routing configuration");
         let mut current_config = self.config.write().await;
         *current_config = config;
@@ -389,7 +390,7 @@ impl Service for RoutingManager {
         })
     }
 
-    async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Routing Manager");
         
         // Start transport manager
@@ -410,7 +411,7 @@ impl Service for RoutingManager {
         Ok(())
     }
 
-    async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopping Routing Manager");
         
         // Mark as not running
@@ -429,10 +430,17 @@ impl Service for RoutingManager {
         Ok(())
     }
 
-    async fn restart(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn restart(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Restarting Routing Manager");
         self.stop().await?;
         self.start().await?;
         Ok(())
+    }
+}
+
+impl RoutingManager {
+    /// Get the transport manager used by this routing manager
+    pub fn get_transport_manager(&self) -> Arc<RwLock<TransportManager>> {
+        self.transport_manager.clone()
     }
 }
