@@ -32,7 +32,7 @@ impl FaceConfig {
             ip_address: None,
             port: None,
             mac_address: Some(mac_address),
-            mtu: Some(1500),
+            mtu: Some(8192),
             enable_stats: true,
         }
     }
@@ -45,7 +45,7 @@ impl FaceConfig {
             ip_address: Some(ip_address),
             port: Some(port),
             mac_address: None,
-            mtu: Some(1500),
+            mtu: Some(8192),
             enable_stats: true,
         }
     }
@@ -58,7 +58,7 @@ impl FaceConfig {
             ip_address: Some(ip_address),
             port: Some(port),
             mac_address: None,
-            mtu: Some(1500),
+            mtu: Some(8192),
             enable_stats: true,
         }
     }
@@ -71,7 +71,7 @@ impl FaceConfig {
             ip_address: Some(ip_address),
             port: None,
             mac_address: None,
-            mtu: Some(1500),
+            mtu: Some(8192),
             enable_stats: true,
         }
     }

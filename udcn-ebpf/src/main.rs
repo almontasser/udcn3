@@ -870,7 +870,9 @@ fn count_name_components(ctx: &XdpContext, name_content_start: usize, name_lengt
         
         // Check component type
         let component_type = unsafe { *(current_pos as *const u8) };
-        if component_type != NDN_TLV_NAME_COMPONENT {
+        if component_type != NDN_TLV_NAME_COMPONENT && 
+           component_type != NDN_TLV_IMPLICIT_SHA256_DIGEST_COMPONENT &&
+           component_type != NDN_TLV_PARAMETERS_SHA256_DIGEST_COMPONENT {
             info!(ctx, "Invalid name component type: {}", component_type);
             break;
         }
@@ -4028,6 +4030,8 @@ const NDN_TLV_INTEREST: u8 = 0x05;
 const NDN_TLV_DATA: u8 = 0x06;
 const NDN_TLV_NAME: u8 = 0x07;
 const NDN_TLV_NAME_COMPONENT: u8 = 0x08;
+const NDN_TLV_IMPLICIT_SHA256_DIGEST_COMPONENT: u8 = 0x01;
+const NDN_TLV_PARAMETERS_SHA256_DIGEST_COMPONENT: u8 = 0x02;
 const NDN_TLV_NONCE: u8 = 0x0A;
 const NDN_TLV_INTEREST_LIFETIME: u8 = 0x0C;
 const NDN_TLV_META_INFO: u8 = 0x14;

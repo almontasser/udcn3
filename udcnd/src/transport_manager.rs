@@ -83,8 +83,8 @@ impl TransportManager {
     pub fn new(config: TransportConfig) -> Self {
         let (tx, rx) = mpsc::channel(1000);
         
-        // Create fragmenter with MTU-safe configuration
-        let fragmentation_config = FragmentationConfig::with_mtu(1400); // Safe for most networks
+        // Create fragmenter with larger MTU to support bigger UDP packets
+        let fragmentation_config = FragmentationConfig::with_mtu(8192); // Match eBPF MAX_PACKET_SIZE
         let fragmenter = PacketFragmenter::new(fragmentation_config);
         
         Self {
@@ -190,30 +190,11 @@ impl TransportManager {
     /// Send raw packet data to a specific address
     async fn send_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref socket) = self.local_socket {
-            // Check if packet needs fragmentation
-            if data.len() > 1400 {
-                // Fragment the packet
-                let mut fragmenter = self.fragmenter.lock().await;
-                let fragments = fragmenter.fragment_packet(data)
-                    .map_err(|e| format!("Failed to fragment packet: {}", e))?;
-                
-                let mut total_bytes = 0;
-                info!("Fragmenting large packet ({} bytes) into {} fragments", data.len(), fragments.len());
-                
-                // Send each fragment
-                for (i, fragment) in fragments.iter().enumerate() {
-                    let fragment_bytes = fragment.to_bytes();
-                    let bytes_sent = socket.send_to(&fragment_bytes, addr).await?;
-                    total_bytes += bytes_sent;
-                    info!("Sent fragment {}/{} ({} bytes)", i + 1, fragments.len(), bytes_sent);
-                }
-                
-                Ok(total_bytes)
-            } else {
-                // Small packet, send directly
-                let bytes_sent = socket.send_to(data, addr).await?;
-                Ok(bytes_sent)
-            }
+            // Send packet directly - UDP can handle up to 65KB packets
+            // Disable fragmentation to avoid complexity since we're using UDP
+            let bytes_sent = socket.send_to(data, addr).await?;
+            debug!("Sent packet: {} bytes to {}", bytes_sent, addr);
+            Ok(bytes_sent)
         } else {
             Err("No local socket available".into())
         }

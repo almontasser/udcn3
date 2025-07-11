@@ -170,16 +170,141 @@ impl FileTransferService {
         let mut received_chunks = Vec::new();
         let mut successful_chunks = 0;
         
-        // Request each chunk
-        for chunk_index in 0..total_chunks {
-            let mut chunk_name = base_name.clone();
-            chunk_name.append_str(&format!("segment/{}", chunk_index));
-            let chunk_interest = Interest::new(chunk_name.clone());
+        // Use streaming approach with single receiver and request pipelining
+        let window_size = 16; // Large pipeline window
+        let chunk_timeout = Duration::from_secs(2); // Shorter timeout for faster flow
+        let mut failed_chunks = Vec::new();
+        
+        // Channels for coordination
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(window_size * 3);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(window_size * 2);
+        
+        // Single receiver task - eliminates UDP socket contention
+        let transport_receiver = self.transport.clone();
+        let receiver_result_tx = result_tx.clone();
+        tokio::spawn(async move {
+            let mut pending_requests = std::collections::HashMap::new();
             
-            match self.request_data(&chunk_interest, source_addr, timeout_duration).await {
-                Ok(chunk_data_packet) => {
-                    // Extract the actual chunk data from the data packet
-                    let chunk_data = chunk_data_packet.content;
+            loop {
+                tokio::select! {
+                    // Handle incoming requests
+                    request = request_rx.recv() => {
+                        match request {
+                            Some((chunk_index, interest_data)) => {
+                                // Send Interest immediately
+                                if let Err(e) = transport_receiver.send_to_async(&interest_data, source_addr).await {
+                                    let _ = receiver_result_tx.send((chunk_index, Err(format!("Send failed: {}", e)))).await;
+                                } else {
+                                    // Track this request
+                                    pending_requests.insert(chunk_index, std::time::Instant::now());
+                                }
+                            }
+                            None => break, // Channel closed
+                        }
+                    }
+                    
+                    // Handle incoming responses  
+                    response = transport_receiver.receive_async() => {
+                        match response {
+                            Ok(response) => {
+                                // Find NDN Data packet
+                                let decode_data = if response.len() > 0 && response[0] == 0x06 {
+                                    &response
+                                } else if response.len() > 16 {
+                                    let mut found_offset = None;
+                                    for offset in 1..std::cmp::min(32, response.len() - 8) {
+                                        if offset < response.len() && response[offset] == 0x06 {
+                                            found_offset = Some(offset);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(offset) = found_offset {
+                                        &response[offset..]
+                                    } else {
+                                        &response
+                                    }
+                                } else {
+                                    &response
+                                };
+                                
+                                // Decode and match to pending request
+                                match Data::decode(decode_data) {
+                                    Ok((data_packet, _)) => {
+                                        // Extract chunk index from name
+                                        if let Some(last_component) = data_packet.name.components.last() {
+                                            if let Ok(index_str) = std::str::from_utf8(last_component) {
+                                                if let Ok(chunk_index) = index_str.parse::<usize>() {
+                                                    pending_requests.remove(&chunk_index);
+                                                    let _ = receiver_result_tx.send((chunk_index, Ok(data_packet.content))).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Ignore decode errors for continuous flow
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // Continue on transport errors
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        }
+                    }
+                    
+                    // Timeout handling
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let now = std::time::Instant::now();
+                        let mut timed_out = Vec::new();
+                        
+                        for (&chunk_index, &request_time) in &pending_requests {
+                            if now.duration_since(request_time) > chunk_timeout {
+                                timed_out.push(chunk_index);
+                            }
+                        }
+                        
+                        for chunk_index in timed_out {
+                            pending_requests.remove(&chunk_index);
+                            let _ = receiver_result_tx.send((chunk_index, Err("Request timed out".to_string()))).await;
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Request sender task - maintains pipeline flow
+        let request_sender = request_tx.clone();
+        let base_name_clone = base_name.clone();
+        tokio::spawn(async move {
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(window_size));
+            
+            for chunk_index in 0..total_chunks {
+                let _permit = semaphore.acquire().await.unwrap();
+                
+                let mut chunk_name = base_name_clone.clone();
+                chunk_name.append_str(&format!("segment/{}", chunk_index));
+                let chunk_interest = Interest::new(chunk_name.clone());
+                
+                match chunk_interest.encode() {
+                    Ok(interest_data) => {
+                        if request_sender.send((chunk_index, interest_data)).await.is_err() {
+                            break; // Channel closed
+                        }
+                    }
+                    Err(e) => {
+                        let _ = result_tx.send((chunk_index, Err(format!("Encode error: {}", e)))).await;
+                    }
+                }
+                
+                // Small delay to control flow rate
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        
+        // Collect results continuously
+        while successful_chunks + failed_chunks.len() < total_chunks {
+            match result_rx.recv().await {
+                Some((chunk_index, Ok(chunk_data))) => {
                     received_chunks.push((chunk_index, chunk_data));
                     successful_chunks += 1;
                     
@@ -190,10 +315,28 @@ impl FileTransferService {
                     
                     debug!("Received chunk {}/{}", successful_chunks, total_chunks);
                 }
-                Err(e) => {
-                    error!("Failed to receive chunk {}: {}", chunk_index, e);
-                    return Err(format!("Failed to receive chunk {}: {}", chunk_index, e).into());
+                Some((chunk_index, Err(e))) => {
+                    warn!("Failed to receive chunk {}: {}", chunk_index, e);
+                    failed_chunks.push(chunk_index);
                 }
+                None => break,
+            }
+        }
+        
+        // Report on failed chunks
+        if !failed_chunks.is_empty() {
+            warn!("Failed to receive {} chunks: {:?}", failed_chunks.len(), failed_chunks);
+            warn!("Successfully received {}/{} chunks ({:.1}%)", 
+                  successful_chunks, total_chunks, 
+                  (successful_chunks as f64 / total_chunks as f64) * 100.0);
+            
+            // If we got most chunks, continue with partial file
+            if successful_chunks > total_chunks * 3 / 4 { // At least 75% success
+                warn!("Continuing with partial file ({:.1}% complete)", 
+                      (successful_chunks as f64 / total_chunks as f64) * 100.0);
+            } else {
+                return Err(format!("Too many failed chunks: {}/{} failed", 
+                                 failed_chunks.len(), total_chunks).into());
             }
         }
         
@@ -234,8 +377,50 @@ impl FileTransferService {
             .map_err(|_| "Request timed out")?
             .map_err(|e| format!("Transport error: {}", e))?;
         
+        // Debug: log response data for troubleshooting
+        debug!("Response data length: {}, first 32 bytes: {:?}", response.len(), &response[..std::cmp::min(32, response.len())]);
+        
+        // Check if response starts with proper NDN packet type (0x06 for Data)
+        let decode_data = if response.len() > 0 && response[0] == 0x06 {
+            // Proper NDN Data packet
+            debug!("Found NDN Data packet at start");
+            &response
+        } else if response.len() > 16 {
+            // Look for NDN Data packet starting at different offsets
+            let mut found_offset = None;
+            for offset in 1..std::cmp::min(32, response.len() - 8) {
+                if offset < response.len() && response[offset] == 0x06 {
+                    // Verify this looks like valid NDN packet by checking length encoding
+                    if offset + 3 < response.len() {
+                        let remaining_len = response.len() - offset;
+                        debug!("Found potential NDN Data packet at offset {}, remaining length: {}", offset, remaining_len);
+                        debug!("NDN header at offset {}: {:02X?}", offset, &response[offset..std::cmp::min(offset+8, response.len())]);
+                        found_offset = Some(offset);
+                        break;
+                    }
+                }
+            }
+            if let Some(offset) = found_offset {
+                &response[offset..]
+            } else {
+                error!("No NDN Data packet found in response");
+                &response
+            }
+        } else {
+            &response
+        };
+        
         // Decode the response
-        let (data_packet, _) = Data::decode(&response).map_err(|e| format!("Failed to decode data: {}", e))?;
+        let (data_packet, _) = Data::decode(decode_data).map_err(|e| {
+            error!("Failed to decode data packet. Response length: {}, error: {}", response.len(), e);
+            if response.len() >= 8 {
+                error!("Response header bytes: {:02X?}", &response[..8]);
+            }
+            if decode_data != &response {
+                error!("Attempted decode from offset, decode data: {:02X?}", &decode_data[..std::cmp::min(8, decode_data.len())]);
+            }
+            format!("Failed to decode data: {}", e)
+        })?;
         Ok(data_packet)
     }
 

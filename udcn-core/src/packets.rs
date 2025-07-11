@@ -9,6 +9,8 @@ pub mod tlv_types {
     pub const DATA: u8 = 0x06;
     pub const NAME: u8 = 0x07;
     pub const NAME_COMPONENT: u8 = 0x08;
+    pub const IMPLICIT_SHA256_DIGEST_COMPONENT: u8 = 0x01;
+    pub const PARAMETERS_SHA256_DIGEST_COMPONENT: u8 = 0x02;
     pub const SELECTORS: u8 = 0x09;
     pub const NONCE: u8 = 0x0A;
     pub const INTEREST_LIFETIME: u8 = 0x0C;
@@ -149,7 +151,7 @@ impl Name {
         
         while offset < name_element.value.len() {
             let (comp_element, comp_consumed) = TlvElement::decode(&name_element.value[offset..])?;
-            if comp_element.type_ != tlv_types::NAME_COMPONENT {
+            if !matches!(comp_element.type_, tlv_types::NAME_COMPONENT | tlv_types::IMPLICIT_SHA256_DIGEST_COMPONENT | tlv_types::PARAMETERS_SHA256_DIGEST_COMPONENT) {
                 return Err(TlvError::InvalidType(comp_element.type_));
             }
             name.components.push(comp_element.value);
