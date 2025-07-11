@@ -4,11 +4,11 @@
 
 set -e
 
-echo "Building UDCN workspace (excluding eBPF)..."
-cargo build --workspace --exclude udcn-ebpf
-
 echo "Building eBPF package..."
 cargo build-ebpf
+
+echo "Building UDCN workspace (excluding eBPF)..."
+cargo build --workspace --exclude udcn-ebpf
 
 echo "All packages built successfully!"
 

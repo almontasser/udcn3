@@ -59,7 +59,7 @@ impl EbpfManager {
         program.load()?;
         
         // Attach the program to the interface
-        program.attach(&self.interface_name, aya::programs::XdpFlags::default())
+        program.attach(&self.interface_name, aya::programs::XdpFlags::SKB_MODE)
             .map_err(|e| format!("failed to attach the XDP program to {}: {} - try changing XdpFlags::default() to XdpFlags::SKB_MODE", 
                                 self.interface_name, e))?;
 

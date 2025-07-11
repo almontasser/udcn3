@@ -404,7 +404,7 @@ impl Default for Config {
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
                 max_connections: 1000,
-                interface: "eth0".to_string(),
+                interface: "ens160".to_string(),
             },
             routing: RoutingConfigSection {
                 fib_entries: vec![
