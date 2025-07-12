@@ -3,19 +3,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, interval};
 use log::{debug, error, info, warn};
 
 use udcn_core::packets::{Interest, Data};
 use crate::transport_manager::{TransportManager, IncomingPacket};
+use crate::persistent_content_store::{PersistentContentStore, PersistentContentStoreConfig};
 
 /// Content store entry
 #[derive(Debug, Clone)]
-struct ContentEntry {
-    data: Data,
-    stored_at: std::time::Instant,
-    freshness_period: Option<Duration>,
-    access_count: u64,
+pub struct ContentEntry {
+    pub data: Data,
+    pub stored_at: std::time::Instant,
+    pub freshness_period: Option<Duration>,
+    pub access_count: u64,
 }
 
 impl ContentEntry {
@@ -28,7 +29,7 @@ impl ContentEntry {
         }
     }
 
-    fn is_fresh(&self) -> bool {
+    pub fn is_fresh(&self) -> bool {
         if let Some(freshness_period) = self.freshness_period {
             self.stored_at.elapsed() < freshness_period
         } else {
@@ -44,6 +45,7 @@ pub struct PacketHandler {
     running: Arc<RwLock<bool>>,
     stats: Arc<RwLock<PacketHandlerStats>>,
     packet_receiver: Option<mpsc::Receiver<IncomingPacket>>,
+    persistent_store: Option<Arc<RwLock<PersistentContentStore>>>,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +70,24 @@ impl PacketHandler {
             running: Arc::new(RwLock::new(false)),
             stats: Arc::new(RwLock::new(PacketHandlerStats::default())),
             packet_receiver: None,
+            persistent_store: None,
+        }
+    }
+
+    /// Create a new packet handler with persistence
+    pub fn new_with_persistence(
+        transport_manager: Arc<RwLock<TransportManager>>,
+        persistent_config: PersistentContentStoreConfig,
+    ) -> Self {
+        let persistent_store = Arc::new(RwLock::new(PersistentContentStore::new(persistent_config)));
+        
+        Self {
+            content_store: Arc::new(RwLock::new(HashMap::new())),
+            transport_manager,
+            running: Arc::new(RwLock::new(false)),
+            stats: Arc::new(RwLock::new(PacketHandlerStats::default())),
+            packet_receiver: None,
+            persistent_store: Some(persistent_store),
         }
     }
 
@@ -84,6 +104,19 @@ impl PacketHandler {
             return Err("Packet receiver not set. Call set_packet_receiver first.".into());
         }
         
+        // Initialize and load persistent content store if enabled
+        if let Some(ref persistent_store) = self.persistent_store {
+            let mut store = persistent_store.write().await;
+            store.initialize().await?;
+            
+            // Load existing content from disk
+            let loaded_content = store.load_content_store().await?;
+            if !loaded_content.is_empty() {
+                info!("Loaded {} entries from persistent storage", loaded_content.len());
+                *self.content_store.write().await = loaded_content;
+            }
+        }
+        
         *self.running.write().await = true;
         
         // Take the receiver
@@ -94,6 +127,7 @@ impl PacketHandler {
         let transport_manager = self.transport_manager.clone();
         let running = self.running.clone();
         let stats = self.stats.clone();
+        let persistent_store = self.persistent_store.clone();
         
         tokio::spawn(async move {
             Self::packet_processing_loop(
@@ -102,6 +136,7 @@ impl PacketHandler {
                 transport_manager,
                 running,
                 stats,
+                persistent_store,
             ).await;
         });
         
@@ -113,6 +148,21 @@ impl PacketHandler {
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopping NDN Packet Handler");
         *self.running.write().await = false;
+        
+        // Save content store before shutdown if persistence is enabled
+        if let Some(ref persistent_store) = self.persistent_store {
+            let store_data = self.content_store.read().await.clone();
+            if !store_data.is_empty() {
+                info!("Saving content store before shutdown...");
+                let mut persistent = persistent_store.write().await;
+                if let Err(e) = persistent.save_content_store(&store_data).await {
+                    warn!("Failed to save content store on shutdown: {}", e);
+                } else {
+                    info!("Successfully saved {} entries before shutdown", store_data.len());
+                }
+            }
+        }
+        
         Ok(())
     }
 
@@ -123,16 +173,52 @@ impl PacketHandler {
         transport_manager: Arc<RwLock<TransportManager>>,
         running: Arc<RwLock<bool>>,
         stats: Arc<RwLock<PacketHandlerStats>>,
+        persistent_store: Option<Arc<RwLock<PersistentContentStore>>>,
     ) {
         info!("Packet processing loop started");
+        
+        // Start auto-save task if persistent store is enabled
+        if let Some(ref persistent_store) = persistent_store {
+            let content_store_clone = content_store.clone();
+            let persistent_store_clone = persistent_store.clone();
+            let running_clone = running.clone();
+            
+            tokio::spawn(async move {
+                let mut save_interval = interval(Duration::from_secs(30)); // Auto-save every 30 seconds
+                
+                while *running_clone.read().await {
+                    save_interval.tick().await;
+                    
+                    // Save content store to disk
+                    let store_data = content_store_clone.read().await.clone();
+                    if !store_data.is_empty() {
+                        if let Ok(mut persistent) = persistent_store_clone.try_write() {
+                            if let Err(e) = persistent.save_content_store(&store_data).await {
+                                warn!("Failed to auto-save content store: {}", e);
+                            } else {
+                                debug!("Auto-saved content store with {} entries", store_data.len());
+                            }
+                        }
+                    }
+                }
+                
+                info!("Auto-save task stopped");
+            });
+        }
+        
         while *running.read().await {
             // Wait for incoming packet
             match timeout(Duration::from_millis(1000), receiver.recv()).await {
                 Ok(Some(packet)) => {
                     info!("Received packet in PacketHandler");
                     match packet {
-                        IncomingPacket::Interest(interest, src_addr) => {
+                        IncomingPacket::Interest(interest, src_addr, stream_context) => {
                             info!("Processing Interest for {} from {}", interest.name, src_addr);
+                            if let Some(ref ctx) = stream_context {
+                                info!("Interest received with bidirectional stream context, sequence: {}", ctx.sequence);
+                            } else {
+                                info!("Interest received without stream context (regular packet)");
+                            }
                             stats.write().await.interests_received += 1;
                             
                             // Look up content in store
@@ -148,7 +234,19 @@ impl PacketHandler {
                                     let data = entry.data.clone();
                                     drop(store); // Release lock before sending
                                     
-                                    if let Err(e) = transport_manager.read().await.send_data(&data, src_addr).await {
+                                    // Use bidirectional stream response if available, otherwise fallback
+                                    let send_result = if let Some(mut stream_ctx) = stream_context {
+                                        if let Some(send_stream) = stream_ctx.send_stream.take() {
+                                            info!("Using bidirectional stream response for {} (sequence: {})", name_str, stream_ctx.sequence);
+                                            transport_manager.read().await.send_data_response_on_stream(&data, send_stream, stream_ctx.sequence).await
+                                        } else {
+                                            transport_manager.read().await.send_data_response(&data, &stream_ctx.connection).await
+                                        }
+                                    } else {
+                                        transport_manager.read().await.send_data(&data, src_addr).await
+                                    };
+                                    
+                                    if let Err(e) = send_result {
                                         error!("Failed to send data response: {}", e);
                                     } else {
                                         info!("Sent data response for {} to {}", name_str, src_addr);
@@ -167,7 +265,7 @@ impl PacketHandler {
                                 stats.write().await.cache_misses += 1;
                             }
                         }
-                        IncomingPacket::Data(data, src_addr) => {
+                        IncomingPacket::Data(data, src_addr, _stream_context) => {
                             info!("Processing Data for {} from {}", data.name, src_addr);
                             stats.write().await.data_received += 1;
                             
@@ -179,7 +277,7 @@ impl PacketHandler {
                             info!("Stored data for {} in content store", name_str);
                             stats.write().await.data_stored += 1;
                         }
-                        IncomingPacket::Unknown(_, src_addr) => {
+                        IncomingPacket::Unknown(_, src_addr, _stream_context) => {
                             warn!("Received unknown packet from {}", src_addr);
                         }
                     }
@@ -261,6 +359,35 @@ impl PacketHandler {
             debug!("Cleaned up {} expired entries from content store", removed);
         }
     }
+
+    /// Manually save content store to disk
+    pub async fn save_content_store(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref persistent_store) = self.persistent_store {
+            let store_data = self.content_store.read().await.clone();
+            let mut persistent = persistent_store.write().await;
+            persistent.save_content_store(&store_data).await?;
+            info!("Manually saved {} entries to disk", store_data.len());
+            Ok(())
+        } else {
+            Err("Persistent content store not enabled".into())
+        }
+    }
+
+    /// Get persistent content store statistics
+    pub async fn get_persistent_stats(&self) -> Option<crate::persistent_content_store::PersistentContentStoreStats> {
+        if let Some(ref persistent_store) = self.persistent_store {
+            let store = persistent_store.read().await;
+            Some(store.get_stats().clone())
+        } else {
+            None
+        }
+    }
+
+    /// Check if persistence is enabled
+    pub fn is_persistence_enabled(&self) -> bool {
+        self.persistent_store.is_some()
+    }
+
 }
 
 /// Content store statistics

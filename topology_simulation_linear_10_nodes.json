@@ -1,0 +1,129 @@
+{
+  "topology_type": "Linear",
+  "node_count": 10,
+  "total_packets_sent": 6260,
+  "total_packets_received": 6231,
+  "average_path_length": 5.7,
+  "network_wide_latency": {
+    "secs": 0,
+    "nanos": 57000000
+  },
+  "network_wide_throughput": 622.3419729141883,
+  "packet_delivery_ratio": 0.9953674121405751,
+  "node_metrics": {
+    "node_6": {
+      "packets_forwarded": 2504,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_3": {
+      "packets_forwarded": 2504,
+      "packets_generated": 3130,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_1": {
+      "packets_forwarded": 2504,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_4": {
+      "packets_forwarded": 5008,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_0": {
+      "packets_forwarded": 0,
+      "packets_generated": 3130,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_5": {
+      "packets_forwarded": 3756,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_8": {
+      "packets_forwarded": 1252,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_9": {
+      "packets_forwarded": 0,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_7": {
+      "packets_forwarded": 2504,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    },
+    "node_2": {
+      "packets_forwarded": 3130,
+      "packets_generated": 0,
+      "packets_dropped": 0,
+      "cache_hit_rate": 0.0,
+      "average_processing_time": {
+        "secs": 0,
+        "nanos": 0
+      },
+      "link_utilizations": {}
+    }
+  },
+  "duration": {
+    "secs": 10,
+    "nanos": 12180234
+  }
+}

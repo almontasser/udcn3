@@ -9,7 +9,7 @@ use udcn_core::packets::{Interest, Data};
 use udcn_transport::{NdnForwardingEngine, ForwardingConfig, ForwardingDecision};
 
 use crate::service::Service;
-use crate::transport_manager::{TransportManager, TransportConfig};
+use crate::transport_manager::{TransportManager, TransportConfig, TransportProtocol};
 
 /// Routing strategy type
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,15 +99,26 @@ pub struct RoutingManager {
 
 impl RoutingManager {
     /// Create a new routing manager
-    pub fn new(local_address: SocketAddr) -> Self {
+    pub fn new(local_address: SocketAddr, transport_protocol: &str) -> Self {
         let forwarding_config = ForwardingConfig::default();
         let forwarding_engine = Arc::new(NdnForwardingEngine::new(local_address, forwarding_config));
         
+        // Parse transport protocol string to enum
+        let protocol = match transport_protocol.to_lowercase().as_str() {
+            "quic" => TransportProtocol::Quic,
+            "tcp" => TransportProtocol::Tcp,
+            "unix" => TransportProtocol::Unix,
+            _ => TransportProtocol::Udp, // Default fallback
+        };
+        
         // Create transport manager with local address and port
         let transport_config = TransportConfig {
+            protocol,
             local_port: local_address.port(),
             bind_address: local_address.ip().to_string(),
-            ..Default::default()
+            buffer_size: 65536,
+            connection_timeout_ms: 30000,
+            keep_alive_interval_ms: 10000,
         };
         let transport_manager = Arc::new(RwLock::new(TransportManager::new(transport_config)));
         

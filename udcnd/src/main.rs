@@ -14,6 +14,7 @@ mod protocols;
 mod face_manager;
 mod transport_manager;
 mod packet_handler;
+mod persistent_content_store;
 
 use config::Config;
 use daemon::Daemon;

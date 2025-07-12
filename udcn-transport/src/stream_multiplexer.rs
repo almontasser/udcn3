@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use anyhow::Result;
-use log::debug;
+use log::{debug, info, warn, error};
 use tokio::sync::{RwLock, Mutex, oneshot};
 use tokio::time::{Duration, Instant};
 use quinn::{Connection, SendStream, RecvStream};
@@ -571,6 +571,9 @@ impl StreamMultiplexer {
         request_frame.header.sequence = sequence;
         
         self.send_on_stream(stream_id, &request_frame).await?;
+        
+        // Start listening for responses on this stream's receive side
+        self.start_stream_response_listener(stream_id).await?;
 
         // Wait for response
         match tokio::time::timeout(timeout, response_rx).await {
@@ -600,6 +603,125 @@ impl StreamMultiplexer {
         let pool = self.get_pool(stream_id.connection_id).await;
         let mut pool = pool.lock().await;
         pool.return_stream(stream_id)
+    }
+
+    /// Handle incoming response on a bidirectional stream
+    pub async fn handle_incoming_response(&self, connection: &Connection, response_frame: NdnFrame) -> Result<()> {
+        let addr = connection.remote_address();
+        let pool = self.get_pool(addr).await;
+        let mut pool = pool.lock().await;
+        
+        // Find pending request by sequence number
+        let sequence = response_frame.header.sequence;
+        if let Some(pending_request) = pool.take_pending_request(sequence) {
+            // Send response to waiting request
+            let _ = pending_request.response_tx.send(Ok(response_frame));
+            debug!("Handled response for sequence {} from {}", sequence, addr);
+        } else {
+            debug!("No pending request found for sequence {} from {}", sequence, addr);
+        }
+        
+        Ok(())
+    }
+    
+    /// Start listening for responses on a specific stream's receive side
+    async fn start_stream_response_listener(&self, stream_id: StreamId) -> Result<()> {
+        let pool = self.get_pool(stream_id.connection_id).await;
+        let mut pool_lock = pool.lock().await;
+        
+        // Get the receive stream from the stream entry
+        let recv_stream = if let Some(stream_entry) = pool_lock.streams.get_mut(&stream_id) {
+            if let Some(recv_stream) = stream_entry.recv_stream.take() {
+                recv_stream
+            } else {
+                debug!("No receive stream available for stream {:?} (already taken or unidirectional)", stream_id);
+                return Ok(()); // No receive stream or already taken
+            }
+        } else {
+            return Err(anyhow::anyhow!("Stream not found: {:?}", stream_id));
+        };
+        
+        drop(pool_lock); // Release the lock before spawning task
+        
+        let pool_clone = pool.clone();
+        
+        // Spawn background task to read responses from this stream
+        tokio::spawn(async move {
+            info!("Starting response listener for stream {:?}", stream_id);
+            
+            let mut recv_stream = recv_stream;
+            let mut buffer = Vec::new();
+            let mut temp_buffer = [0u8; 8192];
+            
+            loop {
+                match tokio::time::timeout(Duration::from_millis(5000), recv_stream.read(&mut temp_buffer)).await {
+                    Ok(Ok(Some(0))) => {
+                        info!("Stream {:?} closed by remote", stream_id);
+                        break;
+                    }
+                    Ok(Ok(Some(n))) => {
+                        buffer.extend_from_slice(&temp_buffer[..n]);
+                        info!("Read {} bytes from stream {:?}, total buffer: {} bytes", n, stream_id, buffer.len());
+                        
+                        // Try to parse complete frames
+                        while buffer.len() >= 14 { // Minimum header size
+                            // Frame header format:
+                            // 1 byte: frame_type
+                            // 4 bytes: length (u32 big-endian)
+                            // 8 bytes: sequence (u64 big-endian)  
+                            // 1 byte: flags
+                            // Skip frame type byte and read length from bytes 1-4
+                            let length = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                            info!("Frame header indicates length: {} bytes, buffer has: {} bytes", length, buffer.len());
+                            
+                            if buffer.len() >= length + 14 { // length + header size
+                                // We have a complete frame
+                                let frame_bytes = buffer.drain(..length + 14).collect::<Vec<u8>>();
+                                
+                                match NdnFrame::from_bytes(&frame_bytes) {
+                                    Ok(response_frame) => {
+                                        info!("Received response frame sequence {} on stream {:?}", 
+                                               response_frame.header.sequence, stream_id);
+                                        
+                                        // Handle the response
+                                        let mut pool_lock = pool_clone.lock().await;
+                                        let sequence = response_frame.header.sequence;
+                                        if let Some(pending_request) = pool_lock.take_pending_request(sequence) {
+                                            let _ = pending_request.response_tx.send(Ok(response_frame));
+                                            info!("Delivered response for sequence {} on stream {:?}", sequence, stream_id);
+                                        } else {
+                                            warn!("No pending request for sequence {} on stream {:?}", sequence, stream_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse response frame on stream {:?}: {}", stream_id, e);
+                                    }
+                                }
+                            } else {
+                                break; // Wait for more data
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        info!("No more data on stream {:?}", stream_id);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!("Read error on stream {:?}: {}", stream_id, e);
+                        break;
+                    }
+                    Err(_timeout) => {
+                        debug!("Read timeout on stream {:?}, continuing...", stream_id);
+                        // Continue listening, timeouts are normal
+                        continue;
+                    }
+                }
+            }
+            
+            info!("Response listener stopped for stream {:?}", stream_id);
+        });
+        
+        Ok(())
     }
 
     /// Close a specific stream

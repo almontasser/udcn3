@@ -10,7 +10,8 @@ use udcn_core::packets::{Interest, Data};
 use udcn_transport::{
     Transport, PacketFragmenter, PacketReassembler, 
     FragmentationConfig, PacketReassemblyConfig,
-    Fragment, FragmentHeader
+    Fragment, FragmentHeader, NdnQuicTransport, NdnQuicConfig,
+    QuicTransport, QuicConfig
 };
 
 /// Transport protocol types
@@ -47,9 +48,9 @@ impl Default for TransportConfig {
 }
 
 /// Transport connection entry
-#[derive(Debug)]
 struct TransportConnection {
-    socket: Arc<UdpSocket>,
+    socket: Option<Arc<UdpSocket>>,
+    quic_transport: Option<Arc<NdnQuicTransport>>,
     protocol: TransportProtocol,
     last_used: std::time::Instant,
     bytes_sent: u64,
@@ -58,12 +59,35 @@ struct TransportConnection {
     packets_received: u64,
 }
 
+impl std::fmt::Debug for TransportConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConnection")
+            .field("socket", &self.socket.is_some())
+            .field("quic_transport", &self.quic_transport.is_some())
+            .field("protocol", &self.protocol)
+            .field("last_used", &self.last_used)
+            .field("bytes_sent", &self.bytes_sent)
+            .field("bytes_received", &self.bytes_received)
+            .field("packets_sent", &self.packets_sent)
+            .field("packets_received", &self.packets_received)
+            .finish()
+    }
+}
+
+/// Stream context for bidirectional communication
+#[derive(Debug)]
+pub struct StreamContext {
+    pub connection: Arc<quinn::Connection>,
+    pub send_stream: Option<quinn::SendStream>,
+    pub sequence: u64,
+}
+
 /// Incoming packet type
 #[derive(Debug)]
 pub enum IncomingPacket {
-    Interest(Interest, SocketAddr),
-    Data(Data, SocketAddr),
-    Unknown(Vec<u8>, SocketAddr),
+    Interest(Interest, SocketAddr, Option<StreamContext>),
+    Data(Data, SocketAddr, Option<StreamContext>),
+    Unknown(Vec<u8>, SocketAddr, Option<StreamContext>),
 }
 
 /// Transport Manager for NDN packet transmission
@@ -71,6 +95,7 @@ pub struct TransportManager {
     config: TransportConfig,
     connections: Arc<RwLock<HashMap<SocketAddr, TransportConnection>>>,
     pub local_socket: Option<Arc<UdpSocket>>,
+    pub quic_transport: Option<Arc<NdnQuicTransport>>,
     running: Arc<RwLock<bool>>,
     packet_sender: Option<mpsc::Sender<IncomingPacket>>,
     packet_receiver: Option<mpsc::Receiver<IncomingPacket>>,
@@ -91,6 +116,7 @@ impl TransportManager {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
             local_socket: None,
+            quic_transport: None,
             running: Arc::new(RwLock::new(false)),
             packet_sender: Some(tx),
             packet_receiver: Some(rx),
@@ -101,32 +127,55 @@ impl TransportManager {
 
     /// Initialize the transport manager
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Starting Transport Manager");
+        info!("Starting Transport Manager with protocol: {:?}", self.config.protocol);
 
         // Parse bind address and create socket address
         let bind_ip: std::net::IpAddr = self.config.bind_address.parse()
             .map_err(|e| format!("Invalid bind address '{}': {}", self.config.bind_address, e))?;
         let local_addr = SocketAddr::new(bind_ip, self.config.local_port);
         
-        // Create local UDP socket for sending packets
-        let socket = UdpSocket::bind(local_addr).await?;
-        self.local_socket = Some(Arc::new(socket));
+        match self.config.protocol {
+            TransportProtocol::Udp => {
+                // Create local UDP socket for sending packets
+                let socket = UdpSocket::bind(local_addr).await?;
+                self.local_socket = Some(Arc::new(socket));
+
+                // Start UDP packet reception loop
+                let socket = self.local_socket.as_ref().unwrap().clone();
+                let running = self.running.clone();
+                let sender = self.packet_sender.as_ref().unwrap().clone();
+                let reassemblers = self.reassemblers.clone();
+                
+                tokio::spawn(async move {
+                    Self::udp_packet_reception_loop(socket, running, sender, reassemblers).await;
+                });
+            }
+            TransportProtocol::Quic => {
+                // Create QUIC transport
+                let quic_config = QuicConfig::default();
+                let ndn_config = NdnQuicConfig::default();
+                let quic_transport = QuicTransport::new_server(local_addr, quic_config).await?;
+                let ndn_quic_transport = NdnQuicTransport::new(Arc::new(quic_transport), ndn_config);
+                self.quic_transport = Some(Arc::new(ndn_quic_transport));
+
+                // Start QUIC packet reception loop
+                let quic_transport = self.quic_transport.as_ref().unwrap().clone();
+                let running = self.running.clone();
+                let sender = self.packet_sender.as_ref().unwrap().clone();
+                
+                tokio::spawn(async move {
+                    Self::quic_packet_reception_loop(quic_transport, running, sender).await;
+                });
+            }
+            _ => {
+                return Err(format!("Unsupported transport protocol: {:?}", self.config.protocol).into());
+            }
+        }
 
         // Mark as running
         *self.running.write().await = true;
 
-        // Start packet reception loop
-        let socket = self.local_socket.as_ref().unwrap().clone();
-        let running = self.running.clone();
-        let sender = self.packet_sender.as_ref().unwrap().clone();
-        let reassemblers = self.reassemblers.clone();
-        
-        tokio::spawn(async move {
-            Self::packet_reception_loop(socket, running, sender, reassemblers).await;
-        });
-
-        info!("Transport Manager started on {}", local_addr);
-        info!("Packet reception loop spawned");
+        info!("Transport Manager started on {} with {:?}", local_addr, self.config.protocol);
         Ok(())
     }
 
@@ -141,6 +190,14 @@ impl TransportManager {
         self.connections.write().await.clear();
         self.local_socket = None;
 
+        // Close QUIC transport if present
+        if let Some(ref quic_transport) = self.quic_transport {
+            if let Err(e) = quic_transport.quic_transport().close().await {
+                error!("Failed to close QUIC transport: {}", e);
+            }
+        }
+        self.quic_transport = None;
+
         info!("Transport Manager stopped");
         Ok(())
     }
@@ -151,19 +208,80 @@ impl TransportManager {
             return Err("Transport Manager not running".into());
         }
 
-        // Encode the Interest packet
-        let encoded_interest = interest.encode()
-            .map_err(|e| format!("Failed to encode Interest: {}", e))?;
+        match self.config.protocol {
+            TransportProtocol::Udp => {
+                // Encode the Interest packet
+                let encoded_interest = interest.encode()
+                    .map_err(|e| format!("Failed to encode Interest: {}", e))?;
 
-        // Send the packet
-        let bytes_sent = self.send_packet(&encoded_interest, addr).await?;
+                // Send the packet via UDP
+                let bytes_sent = self.send_udp_packet(&encoded_interest, addr).await?;
+                debug!("Sent Interest {} ({} bytes) via UDP to {}", interest.name, bytes_sent, addr);
+                
+                // Update connection statistics
+                self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
+                Ok(bytes_sent)
+            }
+            TransportProtocol::Quic => {
+                if let Some(ref quic_transport) = self.quic_transport {
+                    // Send via QUIC
+                    quic_transport.send_interest(interest, addr).await
+                        .map_err(|e| format!("Failed to send Interest via QUIC: {}", e))?;
+                    
+                    let bytes_sent = interest.encode().map(|e| e.len()).unwrap_or(0);
+                    debug!("Sent Interest {} ({} bytes) via QUIC to {}", interest.name, bytes_sent, addr);
+                    
+                    // Update connection statistics
+                    self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
+                    Ok(bytes_sent)
+                } else {
+                    Err("QUIC transport not initialized".into())
+                }
+            }
+            _ => {
+                Err(format!("Unsupported transport protocol: {:?}", self.config.protocol).into())
+            }
+        }
+    }
 
-        debug!("Sent Interest {} ({} bytes) to {}", interest.name, bytes_sent, addr);
+    /// Send a Data packet response on an existing QUIC connection
+    pub async fn send_data_response(&self, data: &Data, connection: &Arc<quinn::Connection>) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if !*self.running.read().await {
+            return Err("Transport Manager not running".into());
+        }
 
-        // Update connection statistics
-        self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
+        if let Some(ref quic_transport) = self.quic_transport {
+            // Send response via the existing QUIC connection (opens new unidirectional stream)
+            quic_transport.send_data_on_connection(data, connection).await
+                .map_err(|e| format!("Failed to send Data response via QUIC: {}", e))?;
+            
+            let bytes_sent = data.encode().map(|e| e.len()).unwrap_or(0);
+            debug!("Sent Data response {} ({} bytes) via QUIC", data.name, bytes_sent);
+            
+            Ok(bytes_sent)
+        } else {
+            Err("QUIC transport not initialized".into())
+        }
+    }
 
-        Ok(bytes_sent)
+    /// Send a Data packet response on a specific bidirectional stream
+    pub async fn send_data_response_on_stream(&self, data: &Data, send_stream: quinn::SendStream, sequence: u64) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if !*self.running.read().await {
+            return Err("Transport Manager not running".into());
+        }
+
+        if let Some(ref quic_transport) = self.quic_transport {
+            // Send response directly on the bidirectional stream with the original sequence number
+            quic_transport.send_data_on_stream(data, send_stream, sequence).await
+                .map_err(|e| format!("Failed to send Data response on stream: {}", e))?;
+            
+            let bytes_sent = data.encode().map(|e| e.len()).unwrap_or(0);
+            debug!("Sent Data response {} ({} bytes) on bidirectional stream with sequence {}", data.name, bytes_sent, sequence);
+            
+            Ok(bytes_sent)
+        } else {
+            Err("QUIC transport not initialized".into())
+        }
     }
 
     /// Send a Data packet to a specific address
@@ -172,31 +290,52 @@ impl TransportManager {
             return Err("Transport Manager not running".into());
         }
 
-        // Encode the Data packet
-        let encoded_data = data.encode()
-            .map_err(|e| format!("Failed to encode Data: {}", e))?;
+        match self.config.protocol {
+            TransportProtocol::Udp => {
+                // Encode the Data packet
+                let encoded_data = data.encode()
+                    .map_err(|e| format!("Failed to encode Data: {}", e))?;
 
-        // Send the packet
-        let bytes_sent = self.send_packet(&encoded_data, addr).await?;
-
-        debug!("Sent Data {} ({} bytes) to {}", data.name, bytes_sent, addr);
-
-        // Update connection statistics
-        self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
-
-        Ok(bytes_sent)
+                // Send the packet via UDP
+                let bytes_sent = self.send_udp_packet(&encoded_data, addr).await?;
+                debug!("Sent Data {} ({} bytes) via UDP to {}", data.name, bytes_sent, addr);
+                
+                // Update connection statistics
+                self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
+                Ok(bytes_sent)
+            }
+            TransportProtocol::Quic => {
+                if let Some(ref quic_transport) = self.quic_transport {
+                    // Send via QUIC
+                    quic_transport.send_data(data, addr).await
+                        .map_err(|e| format!("Failed to send Data via QUIC: {}", e))?;
+                    
+                    let bytes_sent = data.encode().map(|e| e.len()).unwrap_or(0);
+                    debug!("Sent Data {} ({} bytes) via QUIC to {}", data.name, bytes_sent, addr);
+                    
+                    // Update connection statistics
+                    self.update_connection_stats(addr, bytes_sent, 0, 1, 0).await;
+                    Ok(bytes_sent)
+                } else {
+                    Err("QUIC transport not initialized".into())
+                }
+            }
+            _ => {
+                Err(format!("Unsupported transport protocol: {:?}", self.config.protocol).into())
+            }
+        }
     }
 
-    /// Send raw packet data to a specific address
-    async fn send_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    /// Send raw packet data via UDP to a specific address
+    async fn send_udp_packet(&self, data: &[u8], addr: SocketAddr) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref socket) = self.local_socket {
             // Send packet directly - UDP can handle up to 65KB packets
             // Disable fragmentation to avoid complexity since we're using UDP
             let bytes_sent = socket.send_to(data, addr).await?;
-            debug!("Sent packet: {} bytes to {}", bytes_sent, addr);
+            debug!("Sent UDP packet: {} bytes to {}", bytes_sent, addr);
             Ok(bytes_sent)
         } else {
-            Err("No local socket available".into())
+            Err("No UDP socket available".into())
         }
     }
 
@@ -212,18 +351,38 @@ impl TransportManager {
             connection.last_used = std::time::Instant::now();
         } else {
             // Create new connection entry if it doesn't exist
-            if let Some(ref socket) = self.local_socket {
-                let connection = TransportConnection {
-                    socket: socket.clone(),
-                    protocol: self.config.protocol,
-                    last_used: std::time::Instant::now(),
-                    bytes_sent: bytes_sent as u64,
-                    bytes_received: bytes_received as u64,
-                    packets_sent,
-                    packets_received,
-                };
-                connections.insert(addr, connection);
-            }
+            let connection = match self.config.protocol {
+                TransportProtocol::Udp => {
+                    if let Some(ref socket) = self.local_socket {
+                        TransportConnection {
+                            socket: Some(socket.clone()),
+                            quic_transport: None,
+                            protocol: self.config.protocol,
+                            last_used: std::time::Instant::now(),
+                            bytes_sent: bytes_sent as u64,
+                            bytes_received: bytes_received as u64,
+                            packets_sent,
+                            packets_received,
+                        }
+                    } else {
+                        return; // No socket available
+                    }
+                }
+                TransportProtocol::Quic => {
+                    TransportConnection {
+                        socket: None,
+                        quic_transport: self.quic_transport.clone(),
+                        protocol: self.config.protocol,
+                        last_used: std::time::Instant::now(),
+                        bytes_sent: bytes_sent as u64,
+                        bytes_received: bytes_received as u64,
+                        packets_sent,
+                        packets_received,
+                    }
+                }
+                _ => return, // Unsupported protocol
+            };
+            connections.insert(addr, connection);
         }
     }
 
@@ -303,8 +462,8 @@ impl TransportManager {
         self.packet_receiver.take()
     }
 
-    /// Packet reception loop
-    async fn packet_reception_loop(
+    /// UDP packet reception loop
+    async fn udp_packet_reception_loop(
         socket: Arc<UdpSocket>,
         running: Arc<RwLock<bool>>,
         sender: mpsc::Sender<IncomingPacket>,
@@ -326,14 +485,14 @@ impl TransportManager {
                     // Try normal decoding
                     if let Ok((interest, _)) = Interest::decode(packet_data) {
                             info!("Received Interest for {} from {}", interest.name, src_addr);
-                            if let Err(e) = sender.send(IncomingPacket::Interest(interest, src_addr)).await {
+                            if let Err(e) = sender.send(IncomingPacket::Interest(interest, src_addr, None)).await {
                                 error!("Failed to send Interest to handler: {}", e);
                             }
                     }
                     // Try to decode as Data packet
                     else if let Ok((data, _)) = Data::decode(packet_data) {
                             info!("Received Data for {} from {}", data.name, src_addr);
-                            if let Err(e) = sender.send(IncomingPacket::Data(data, src_addr)).await {
+                            if let Err(e) = sender.send(IncomingPacket::Data(data, src_addr, None)).await {
                                 error!("Failed to send Data to handler: {}", e);
                             }
                     }
@@ -341,7 +500,7 @@ impl TransportManager {
                             warn!("Received unknown packet type from {} (first 8 bytes: {:?})", 
                                 src_addr, 
                                 &packet_data[..packet_data.len().min(8)]);
-                            if let Err(e) = sender.send(IncomingPacket::Unknown(packet_data.to_vec(), src_addr)).await {
+                            if let Err(e) = sender.send(IncomingPacket::Unknown(packet_data.to_vec(), src_addr, None)).await {
                                 error!("Failed to send unknown packet to handler: {}", e);
                             }
                     }
@@ -356,7 +515,104 @@ impl TransportManager {
             }
         }
         
-        info!("Packet reception loop stopped");
+        info!("UDP packet reception loop stopped");
+    }
+
+    /// QUIC packet reception loop
+    async fn quic_packet_reception_loop(
+        quic_transport: Arc<NdnQuicTransport>,
+        running: Arc<RwLock<bool>>,
+        sender: mpsc::Sender<IncomingPacket>,
+    ) {
+        info!("QUIC packet reception loop started");
+        
+        while *running.read().await {
+            // Accept incoming QUIC connections
+            match timeout(Duration::from_millis(1000), quic_transport.quic_transport().accept()).await {
+                Ok(Ok(connection)) => {
+                    let remote_addr = connection.remote_address();
+                    info!("Accepted QUIC connection from {}", remote_addr);
+                    
+                    // Handle this connection in a separate task
+                    let connection = Arc::new(connection);
+                    let quic_transport_clone = quic_transport.clone();
+                    let sender_clone = sender.clone();
+                    let running_clone = running.clone();
+                    
+                    tokio::spawn(async move {
+                        Self::handle_quic_connection(connection, quic_transport_clone, sender_clone, running_clone).await;
+                    });
+                }
+                Ok(Err(e)) => {
+                    error!("QUIC accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    // Timeout - this is normal, just continue
+                }
+            }
+        }
+        
+        info!("QUIC packet reception loop stopped");
+    }
+
+    /// Handle a single QUIC connection
+    async fn handle_quic_connection(
+        connection: Arc<quinn::Connection>,
+        quic_transport: Arc<NdnQuicTransport>,
+        sender: mpsc::Sender<IncomingPacket>,
+        running: Arc<RwLock<bool>>,
+    ) {
+        let remote_addr = connection.remote_address();
+        info!("Handling QUIC connection from {}", remote_addr);
+        
+        while *running.read().await && !connection.close_reason().is_some() {
+            // Try to receive NDN frames
+            debug!("Waiting for frame from connection {}", remote_addr);
+            match timeout(Duration::from_millis(5000), quic_transport.receive_frame(&connection)).await {
+                Ok(Ok((frame, send_stream))) => {
+                    debug!("Received frame from connection {}", remote_addr);
+                    
+                    // Create stream context with the bidirectional stream info
+                    let stream_context = StreamContext {
+                        connection: connection.clone(),
+                        send_stream,
+                        sequence: frame.header.sequence,
+                    };
+                    
+                    // Convert frame to packet and send to handler
+                    match frame.to_packet() {
+                        Ok(udcn_core::packets::Packet::Interest(interest)) => {
+                            info!("Received Interest for {} via QUIC from {}", interest.name, remote_addr);
+                            if let Err(e) = sender.send(IncomingPacket::Interest(interest, remote_addr, Some(stream_context))).await {
+                                error!("Failed to send Interest to handler: {}", e);
+                                break;
+                            }
+                        }
+                        Ok(udcn_core::packets::Packet::Data(data)) => {
+                            info!("Received Data for {} via QUIC from {}", data.name, remote_addr);
+                            if let Err(e) = sender.send(IncomingPacket::Data(data, remote_addr, Some(stream_context))).await {
+                                error!("Failed to send Data to handler: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to convert QUIC frame to packet from {}: {}", remote_addr, e);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("QUIC frame receive error from {}: {}", remote_addr, e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if connection is still alive
+                    debug!("QUIC receive timeout from {}", remote_addr);
+                }
+            }
+        }
+        
+        info!("QUIC connection handler stopped for {}", remote_addr);
     }
 }
 

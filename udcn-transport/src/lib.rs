@@ -30,6 +30,8 @@ pub use tcp::*;
 pub use udp::*;
 pub use unix::*;
 pub use quic::*;
+// Re-export quinn types
+pub use quinn::Connection;
 pub use quic_pool::*;
 
 // NDN-specific exports

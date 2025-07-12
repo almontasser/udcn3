@@ -161,8 +161,9 @@ impl QuicTransport {
         let transport_config = create_transport_config(&config);
         client_config.transport_config(Arc::new(transport_config));
         
-        let endpoint = Endpoint::client("0.0.0.0:0".parse()?)
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
             .context("Failed to create client endpoint")?;
+        endpoint.set_default_client_config(client_config);
         
         info!("QUIC client initialized with TLS security");
         
@@ -264,14 +265,95 @@ impl QuicTransport {
         debug!("Sent {} bytes to {}", data.len(), remote_addr);
         Ok(())
     }
-    
-    /// Receive data from a connection
-    pub async fn receive_from(&self, connection: &Connection) -> Result<Vec<u8>> {
-        let mut recv_stream = connection.accept_uni().await?;
-        let buffer = recv_stream.read_to_end(1024 * 1024).await?; // 1MB limit
+
+    /// Send data on an existing connection
+    pub async fn send_to_connection(&self, connection: &Arc<Connection>, data: &[u8]) -> Result<()> {
+        let mut send_stream = connection.open_uni().await?;
+        send_stream.write_all(data).await?;
+        send_stream.finish().await?;
         
-        debug!("Received {} bytes from {}", buffer.len(), connection.remote_address());
-        Ok(buffer)
+        debug!("Sent {} bytes on existing connection", data.len());
+        Ok(())
+    }
+    
+    /// Send data on a specific connection using a provided send stream (for bidirectional responses)
+    pub async fn send_data_on_connection(&self, _connection: &Arc<Connection>, send_stream: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
+        send_stream.write_all(data).await?;
+        // Don't finish the stream immediately - let the caller decide when to close it
+        
+        debug!("Sent {} bytes on bidirectional stream", data.len());
+        Ok(())
+    }
+    
+    /// Receive data from a connection (accepts both unidirectional and bidirectional streams)
+    /// Returns the received data and optionally a send stream for bidirectional responses
+    pub async fn receive_from(&self, connection: &Connection) -> Result<(Vec<u8>, Option<quinn::SendStream>)> {
+        debug!("Attempting to receive data from connection {}", connection.remote_address());
+        
+        // First try to accept a bidirectional stream (which is what the CLI uses)
+        match tokio::time::timeout(std::time::Duration::from_millis(5000), connection.accept_bi()).await {
+            Ok(Ok((send_stream, mut recv_stream))) => {
+                debug!("Accepted bidirectional stream from {}", connection.remote_address());
+                
+                // For bidirectional streams, read with timeout instead of read_to_end
+                // since the client may not close the send side immediately
+                let mut buffer = Vec::new();
+                let mut temp_buffer = [0u8; 8192];
+                
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_millis(1000), recv_stream.read(&mut temp_buffer)).await {
+                        Ok(Ok(Some(0))) => break, // Stream closed
+                        Ok(Ok(Some(n))) => {
+                            buffer.extend_from_slice(&temp_buffer[..n]);
+                            // Check if we've received what looks like a complete frame
+                            if buffer.len() >= 4 {
+                                // Read the length from the frame header
+                                let length = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+                                if buffer.len() >= length + 4 {
+                                    // We have a complete frame
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            // No more data available, but stream not closed
+                            if !buffer.is_empty() {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(_timeout) => {
+                            // Timeout - if we have any data, use it
+                            if !buffer.is_empty() {
+                                break;
+                            }
+                            return Err(anyhow::anyhow!("Timeout reading from bidirectional stream"));
+                        }
+                    }
+                }
+                
+                debug!("Received {} bytes from bidirectional stream on {}", buffer.len(), connection.remote_address());
+                
+                // Return both the data and the send stream for responses
+                Ok((buffer, Some(send_stream)))
+            }
+            Ok(Err(e)) => {
+                debug!("Failed to accept bidirectional stream: {}, trying unidirectional", e);
+                // Fall back to unidirectional stream
+                let mut recv_stream = connection.accept_uni().await?;
+                let buffer = recv_stream.read_to_end(1024 * 1024).await?;
+                debug!("Received {} bytes from unidirectional stream on {}", buffer.len(), connection.remote_address());
+                Ok((buffer, None))
+            }
+            Err(_timeout) => {
+                debug!("Timeout accepting bidirectional stream, trying unidirectional");
+                // Fall back to unidirectional stream
+                let mut recv_stream = connection.accept_uni().await?;
+                let buffer = recv_stream.read_to_end(1024 * 1024).await?;
+                debug!("Received {} bytes from unidirectional stream on {}", buffer.len(), connection.remote_address());
+                Ok((buffer, None))
+            }
+        }
     }
     
     /// Close a specific connection

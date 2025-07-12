@@ -13,6 +13,7 @@ use crate::control_plane::{ControlPlaneManager, ControlPlaneConfig};
 use crate::protocols::NdnOspfHandler;
 use crate::transport_manager::{TransportManager, TransportConfig, TransportProtocol};
 use crate::packet_handler::PacketHandler;
+use crate::persistent_content_store::PersistentContentStoreConfig;
 
 pub struct Daemon {
     config: Config,
@@ -76,7 +77,7 @@ impl Daemon {
         let bind_address = self.config.network.bind_address.parse::<std::net::IpAddr>()
             .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
         let local_address = SocketAddr::new(bind_address, self.config.network.port);
-        let routing_manager = Arc::new(RoutingManager::new(local_address));
+        let routing_manager = Arc::new(RoutingManager::new(local_address, &self.config.network.transport_protocol));
         
         // Start the routing manager service
         if let Err(e) = routing_manager.start().await {
@@ -103,7 +104,20 @@ impl Daemon {
                 .ok_or_else(|| "Failed to get packet receiver from transport manager".to_string())?
         };
         
-        let mut packet_handler = PacketHandler::new(transport_manager.clone());
+        // Create persistent content store configuration
+        let persistent_config = crate::persistent_content_store::PersistentContentStoreConfig {
+            data_directory: std::path::PathBuf::from("./udcn_content_store"),
+            max_entries: 10000,
+            auto_save_interval_secs: 30,
+            compression_enabled: false, // Start with simple JSON for now
+            backup_enabled: true,
+            max_file_size_bytes: 100 * 1024 * 1024, // 100MB
+        };
+        
+        let mut packet_handler = PacketHandler::new_with_persistence(
+            transport_manager.clone(),
+            persistent_config,
+        );
         packet_handler.set_packet_receiver(packet_receiver);
         
         // Start the packet handler service

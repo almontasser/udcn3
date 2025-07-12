@@ -5,14 +5,14 @@ use anyhow::Result;
 use log::{info, debug, warn, error};
 use tokio::sync::{RwLock, Notify};
 use quinn::{Connection, SendStream, RecvStream};
-use tokio::time::{sleep, Duration, interval};
+use tokio::time::{sleep, Duration, interval, Instant};
 
 use udcn_core::packets::{Packet, Interest, Data};
 use crate::quic::QuicTransport;
 use crate::stream_multiplexer::{StreamMultiplexer, StreamMultiplexerConfig, StreamPriority};
 
 /// NDN-over-QUIC frame types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NdnFrameType {
     /// NDN Interest packet
     Interest = 0x01,
@@ -64,6 +64,65 @@ pub mod frame_flags {
     pub const COMPRESSED: u8 = 0x04;
     /// Frame contains priority hints
     pub const PRIORITY: u8 = 0x08;
+}
+
+/// Fragment reassembly buffer for tracking partial frames
+#[derive(Debug, Clone)]
+struct FragmentBuffer {
+    /// Expected total number of fragments
+    total_fragments: u16,
+    /// Received fragments indexed by fragment number
+    fragments: HashMap<u16, Vec<u8>>,
+    /// When this reassembly was started
+    start_time: Instant,
+    /// Original frame header (from first fragment)
+    original_header: NdnFrameHeader,
+}
+
+impl FragmentBuffer {
+    fn new(total_fragments: u16, original_header: NdnFrameHeader) -> Self {
+        Self {
+            total_fragments,
+            fragments: HashMap::new(),
+            start_time: Instant::now(),
+            original_header,
+        }
+    }
+    
+    /// Add a fragment to the buffer
+    fn add_fragment(&mut self, fragment_index: u16, data: Vec<u8>) {
+        self.fragments.insert(fragment_index, data);
+    }
+    
+    /// Check if all fragments have been received
+    fn is_complete(&self) -> bool {
+        self.fragments.len() == self.total_fragments as usize
+    }
+    
+    /// Check if this buffer has expired
+    fn is_expired(&self, timeout: Duration) -> bool {
+        self.start_time.elapsed() > timeout
+    }
+    
+    /// Reassemble all fragments into the original payload
+    fn reassemble(&self) -> Result<Vec<u8>> {
+        if !self.is_complete() {
+            return Err(anyhow::anyhow!("Cannot reassemble incomplete fragment set"));
+        }
+        
+        let mut reassembled = Vec::new();
+        
+        // Add fragments in order
+        for i in 0..self.total_fragments {
+            if let Some(fragment_data) = self.fragments.get(&i) {
+                reassembled.extend_from_slice(fragment_data);
+            } else {
+                return Err(anyhow::anyhow!("Missing fragment {}", i));
+            }
+        }
+        
+        Ok(reassembled)
+    }
 }
 
 impl NdnFrameHeader {
@@ -289,6 +348,10 @@ pub struct NdnQuicTransport {
     timeout_task_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Stream multiplexer for managing concurrent streams
     stream_multiplexer: Option<Arc<StreamMultiplexer>>,
+    /// Fragment reassembly buffers indexed by (sequence, frame_type)
+    fragment_buffers: Arc<RwLock<HashMap<(u64, NdnFrameType), FragmentBuffer>>>,
+    /// Active response listeners per connection
+    active_listeners: Arc<RwLock<HashMap<SocketAddr, bool>>>,
 }
 
 /// Timeout event types
@@ -656,6 +719,8 @@ impl NdnQuicTransport {
             pending_interests: Arc::new(RwLock::new(PendingInterestTable::default())),
             timeout_task_handle: Arc::new(RwLock::new(None)),
             stream_multiplexer,
+            fragment_buffers: Arc::new(RwLock::new(HashMap::new())),
+            active_listeners: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Start proactive timeout management if enabled
@@ -675,6 +740,7 @@ impl NdnQuicTransport {
     /// Start proactive timeout management service
     pub fn start_timeout_management(&self) {
         let pending_interests = self.pending_interests.clone();
+        let fragment_buffers = self.fragment_buffers.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let _config = self.config.clone();
         
@@ -698,6 +764,26 @@ impl NdnQuicTransport {
                     let retry_entries = pit.process_retries();
                     if !retry_entries.is_empty() {
                         debug!("Processed {} Interest retries", retry_entries.len());
+                    }
+                }
+                
+                // Clean up expired fragment buffers
+                {
+                    let timeout = Duration::from_secs(30);
+                    let mut buffers = fragment_buffers.write().await;
+                    let initial_count = buffers.len();
+                    
+                    buffers.retain(|key, buffer| {
+                        let expired = buffer.is_expired(timeout);
+                        if expired {
+                            warn!("Fragment reassembly expired for sequence {} type {:?}", key.0, key.1);
+                        }
+                        !expired
+                    });
+                    
+                    let cleaned_count = initial_count - buffers.len();
+                    if cleaned_count > 0 {
+                        debug!("Cleaned up {} expired fragment buffers", cleaned_count);
                     }
                 }
                 
@@ -1056,6 +1142,41 @@ impl NdnQuicTransport {
         Ok(())
     }
 
+    /// Send an NDN Data packet on an existing QUIC connection
+    pub async fn send_data_on_connection(&self, data: &Data, connection: &Connection) -> Result<()> {
+        let sequence = self.next_sequence().await;
+        let frame = NdnFrame::from_packet(&Packet::Data(data.clone()), sequence)?;
+        
+        // Send frame bytes directly on the existing connection
+        let frame_bytes = frame.to_bytes();
+        // Create an Arc for the connection to match the expected type
+        let connection_arc = Arc::new(connection.clone());
+        self.quic_transport.send_to_connection(&connection_arc, &frame_bytes).await?;
+        
+        debug!("Sent Data response {} via existing QUIC connection", data.name);
+        Ok(())
+    }
+
+    /// Send an NDN Data packet on a specific bidirectional stream
+    pub async fn send_data_on_stream(&self, data: &Data, mut send_stream: quinn::SendStream, sequence: u64) -> Result<()> {
+        // Create frame with the original sequence number to match the request
+        let frame = NdnFrame::from_packet(&Packet::Data(data.clone()), sequence)?;
+        
+        // Send frame bytes directly on the bidirectional stream
+        let frame_bytes = frame.to_bytes();
+        
+        // Write the response to the bidirectional stream
+        send_stream.write_all(&frame_bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to write to bidirectional stream: {}", e))?;
+        
+        // Finish the send side to signal completion
+        send_stream.finish().await
+            .map_err(|e| anyhow::anyhow!("Failed to finish bidirectional stream: {}", e))?;
+        
+        debug!("Sent Data response {} on bidirectional stream with sequence {}", data.name, sequence);
+        Ok(())
+    }
+
     // ==================== STREAM MULTIPLEXING METHODS ====================
 
     /// Send Interest using stream multiplexing (if enabled)
@@ -1150,6 +1271,120 @@ impl NdnQuicTransport {
         }
     }
 
+    /// Ensure response listener is running for this connection
+    async fn ensure_response_listener(&self, connection: &Connection, multiplexer: Arc<StreamMultiplexer>) -> Result<()> {
+        let remote_addr = connection.remote_address();
+        
+        // Check if we already have a listener for this connection
+        {
+            let mut listeners = self.active_listeners.write().await;
+            if listeners.contains_key(&remote_addr) {
+                return Ok(());
+            }
+            
+            // Mark that we're starting a listener for this connection
+            listeners.insert(remote_addr, true);
+        }
+        
+        // Start background task to listen for responses on this connection
+        let connection_clone = connection.clone();
+        let multiplexer_clone = multiplexer.clone();
+        let listeners_clone = self.active_listeners.clone();
+        
+        tokio::spawn(async move {
+            debug!("Starting response listener for {}", remote_addr);
+            
+            // Listen for responses until connection is closed
+            loop {
+                // Try to receive frames from bidirectional streams
+                match tokio::time::timeout(
+                    Duration::from_secs(30), 
+                    Self::receive_response_frame(&connection_clone)
+                ).await {
+                    Ok(Ok(response_frame)) => {
+                        debug!("Received response frame sequence {} from {}", 
+                               response_frame.header.sequence, remote_addr);
+                        
+                        // Forward response to multiplexer
+                        if let Err(e) = multiplexer_clone.handle_incoming_response(&connection_clone, response_frame).await {
+                            debug!("Failed to handle response from {}: {}", remote_addr, e);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Response receive error from {}: {}", remote_addr, e);
+                        break;
+                    }
+                    Err(_timeout) => {
+                        // Continue listening - timeout is normal
+                        continue;
+                    }
+                }
+            }
+            
+            // Remove from active listeners when done
+            let mut listeners = listeners_clone.write().await;
+            listeners.remove(&remote_addr);
+            debug!("Response listener stopped for {}", remote_addr);
+        });
+        
+        Ok(())
+    }
+
+    /// Receive a response frame from bidirectional streams 
+    /// This accepts NEW bidirectional streams initiated by the remote peer
+    async fn receive_response_frame(connection: &Connection) -> Result<NdnFrame> {
+        // Wait for the remote peer to initiate a bidirectional stream (for responses)
+        let (mut send_stream, mut recv_stream) = connection.accept_bi().await?;
+        
+        // Read the response data with timeout-based reading
+        let mut buffer = Vec::new();
+        let mut temp_buffer = [0u8; 8192];
+        
+        loop {
+            match tokio::time::timeout(Duration::from_millis(1000), recv_stream.read(&mut temp_buffer)).await {
+                Ok(Ok(Some(0))) => break, // Stream closed
+                Ok(Ok(Some(n))) => {
+                    buffer.extend_from_slice(&temp_buffer[..n]);
+                    // Check if we've received what looks like a complete frame
+                    if buffer.len() >= 4 {
+                        // Read the length from the frame header
+                        let length = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+                        if buffer.len() >= length + 4 {
+                            // We have a complete frame
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {
+                    // No more data available, but stream not closed
+                    if !buffer.is_empty() {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_timeout) => {
+                    // Timeout - if we have any data, use it
+                    if !buffer.is_empty() {
+                        break;
+                    }
+                    return Err(anyhow::anyhow!("Timeout reading response from bidirectional stream"));
+                }
+            }
+        }
+        
+        if buffer.is_empty() {
+            return Err(anyhow::anyhow!("No data received on response stream"));
+        }
+        
+        // Parse NDN frame
+        let frame = NdnFrame::from_bytes(&buffer)?;
+        
+        // Close the send side since we're only receiving
+        let _ = send_stream.finish();
+        
+        Ok(frame)
+    }
+
     /// Send Interest request and wait for Data response using bidirectional stream multiplexing
     pub async fn send_interest_request_multiplexed(
         &self,
@@ -1161,6 +1396,9 @@ impl NdnQuicTransport {
         if let Some(ref multiplexer) = self.stream_multiplexer {
             // Get connection
             let connection = self.quic_transport.connect(remote_addr).await?;
+            
+            // Start response listener for this connection if not already started
+            self.ensure_response_listener(&connection, multiplexer.clone()).await?;
             
             // Create request frame
             let sequence = self.next_sequence().await;
@@ -1267,16 +1505,17 @@ impl NdnQuicTransport {
     
     /// Send a fragmented NDN frame
     async fn send_fragmented_frame(&self, frame: &NdnFrame, remote_addr: SocketAddr) -> Result<()> {
-        let frame_bytes = frame.to_bytes();
+        // Chunk only the payload, not the entire frame bytes
         let chunk_size = self.config.max_packet_size - NdnFrameHeader::size() - 4; // Reserve space for fragment info
         
-        let chunks: Vec<_> = frame_bytes.chunks(chunk_size).collect();
+        let chunks: Vec<_> = frame.payload.chunks(chunk_size).collect();
         let total_chunks = chunks.len();
         
         for (i, chunk) in chunks.iter().enumerate() {
             let mut fragment_header = frame.header.clone();
             fragment_header.flags |= frame_flags::FRAGMENTED;
-            fragment_header.length = chunk.len() as u32;
+            // Length should only include the actual payload data (chunk + 4 bytes fragment metadata)
+            fragment_header.length = (chunk.len() + 4) as u32;
             
             // Create fragment payload with fragment info
             let mut fragment_payload = Vec::with_capacity(chunk.len() + 4);
@@ -1293,37 +1532,105 @@ impl NdnQuicTransport {
         }
         
         info!("Sent fragmented NDN frame: {} fragments, total size={} bytes", 
-              total_chunks, frame_bytes.len());
+              total_chunks, frame.payload.len());
         Ok(())
     }
     
     /// Receive an NDN frame from QUIC
-    pub async fn receive_frame(&self, connection: &Connection) -> Result<NdnFrame> {
-        let frame_bytes = self.quic_transport.receive_from(connection).await?;
-        let frame = NdnFrame::from_bytes(&frame_bytes)?;
-        
-        debug!("Received NDN frame: type={:?}, size={} bytes, seq={}", 
-               frame.header.frame_type, frame_bytes.len(), frame.header.sequence);
-        
-        // Handle fragmented frames
-        if frame.header.has_flag(frame_flags::FRAGMENTED) {
-            return self.handle_fragmented_frame(frame, connection).await;
+    /// Returns the frame and optionally a send stream for bidirectional responses
+    pub async fn receive_frame(&self, connection: &Connection) -> Result<(NdnFrame, Option<quinn::SendStream>)> {
+        loop {
+            let (frame_bytes, send_stream) = self.quic_transport.receive_from(connection).await?;
+            let frame = NdnFrame::from_bytes(&frame_bytes)?;
+            
+            debug!("Received NDN frame: type={:?}, size={} bytes, seq={}", 
+                   frame.header.frame_type, frame_bytes.len(), frame.header.sequence);
+            
+            // Handle fragmented frames
+            if frame.header.has_flag(frame_flags::FRAGMENTED) {
+                match self.handle_fragmented_frame(frame, connection).await {
+                    Ok(reassembled_frame) => {
+                        info!("Successfully reassembled fragmented frame for sequence {}", 
+                              reassembled_frame.header.sequence);
+                        return Ok((reassembled_frame, send_stream));
+                    }
+                    Err(e) => {
+                        // Check if it's an incomplete fragment error (expected)
+                        if e.to_string().contains("Fragment reassembly incomplete") {
+                            debug!("Waiting for more fragments: {}", e);
+                            // Continue the loop to receive more fragments
+                            continue;
+                        } else {
+                            // Other errors should be propagated
+                            return Err(e);
+                        }
+                    }
+                }
+            } else {
+                // Non-fragmented frame, return directly
+                return Ok((frame, send_stream));
+            }
         }
-        
-        Ok(frame)
     }
     
     /// Handle fragmented NDN frames
     async fn handle_fragmented_frame(&self, fragment: NdnFrame, _connection: &Connection) -> Result<NdnFrame> {
-        // This is a simplified implementation
-        // A production implementation would need to handle fragment reassembly
-        warn!("Received fragmented frame - reassembly not yet implemented");
-        Ok(fragment)
+        if fragment.payload.len() < 4 {
+            return Err(anyhow::anyhow!("Fragment payload too short for metadata"));
+        }
+        
+        // Extract fragment metadata
+        let fragment_index = u16::from_be_bytes([fragment.payload[0], fragment.payload[1]]);
+        let total_fragments = u16::from_be_bytes([fragment.payload[2], fragment.payload[3]]);
+        let fragment_data = fragment.payload[4..].to_vec();
+        
+        debug!("Received fragment {}/{} for sequence {}", 
+               fragment_index + 1, total_fragments, fragment.header.sequence);
+        
+        let reassembly_key = (fragment.header.sequence, fragment.header.frame_type);
+        
+        // Get or create fragment buffer
+        let mut buffers = self.fragment_buffers.write().await;
+        let buffer = buffers.entry(reassembly_key).or_insert_with(|| {
+            // Create original header without fragmented flag for reassembled frame
+            let mut original_header = fragment.header.clone();
+            original_header.flags &= !frame_flags::FRAGMENTED;
+            FragmentBuffer::new(total_fragments, original_header)
+        });
+        
+        // Add this fragment
+        buffer.add_fragment(fragment_index, fragment_data);
+        
+        // Check if reassembly is complete
+        if buffer.is_complete() {
+            debug!("Fragment reassembly complete for sequence {}", fragment.header.sequence);
+            
+            // Reassemble the original payload
+            let reassembled_payload = buffer.reassemble()?;
+            
+            // Create the reassembled frame
+            let mut reassembled_header = buffer.original_header.clone();
+            reassembled_header.length = reassembled_payload.len() as u32;
+            
+            let reassembled_frame = NdnFrame {
+                header: reassembled_header,
+                payload: reassembled_payload,
+            };
+            
+            // Remove the completed buffer
+            buffers.remove(&reassembly_key);
+            
+            Ok(reassembled_frame)
+        } else {
+            // More fragments needed - return an error to indicate incomplete
+            Err(anyhow::anyhow!("Fragment reassembly incomplete: {}/{} fragments received", 
+                                buffer.fragments.len(), total_fragments))
+        }
     }
     
     /// Receive an NDN Interest packet
     pub async fn receive_interest(&self, connection: &Connection) -> Result<Interest> {
-        let frame = self.receive_frame(connection).await?;
+        let (frame, _send_stream) = self.receive_frame(connection).await?;
         
         match frame.header.frame_type {
             NdnFrameType::Interest => {
@@ -1341,7 +1648,7 @@ impl NdnQuicTransport {
     
     /// Receive an NDN Data packet
     pub async fn receive_data(&self, connection: &Connection) -> Result<Data> {
-        let frame = self.receive_frame(connection).await?;
+        let (frame, _send_stream) = self.receive_frame(connection).await?;
         
         match frame.header.frame_type {
             NdnFrameType::Data => {
@@ -1377,6 +1684,28 @@ impl NdnQuicTransport {
         }
         
         Ok(count)
+    }
+    
+    /// Clean up expired fragment reassembly buffers
+    pub async fn cleanup_expired_fragments(&self) -> Result<usize> {
+        let timeout = Duration::from_secs(30); // 30 second timeout for fragment reassembly
+        let mut buffers = self.fragment_buffers.write().await;
+        let initial_count = buffers.len();
+        
+        buffers.retain(|key, buffer| {
+            let expired = buffer.is_expired(timeout);
+            if expired {
+                warn!("Fragment reassembly expired for sequence {} type {:?}", key.0, key.1);
+            }
+            !expired
+        });
+        
+        let cleaned_count = initial_count - buffers.len();
+        if cleaned_count > 0 {
+            debug!("Cleaned up {} expired fragment buffers", cleaned_count);
+        }
+        
+        Ok(cleaned_count)
     }
     
     /// Get pending Interest statistics

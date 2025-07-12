@@ -26,6 +26,12 @@ pub struct NetworkConfig {
     pub port: u16,
     pub max_connections: usize,
     pub interface: String,
+    #[serde(default = "default_transport_protocol")]
+    pub transport_protocol: String,
+}
+
+fn default_transport_protocol() -> String {
+    "udp".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +411,7 @@ impl Default for Config {
                 port: 8080,
                 max_connections: 1000,
                 interface: "ens160".to_string(),
+                transport_protocol: "udp".to_string(),
             },
             routing: RoutingConfigSection {
                 fib_entries: vec![
@@ -640,6 +647,15 @@ impl Config {
         // Validate interface name
         if self.network.interface.is_empty() {
             return Err(ConfigError::ValidationFailed("Interface name cannot be empty".to_string()));
+        }
+
+        // Validate transport protocol
+        let valid_protocols = ["udp", "quic", "tcp", "unix"];
+        if !valid_protocols.contains(&self.network.transport_protocol.as_str()) {
+            return Err(ConfigError::ValidationFailed(
+                format!("Invalid transport protocol: {}. Valid protocols: {:?}", 
+                       self.network.transport_protocol, valid_protocols)
+            ));
         }
 
         Ok(())
